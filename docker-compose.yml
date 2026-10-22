@@ -9,6 +9,9 @@ services:
     stdin_open: true
 
   telegram-bot:
+    # CI publishes this image (see .github/workflows/ci.yml); the VPS pulls it
+    # instead of building. `build: .` still works for a local `docker compose build`.
+    image: ghcr.io/minhhq-a1/tradingagents:${TRADINGAGENTS_TAG:-development}
     build: .
     entrypoint: ["python", "telegram_bot.py"]
     env_file:
