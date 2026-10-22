@@ -185,11 +185,36 @@ def test_analyze_sends_card_then_report(bot, monkeypatch):
             return report
 
     monkeypatch.setattr(mod, "TradingAgentsGraph", Graph)
+    monkeypatch.setattr(mod, "chart", lambda ticker, date, card: b"png")
     mod.analyze("1", "BTCUSDT", "2026-10-22")
-    (m1, kw1), (m2, kw2) = sent
+    (m1, kw1), (m2, kw2), (m3, kw3) = sent
     assert m1 == "sendMessage" and kw1["json"]["parse_mode"] == "HTML" and "<b>Hold</b>" in kw1["json"]["text"]
     assert "Entry <b>81400.0</b>" in kw1["json"]["text"]
-    assert m2 == "sendDocument" and kw2["files"]["document"][0] == "BTCUSDT-2026-10-22.md"
+    assert m2 == "sendPhoto" and kw2["files"]["photo"] == ("chart.png", b"png")
+    assert m3 == "sendDocument" and kw3["files"]["document"][0] == "BTCUSDT-2026-10-22.md"
+
+    sent.clear()  # a failing chart is skipped: the card and the report still go out
+    monkeypatch.setattr(mod, "chart", lambda *a: 1 / 0)
+    mod.analyze("1", "BTCUSDT", "2026-10-22")
+    assert [m for m, _ in sent] == ["sendMessage", "sendDocument"]
+
+
+def test_chart_draws_the_card_levels(bot, monkeypatch):
+    import io
+
+    import pandas as pd
+    from PIL import Image
+
+    mod, _ = bot
+    close = pd.Series([100 + i * 0.1 for i in range(300)])
+    df = pd.DataFrame({"Date": pd.date_range("2025-12-01", periods=300), "Open": close - 1, "High": close + 2,
+                       "Low": close - 2, "Close": close})
+    monkeypatch.setattr(mod, "load_ohlcv", lambda ticker, date: df)
+    card = "🎯 ▲ close above <b>$135</b> · ▼ close below <b>1,200</b>\n📍 Stop <b>118.5</b> · Target <b>n/a</b>"
+    png = Image.open(io.BytesIO(mod.chart("NVDA", "2026-09-26", card)))
+    assert png.size == (1000, 560)
+    assert [mod.level(x) for x in ("$135", "84,093.42", "84.5k", "~2500.0", "1.39 (trim)")] == [
+        135, 84093.42, 84500, 2500, None]
 
 
 def test_analyze_falls_back_to_plain_text_when_html_rejected(bot, monkeypatch):
@@ -218,6 +243,7 @@ def test_analyze_falls_back_to_plain_text_when_html_rejected(bot, monkeypatch):
             return f"{path}/r.md"
 
     monkeypatch.setattr(mod, "TradingAgentsGraph", Graph)
+    monkeypatch.setattr(mod, "chart", lambda ticker, date, card: b"png")
     mod.analyze("1", "BTCUSDT", "2026-10-22")
-    assert [m for m, _ in sent] == ["sendMessage", "sendMessage", "sendDocument"]
+    assert [m for m, _ in sent] == ["sendMessage", "sendMessage", "sendPhoto", "sendDocument"]
     assert sent[1][1]["json"]["text"].startswith("**Rating**: Hold")
