@@ -45,7 +45,14 @@ def check_levels(proposal: TraderProposal, symbol: str, trade_date: str) -> Trad
     price history is available, and the correction is stated in the reasoning.
     """
     entry, stop, action = proposal.entry_price, proposal.stop_loss, proposal.action
-    if entry is None or stop is None or action is TraderAction.HOLD:
+    if action is TraderAction.HOLD:
+        # A Hold places no order, so an entry or stop on it is a level nobody can act on.
+        if entry is None and stop is None:
+            return proposal
+        note = " [Level check: a Hold places no order, so its entry and stop-loss were dropped.]"
+        return proposal.model_copy(update={
+            "entry_price": None, "stop_loss": None, "reasoning": proposal.reasoning + note})
+    if entry is None or stop is None:
         return proposal
     buying = action is TraderAction.BUY
     if stop < entry if buying else stop > entry:
@@ -110,6 +117,7 @@ def create_trader(llm):
                     "or a range; convert a percentage distance to the price level it "
                     "implies, or omit the field if you cannot state a number. "
                     "A Buy's stop-loss is below its entry price and a Sell's is above it. "
+                    "A Hold places no order: leave entry price and stop-loss empty. "
                     + NO_EXTERNAL_TOOLS
                     + get_language_instruction()
                 ),

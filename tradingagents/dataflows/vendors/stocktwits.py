@@ -23,18 +23,44 @@ from datetime import datetime
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from curl_cffi import requests as curl_requests
+
 from tradingagents.dataflows.date_window import coverage_gap, in_window
 from tradingagents.dataflows.symbols import crypto_base
 
 logger = logging.getLogger(__name__)
 
 _API = "https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
-# StockTwits sits behind Cloudflare, which answers 403 to a bot-style User-Agent
-# on datacenter addresses, so the request presents a browser's.
+# StockTwits sits behind Cloudflare, which can answer 403 to a bot-style
+# User-Agent, so the request presents a browser's.
 _UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0 Safari/537.36"
 )
+
+
+def _fetch_json(url: str, timeout: float):
+    """The stream's JSON. A 403 is retried once presenting Chrome's TLS fingerprint.
+
+    Cloudflare also tells a script from a browser by the TLS handshake, which
+    urllib's differs from, so a header change alone does not clear that 403. The
+    retry cannot clear a block on the address itself; the original 403 is then
+    what the caller reports.
+    """
+    req = Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except HTTPError as exc:
+        if exc.code != 403:
+            raise
+        try:
+            response = curl_requests.get(url, impersonate="chrome", timeout=timeout)
+        except OSError:  # curl's transport errors are OSErrors
+            raise exc from None
+        if response.status_code != 200:
+            raise exc from None
+        return response.json()
 
 
 def _created_at(message) -> datetime | None:
@@ -101,10 +127,8 @@ def fetch_stocktwits_messages(
     caller never has to special-case None or exceptions.
     """
     url = _API.format(ticker=_stocktwits_symbol(ticker))
-    req = Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
     try:
-        with urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read())
+        data = _fetch_json(url, timeout)
     except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
         # OSError covers URLError/TimeoutError/connection resets; HTTPException
         # covers chunked-transfer errors (IncompleteRead/BadStatusLine, #1024).

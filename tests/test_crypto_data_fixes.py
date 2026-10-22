@@ -16,6 +16,7 @@ import requests
 
 import tradingagents.dataflows.config as config_module
 import tradingagents.default_config as default_config
+from tradingagents.agents.context import last_close_line
 from tradingagents.agents.schemas import TraderAction, TraderProposal
 from tradingagents.agents.trader import trader
 from tradingagents.dataflows import router
@@ -48,24 +49,34 @@ def _response(payload):
 # --- Binance daily bars -----------------------------------------------------
 
 
+def _ago(days):
+    return (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 @pytest.mark.unit
-def test_klines_serve_every_day_with_turnover_as_volume():
-    days = ["2026-10-20", "2026-10-21", "2026-10-22"]
-    with mock.patch.object(binance_klines.requests, "get",
-                           return_value=_response([_kline(d, 1.35) for d in days])) as get:
-        frame = binance_klines.fetch_daily_klines("XRPUSDT", "2026-10-20", "2026-10-22")
+def test_klines_serve_every_completed_day_with_turnover_as_volume():
+    days = [_ago(3), _ago(2), _ago(1)]
+    rows = [_kline(d, 1.35) for d in days] + [_kline(_ago(0), 9.99)]  # the open day, partial
+    with mock.patch.object(binance_klines.requests, "get", return_value=_response(rows)) as get:
+        frame = binance_klines.fetch_daily_klines("XRPUSDT", days[0], _ago(0))
     assert get.call_args.kwargs["params"]["symbol"] == "XRPUSDT"
-    assert [d.strftime("%Y-%m-%d") for d in frame.index] == days  # no day dropped
+    assert [d.strftime("%Y-%m-%d") for d in frame.index] == days  # none dropped, the open day left out
     assert frame["Volume"].iloc[0] == 6500.5 and frame["Close"].iloc[0] == 1.35
+
+
+@pytest.mark.unit
+def test_klines_with_only_the_open_day_are_none():
+    with mock.patch.object(binance_klines.requests, "get", return_value=_response([_kline(_ago(0), 1)])):
+        assert binance_klines.fetch_daily_klines("XRPUSDT", _ago(0), _ago(0)) is None
 
 
 @pytest.mark.unit
 def test_klines_page_past_one_thousand_bars():
     first = [_kline("2026-01-01", 1)] * binance_klines.PAGE_LIMIT
-    second = [_kline("2026-10-22", 2)]
+    second = [_kline(_ago(1), 2)]
     with mock.patch.object(binance_klines.requests, "get",
                            side_effect=[_response(first), _response(second)]) as get:
-        frame = binance_klines.fetch_daily_klines("BTC-USD", "2023-01-01", "2026-10-22")
+        frame = binance_klines.fetch_daily_klines("BTC-USD", "2023-01-01", _ago(1))
     assert get.call_count == 2 and len(frame) == 1001
 
 
@@ -73,11 +84,11 @@ def test_klines_page_past_one_thousand_bars():
 def test_klines_fall_back_to_the_mirror_then_to_none():
     blocked = requests.HTTPError("451")
     with mock.patch.object(binance_klines.requests, "get",
-                           side_effect=[blocked, _response([_kline("2026-10-22", 1)])]) as get:
-        assert binance_klines.fetch_daily_klines("ETHUSDT", "2026-10-22", "2026-10-22") is not None
+                           side_effect=[blocked, _response([_kline(_ago(1), 1)])]) as get:
+        assert binance_klines.fetch_daily_klines("ETHUSDT", _ago(1), _ago(1)) is not None
     assert get.call_args_list[1].args[0].startswith("https://data-api.binance.vision")
     with mock.patch.object(binance_klines.requests, "get", side_effect=blocked):
-        assert binance_klines.fetch_daily_klines("ETHUSDT", "2026-10-22", "2026-10-22") is None
+        assert binance_klines.fetch_daily_klines("ETHUSDT", _ago(1), _ago(1)) is None
 
 
 @pytest.mark.unit
@@ -145,6 +156,51 @@ def test_stocktwits_presents_a_browser_user_agent():
     with mock.patch.object(stocktwits, "urlopen", side_effect=OSError("down")) as opened:
         stocktwits.fetch_stocktwits_messages("XRPUSDT")
     assert opened.call_args.args[0].get_header("User-agent").startswith("Mozilla/5.0")
+
+
+def _forbidden():
+    return HTTPError("url", 403, "Forbidden", {}, None)
+
+
+@pytest.mark.unit
+def test_stocktwits_403_is_retried_with_a_browser_tls_fingerprint():
+    reply = mock.Mock(status_code=200)
+    reply.json.return_value = {"messages": [
+        {"created_at": "2026-10-22T04:00:00Z", "body": "up", "user": {"username": "a"},
+         "entities": {"sentiment": {"basic": "Bullish"}}}]}
+    with mock.patch.object(stocktwits, "urlopen", side_effect=_forbidden()), \
+            mock.patch.object(stocktwits.curl_requests, "get", return_value=reply) as curl:
+        out = stocktwits.fetch_stocktwits_messages("XRPUSDT")
+    assert curl.call_args.kwargs["impersonate"] == "chrome"
+    assert "Bullish: 1" in out
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("retry", [mock.Mock(status_code=403), OSError("curl failed")])
+def test_stocktwits_still_blocked_reports_the_original_403(retry):
+    kwargs = {"side_effect": retry} if isinstance(retry, Exception) else {"return_value": retry}
+    with mock.patch.object(stocktwits, "urlopen", side_effect=_forbidden()), \
+            mock.patch.object(stocktwits.curl_requests, "get", **kwargs):
+        assert stocktwits.fetch_stocktwits_messages("XRPUSDT") == "<stocktwits unavailable: HTTP 403>"
+
+
+@pytest.mark.unit
+def test_stocktwits_other_errors_are_not_retried():
+    with mock.patch.object(stocktwits, "urlopen", side_effect=HTTPError("url", 429, "slow", {}, None)), \
+            mock.patch.object(stocktwits.curl_requests, "get") as curl:
+        assert stocktwits.fetch_stocktwits_messages("XRPUSDT") == "<stocktwits unavailable: HTTP 429>"
+    curl.assert_not_called()
+
+
+@pytest.mark.unit
+def test_indicator_table_says_a_crypto_bar_is_not_closed_rather_than_a_holiday():
+    yesterday, today = _ago(1), _ago(0)
+    with mock.patch.object(market, "_get_stock_stats_bulk",
+                           return_value={_ago(2): "1.0", yesterday: "2.0"}):
+        crypto = market.get_stock_stats_indicators_window("XRPUSDT", "rsi", today, 2)
+        stock = market.get_stock_stats_indicators_window("NVDA", "rsi", today, 2)
+    assert f"{today}: N/A: bar not closed yet" in crypto and f"{yesterday}: 2.0" in crypto
+    assert f"{today}: N/A: Not a trading day" in stock
 
 
 # --- Crypto news RSS ------------------------------------------------------------
@@ -241,7 +297,7 @@ def _bars(atr):
 @pytest.mark.unit
 @pytest.mark.parametrize("action, entry, stop", [
     (TraderAction.BUY, 100.0, 95.0), (TraderAction.SELL, 100.0, 105.0),
-    (TraderAction.HOLD, 100.0, 120.0),            # no order, nothing to check
+    (TraderAction.HOLD, None, None),              # no order, nothing to check
     (TraderAction.SELL, None, 90.0), (TraderAction.BUY, 100.0, None),
 ])
 def test_valid_or_absent_levels_are_untouched(action, entry, stop):
@@ -270,3 +326,28 @@ def test_a_wrong_side_stop_is_dropped_when_there_is_no_price_history():
     with mock.patch.object(trader, "load_ohlcv", side_effect=NoMarketDataError("XRPUSDT")):
         fixed = trader.check_levels(_proposal(TraderAction.SELL, 1.38, 1.29), "XRPUSDT", "2026-10-22")
     assert fixed.stop_loss is None and "dropped" in fixed.reasoning
+
+
+@pytest.mark.unit
+def test_a_hold_carries_no_entry_or_stop():
+    with mock.patch.object(trader, "load_ohlcv", side_effect=AssertionError("no data needed")):
+        fixed = trader.check_levels(_proposal(TraderAction.HOLD, 82000.0, 78631.0), "BTCUSDT", "2026-10-22")
+    assert fixed.entry_price is None and fixed.stop_loss is None
+    assert "Hold places no order" in fixed.reasoning
+
+
+# --- Reference price for the agents that never call a price tool ----------------
+
+
+@pytest.mark.unit
+def test_reference_close_line_states_the_last_completed_close():
+    bars = pd.DataFrame({"Date": pd.to_datetime(["2026-10-20", "2026-10-21"]), "Close": [81000.0, 82761.4]})
+    with mock.patch("tradingagents.dataflows.vendors.yahoo.ohlcv.load_ohlcv", return_value=bars):
+        line = last_close_line("BTCUSDT", "2026-10-22")
+    assert "82,761.40" in line and "2026-10-21" in line and "do not call the price unverified" in line
+
+
+@pytest.mark.unit
+def test_reference_close_line_is_empty_when_prices_are_unavailable():
+    with mock.patch("tradingagents.dataflows.vendors.yahoo.ohlcv.load_ohlcv", side_effect=NoMarketDataError("X")):
+        assert last_close_line("BTCUSDT", "2026-10-22") == ""

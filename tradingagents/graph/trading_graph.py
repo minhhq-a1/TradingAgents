@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import tradingagents
-from tradingagents.agents.context import build_instrument_context, resolve_instrument_identity
+from tradingagents.agents.context import (
+    build_instrument_context,
+    last_close_line,
+    resolve_instrument_identity,
+)
 from tradingagents.agents.rating import run_rating
 from tradingagents.dataflows.config import run_config, run_config_context, set_config
 from tradingagents.dataflows.date_window import get_current_date, is_historical
@@ -125,7 +129,8 @@ class TradingAgentsGraph:
         graph regardless of entry point.
         """
         identity = resolve_instrument_identity(ticker)
-        return build_instrument_context(ticker, asset_type, identity, trade_date)
+        return build_instrument_context(ticker, asset_type, identity, trade_date) + last_close_line(
+            ticker, trade_date)
 
     def _memory_as_of(self, trade_date) -> str | None:
         """Point-in-time cutoff for past-context lessons (#1251).

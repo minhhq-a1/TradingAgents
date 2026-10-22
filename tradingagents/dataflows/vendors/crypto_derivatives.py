@@ -14,7 +14,7 @@ Binance refuses requests from restricted regions (the US among them), so the
 default chain is ``binance,okx,hyperliquid``. Hyperliquid serves funding only.
 
 Rows are cut at the end of the analysis date (UTC), so a backtest never sees a
-later funding print. Binance keeps open-interest and long/short history for 30
+later funding print, and the still-open current day is left out as partial. Binance keeps open-interest and long/short history for 30
 days only; older dates get funding alone from it.
 """
 
@@ -72,7 +72,10 @@ def _base(symbol: str) -> str:
 def _report(symbol: str, venue: str, funding: dict, oi: dict, ratio: dict, start_ms: int, end_ms: int) -> str:
     """One markdown table of daily rows inside the window, plus a short summary."""
     lo, hi = _day(start_ms), _day(end_ms)
-    days = sorted(d for d in set(funding) | set(oi) | set(ratio) if lo <= d <= hi)
+    # The still-open UTC day is partial (funding not yet paid out, OI mid-move),
+    # and the price bars stop at the last completed day, so these do too.
+    open_day = datetime.now(UTC).strftime("%Y-%m-%d")
+    days = sorted(d for d in set(funding) | set(oi) | set(ratio) if lo <= d <= hi and d < open_day)
     if not days:
         raise NoMarketDataError(symbol, detail=f"{venue} returned no derivatives rows up to {hi}")
 
