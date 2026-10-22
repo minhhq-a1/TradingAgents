@@ -7,8 +7,13 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /build
+# Install dependencies before copying the source so this layer stays cached
+# until pyproject.toml changes (a code-only deploy then skips the slow pip step).
+COPY pyproject.toml ./
+RUN python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']))" > /tmp/deps.txt \
+ && pip install --no-cache-dir -r /tmp/deps.txt
 COPY . .
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-deps .
 
 FROM python:3.13-slim
 
