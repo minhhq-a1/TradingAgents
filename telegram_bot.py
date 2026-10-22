@@ -31,6 +31,8 @@ def say(chat, text, **kw):
     call("sendMessage", json={"chat_id": chat, "text": text[:4096], **kw})
 
 
+GAPS = r"data (?:conflict and )?gaps?|gaps?|missing\b"
+GAPS_RE = re.compile(GAPS, re.I)
 EMOJI = {"Buy": "🟢", "Overweight": "🟢", "Hold": "🟡", "Underweight": "🔴", "Sell": "🔴"}
 
 
@@ -69,21 +71,33 @@ def summarize(ticker, date, decision, trade_plan=""):
 
     out += ["", e(clip(f.get("Executive Summary", ""), 600))]
 
-    # The thesis is bold-led blocks ("**Trend.** text" or "**Bullish evidence:**\n- item"):
-    # show label + first bullet or sentence of the first three, and fold "Data gaps" into one line.
-    blocks = re.findall(r"\*\*([^*\n]+?)[.:]?\*\*[.:]?\s*(.*?)(?=\n\*\*|\Z)", f.get("Investment Thesis", ""), re.DOTALL)
-    gaps = [body for label, body in blocks if label.lower().startswith("data gaps")]
+    # The thesis is bold-led blocks ("**Trend.** text" or "**Bullish evidence:**\n- item") or, when the
+    # PM writes plain paragraphs, one block per paragraph ("For the bull: text"). Show label + first bullet
+    # or sentence of the first three, and fold the gaps block into one line.
+    thesis = f.get("Investment Thesis", "")
+    blocks = re.findall(r"\*\*([^*\n]+?)[.:]?\*\*[.:]?\s*(.*?)(?=\n\*\*|\Z)", thesis, re.DOTALL)
+    if not blocks:  # plain paragraphs: "Data gap. text", "Gaps: text", "For the bull: text"
+        blocks = [m.groups() if (m := re.match(rf"((?:{GAPS})[^.:\n]*|[^.:\n]{{3,40}})\s*[.:]\s*(.*)", para.strip(), re.DOTALL | re.I))
+                  and (GAPS_RE.match(m.group(1)) or para.strip()[len(m.group(1))] == ":")
+                  else ("", para.strip()) for para in re.split(r"\n\s*\n", thesis)]
+
+    def is_gaps(label):
+        return bool(GAPS_RE.match(label))
+
+    gaps = [(label, body) for label, body in blocks if is_gaps(label)]
     bullets = []
-    for label, body in [x for x in blocks if not x[0].lower().startswith("data gaps")]:
+    for label, body in [x for x in blocks if not is_gaps(x[0])]:
         body = body.strip()
         first = re.match(r"- (.+)", body) or re.match(r"(.+?[.!?])(?:\s|$)", body, re.DOTALL)
         if first and len(first.group(1)) > 25 and len(bullets) < 3:  # a bare "Aggressive:" sub-label says nothing
-            bullets.append(f"• <b>{e(clip(label, 40))}</b> {e(clip(first.group(1), 150))}")
+            bullets.append(f"• {f'<b>{e(clip(label, 40))}</b> ' if label else ''}{e(clip(first.group(1), 150))}")
     if bullets:
         out += [""] + bullets
     if gaps:
-        items = [x.strip("- ").strip().rstrip(".") for x in gaps[0].strip().splitlines() if x.strip()]
-        out += ["", f"⚠️ <i>Gaps: {e(clip('; '.join(items), 260))}</i>"]
+        label, body = gaps[0]
+        items = [x.strip("- ").strip().rstrip(".") for x in body.strip().splitlines() if x.strip()]
+        lead = "Missing: " if label.lower().startswith("missing") else "Gaps: "
+        out += ["", f"⚠️ <i>{lead}{e(clip('; '.join(items), 260))}</i>"]
     out += ["", "📎 Full report attached."]
     return "\n".join(out)
 
@@ -93,8 +107,11 @@ def analyze(chat, ticker, date):
     analysts = [a.value for a in filter_analysts_for_asset_type(list(AnalystType), kind)]
     graph = TradingAgentsGraph(selected_analysts=analysts, config=DEFAULT_CONFIG.copy())
     state, _ = graph.propagate(ticker, date, asset_type=kind.value)
-    say(chat, summarize(ticker, date, state["final_trade_decision"], state.get("trader_investment_plan", "")),
-        parse_mode="HTML")
+    try:
+        say(chat, summarize(ticker, date, state["final_trade_decision"], state.get("trader_investment_plan", "")),
+            parse_mode="HTML")
+    except requests.HTTPError:  # Telegram rejected the markup: still deliver the decision, as plain text
+        say(chat, state["final_trade_decision"])
     # Telegram caps a message at 4096 chars, so the full report goes as a file.
     with tempfile.TemporaryDirectory() as tmp:
         report = graph.save_reports(state, ticker, tmp, html=False)
