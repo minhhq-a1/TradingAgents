@@ -76,6 +76,8 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/development'
     needs: [test, smoke-install, lint]
     runs-on: ubuntu-latest
+    # A hung build on the small VPS must not block every later deploy (the job queue is serial).
+    timeout-minutes: 20
     permissions: {}
     concurrency:
       group: deploy-vps
@@ -92,5 +94,5 @@ jobs:
         run: |
           install -m 600 /dev/null ~/key && printf '%s\n' "$SSH_KEY" > ~/key
           # Deploy exactly the commit CI tested, not whatever development is now.
-          ssh -i ~/key -p "$PORT" -o StrictHostKeyChecking=accept-new "$USER@$HOST" \
+          ssh -i ~/key -p "$PORT" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=4 "$USER@$HOST" \
             "set -e; cd '$APP_DIR'; git fetch origin development; git checkout -q --detach '$SHA'; docker compose --profile telegram up -d --build telegram-bot; docker image prune -f"
