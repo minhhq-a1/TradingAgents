@@ -60,6 +60,10 @@ class DataGap(Exception):
     """A calendar day is missing from the bars the signal needs, so no signal is made."""
 
 
+class SourceUnverified(Exception):
+    """The bars come from another source than the book's and do not reproduce what it stored: no signal."""
+
+
 class SendFailed(Exception):
     """At least one chat did not get a message; the others did, and only this one is retried."""
 
@@ -177,7 +181,8 @@ def _distance(info: dict) -> str:
 
 
 def _split(weight: float) -> str:
-    return f"Book split: {weight:.0%} stays in BTC permanently, {1 - weight:.0%} follows this rule."
+    return (f"Starting split: {weight:.0%} core BTC (never sold), {1 - weight:.0%} follows this rule; "
+            "the two parts are not rebalanced.")
 
 
 def _head(state: str) -> str:
@@ -247,18 +252,25 @@ def paper_text(symbol: str = "BTCUSDT") -> str:
     frame, rule, operated = _book(entry)
     weight = entry["core"]
     if len(frame) < 2:
-        return f"{symbol} paper book opened {entry['start']['date']} as cash; no day has closed since, so no equity yet."
+        notes = "".join(f"\n⚠ Data check: {event}" for event in entry["data_events"][-2:])
+        return f"{symbol} paper book opened {entry['start']['date']} as cash; no day has closed since, so no equity yet.{notes}"
     ideal, ops = simulate(frame, rule, weight), simulate(frame, operated, weight)
 
     def pct(equity: pd.Series) -> str:
         return f"{equity.iloc[-1] * 100 - 100:+.1f}%"
 
-    exposure = weight + (1 - weight) * (operated.iloc[-1] == HOLD)
+    in_btc = operated.shift(fill_value=CASH).iloc[-1] == HOLD  # filled: yesterday's signal, bought at today's open
+    core, sleeve = weight * ops["hold"].iloc[-1], (1 - weight) * ops["trend"].iloc[-1] * in_btc
+    total = ops["mix"].iloc[-1]
+    pending = ""
+    if operated.iloc[-1] != (HOLD if in_btc else CASH):
+        pending = f" Pending at the next open: trend sleeve to {operated.iloc[-1]} (signal of {frame.index[-1].date()})."
     lines = [
         f"{symbol} paper book since {entry['start']['date']} ({len(frame) - 1} days, no real orders), "
         f"core {weight:.0%} fixed at the start",
-        f"Now: {exposure:.0%} in BTC ({weight:.0%} core + trend sleeve {operated.iloc[-1]}), through {frame.index[-1].date()}. "
-        "Sleeves start as cash and fill at the next open, 0.1% fee per side.",
+        f"Now, filled through {frame.index[-1].date()}: {(core + sleeve) / total:.1%} of the book in BTC "
+        f"(core {core / total:.1%} + trend sleeve {sleeve / total:.1%}), the rest cash.{pending} "
+        "Sleeves start as cash and fill at the next open, 0.1% fee per side, no rebalancing.",
         f"Equity, rule (every change filled): mix {pct(ideal['mix'])} | 100% SMA200 {pct(ideal['trend'])} | buy-and-hold {pct(ideal['hold'])}",
     ]
     if entry["gaps"]:
@@ -284,10 +296,8 @@ def _day(date: pd.Timestamp, frame: pd.DataFrame, state: pd.Series, sma: pd.Seri
 
 
 def _data_events(entry: dict, frame: pd.DataFrame, source: str) -> None:
-    """A new source, or a stored close that a later fetch moved, is logged and shown, never acted on."""
+    """A stored close that a later fetch moved is logged and shown, never acted on."""
     notes = []
-    if source != entry["source"]:
-        notes.append(f"source changed from {entry['source']} to {source}")
     for day in entry["days"]:
         stamp = pd.Timestamp(day["date"])
         if stamp in frame.index and abs(frame.loc[stamp, "Close"] / day["Close"] - 1) > REVISION and day["date"] not in entry["revised"]:
@@ -296,7 +306,24 @@ def _data_events(entry: dict, frame: pd.DataFrame, source: str) -> None:
     for note in notes:
         entry["data_events"].append(note)
         _log("data_event", note=note, source=source)
-    entry["source"] = source
+
+
+def _verify_source(entry: dict, frame: pd.DataFrame, source: str, state: pd.Series, sma: pd.Series, new) -> str:
+    """Another source is used only if it reproduces the last stored day. Returns why not, or ''."""
+    last = entry["days"][-1]
+    stamp = pd.Timestamp(last["date"])
+    if stamp not in frame.index or pd.isna(sma.get(stamp)):
+        return f"{last['date']} is not in the {source} bars"
+    close, level = float(frame.loc[stamp, "Close"]), float(sma[stamp])
+    if abs(close / last["Close"] - 1) > REVISION or abs(level / last["sma"] - 1) > REVISION or state[stamp] != last["state"]:
+        return (f"{source} has {last['date']} at close {close:,.1f}, SMA200 {level:,.1f}, {state[stamp]}; "
+                f"the book stored {last['Close']:,.1f}, {last['sma']:,.1f}, {last['state']}")
+    current = entry["state"]
+    for date in new:  # a flip inside the gap between the two sources' SMAs may exist in one of them only
+        if state[date] != current and abs(frame.loc[date, "Close"] / sma[date] - 1) <= REVISION:
+            return f"{source} flips to {state[date]} on {date.date()} within {REVISION:.1%} of the SMA200"
+        current = state[date]
+    return ""
 
 
 def check(symbol: str, send, chats, today: datetime | None = None) -> bool:
@@ -322,13 +349,23 @@ def check(symbol: str, send, chats, today: datetime | None = None) -> bool:
             "core": core_weight(), "source": source, "state": state[newest], "checked": newest.date().isoformat(),
             "start": {"date": newest.date().isoformat(), "close": float(close[newest])},
             "days": [_day(newest, frame, state, sma, source, True)], "ledger": [], "gaps": [], "data_events": [],
-            "revised": [], "pending": None}
+            "revised": [], "pending": []}
         _save(data)
         _log("baseline", source=source, date=newest.date().isoformat())
         return False
 
     new = state.index[state.index > pd.Timestamp(entry["checked"])]
     require_continuous(frame, len(new))
+    if source != entry["source"]:
+        why = _verify_source(entry, frame, source, state, sma, new)
+        note = f"source changed from {entry['source']} to {source}" + (f" and does not match: {why}" if why else " (verified)")
+        if note not in entry["data_events"][-1:]:
+            entry["data_events"].append(note)
+            _log("data_event", note=note, source=source)
+        if why:  # no signal from numbers the book cannot reproduce; the stored source returning ends this
+            _save(data)
+            raise SourceUnverified(note)
+        entry["source"] = source
     _data_events(entry, frame, source)
     flips = []
     for date in new:
@@ -356,36 +393,38 @@ def check(symbol: str, send, chats, today: datetime | None = None) -> bool:
         detected = now.isoformat(timespec="seconds")
         text = (late_text(rows, info, outage, detected, entry["core"]) if outage
                 else alert_text(info, detected, entry["core"]))
-        entry["pending"] = {"text": text, "rows": flips, "sent_to": []}  # a newer flip replaces an undelivered older one
+        entry["pending"].append({"text": text, "rows": flips, "sent_to": []})  # an undelivered older alert stays queued
         _log("detected", detected_at=detected, flips=[r["signal_date"] for r in rows], late=bool(outage))
     _save(data)  # before sending: a crash now resends to the chats not yet reached, it cannot lose the flip
     return _deliver(data, entry, send, chats)
 
 
 def _deliver(data: dict, entry: dict, send, chats) -> bool:
-    pending = entry["pending"]
-    if not pending:
+    """Send every queued alert, oldest first, to each chat that has not had it; a chat that fails one waits
+    with the rest of its queue, so it never gets a later alert before an earlier one."""
+    if not entry["pending"]:
         return False
     failed = []
-    for chat in chats:
-        if chat in pending["sent_to"]:
-            continue
-        try:
-            send(chat, pending["text"])
-        except Exception as exc:  # the other chats still get theirs; only this one is retried
-            failed.append(chat)
-            _log("send_failed", chat=chat, error=repr(exc))
-            continue
-        stamp = datetime.now(UTC).isoformat(timespec="seconds")
-        pending["sent_to"].append(chat)
-        for i in pending["rows"]:
-            entry["ledger"][i]["sent"][chat] = stamp
-        _save(data)
-        _log("sent", chat=chat, sent_at=stamp, rows=pending["rows"])
+    for pending in entry["pending"]:
+        for chat in chats:
+            if chat in pending["sent_to"] or chat in failed:
+                continue
+            try:
+                send(chat, pending["text"])
+            except Exception as exc:  # the other chats still get theirs; only this one is retried
+                failed.append(chat)
+                _log("send_failed", chat=chat, error=repr(exc))
+                continue
+            stamp = datetime.now(UTC).isoformat(timespec="seconds")
+            pending["sent_to"].append(chat)
+            for i in pending["rows"]:
+                entry["ledger"][i]["sent"][chat] = stamp
+            _save(data)
+            _log("sent", chat=chat, sent_at=stamp, rows=pending["rows"])
+    entry["pending"] = [p for p in entry["pending"] if not set(chats) <= set(p["sent_to"])]
+    _save(data)
     if failed:
         raise SendFailed(f"not delivered to {', '.join(failed)}")
-    entry["pending"] = None
-    _save(data)
     return True
 
 

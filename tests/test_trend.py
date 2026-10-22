@@ -102,7 +102,7 @@ def test_first_run_opens_the_book_as_cash_and_sends_nothing(monkeypatch):
     sent = []
     assert _check(_walk(), _walk().index[-1], sent) is False
     entry = trend._load()["BTCUSDT"]
-    assert sent == [] and entry["pending"] is None and entry["ledger"] == [] and entry["core"] == 0.3
+    assert sent == [] and entry["pending"] == [] and entry["ledger"] == [] and entry["core"] == 0.3
     assert len(entry["days"]) == 1 and entry["start"]["date"] == entry["days"][0]["date"] and entry["source"] == "binance"
 
 
@@ -123,7 +123,7 @@ def test_one_failing_chat_blocks_no_other_and_only_it_is_retried():
     assert sorted(c for c, _ in sent) == ["a", "b", "c"]
     assert _check(frame, flip, sent, CHATS) is False and len(sent) == 3  # nobody gets it twice
     row = trend._load()["BTCUSDT"]["ledger"][0]
-    assert sorted(row["sent"]) == CHATS and trend._load()["BTCUSDT"]["pending"] is None
+    assert sorted(row["sent"]) == CHATS and trend._load()["BTCUSDT"]["pending"] == []
 
 
 @pytest.mark.unit
@@ -209,7 +209,7 @@ def test_book_starts_as_cash_with_the_configured_split_and_ignores_later_env_cha
     before = trend.paper_text("BTCUSDT")
     monkeypatch.setenv("TREND_CORE_WEIGHT", "0.9")
     assert trend.paper_text("BTCUSDT") == before and "core 50% fixed at the start" in before
-    assert "Book split: 50%" in sent[0][1]
+    assert "Starting split: 50% core BTC" in sent[0][1]
 
 
 # --- finding 4: data continuity, source and revisions --------------------------------------------
@@ -257,8 +257,52 @@ def test_a_source_change_is_recorded_as_a_data_event():
     _check(frame, frame.index[250], [], source="binance")
     _check(frame, frame.index[251], [], source="yahoo")
     entry = trend._load()["BTCUSDT"]
-    assert entry["source"] == "yahoo" and "source changed from binance to yahoo" in entry["data_events"]
+    assert entry["source"] == "yahoo" and "source changed from binance to yahoo (verified)" in entry["data_events"]
     assert [d["source"] for d in entry["days"]] == ["binance", "yahoo"]
+
+
+def _other_history(frame, day, factor=3.0):
+    """Bars whose last 5 closes are the same as ``frame``'s but whose older history is another price level."""
+    alt = frame[:day].copy()
+    alt.loc[alt.index[:-5], ["Open", "Close"]] *= factor
+    return alt
+
+
+@pytest.mark.unit
+def test_an_unverified_source_switch_makes_no_signal_and_the_stored_source_returning_ends_it():
+    frame = _crafted()
+    _check(frame, frame.index[250], [], CHATS)  # HOLD, from binance
+    day = frame.index[251]
+    alt = _other_history(frame, day)
+    assert alt["Close"].iloc[-1] == frame.loc[day, "Close"]  # today's close is unchanged...
+    assert trend.states(alt["Close"]).iloc[-1] == trend.CASH  # ...but the other history's SMA200 says CASH
+    sent = []
+    with mock.patch.object(trend, "bars", return_value=(alt, "yahoo")), pytest.raises(trend.SourceUnverified):
+        trend.check("BTCUSDT", lambda c, t: sent.append((c, t)), list(CHATS), _at(day))
+    entry = trend._load()["BTCUSDT"]
+    assert sent == [] and entry["ledger"] == [] and entry["pending"] == [] and entry["state"] == trend.HOLD
+    assert entry["source"] == "binance" and entry["checked"] == frame.index[250].date().isoformat() and len(entry["days"]) == 1
+    assert "does not match" in entry["data_events"][-1] and "Data check:" in trend.paper_text("BTCUSDT")
+    with mock.patch.object(trend, "bars", return_value=(alt, "yahoo")), pytest.raises(trend.SourceUnverified):
+        trend.check("BTCUSDT", lambda c, t: sent.append((c, t)), list(CHATS), _at(day))  # a retry
+    assert sent == [] and len(trend._load()["BTCUSDT"]["data_events"]) == 1  # logged once, not on every retry
+    _check(frame, day, sent, CHATS)  # binance is back: the day is processed normally
+    assert sent == [] and trend._load()["BTCUSDT"]["checked"] == day.date().isoformat()
+
+
+@pytest.mark.unit
+def test_a_source_switch_does_not_signal_a_flip_inside_the_sources_own_noise():
+    frame = _crafted()
+    flip = _flips(frame)[1][0]
+    _check(frame, flip - timedelta(days=1), [], CHATS)
+    near = frame[:flip].copy()
+    sma = near["Close"].rolling(trend.WINDOW).mean()
+    near.loc[flip, "Close"] = sma[flip] * (1 - trend.REVISION / 2)  # just under the SMA: CASH here, HOLD to a vendor 0.3% away
+    assert trend.states(near["Close"]).iloc[-1] == trend.CASH
+    sent = []
+    with mock.patch.object(trend, "bars", return_value=(near, "yahoo")), pytest.raises(trend.SourceUnverified):
+        trend.check("BTCUSDT", lambda c, t: sent.append((c, t)), list(CHATS), _at(flip))
+    assert sent == [] and trend._load()["BTCUSDT"]["ledger"] == []
 
 
 @pytest.mark.unit
@@ -330,7 +374,7 @@ def test_alert_does_not_promise_the_open_price_and_warns_about_whipsaw():
     text = trend.alert_text(info, "2026-10-22T00:06:11+00:00", 0.5)
     assert "84,093 vs SMA200 72,774 (+15.6%)" in text and "Detected 00:06 UTC" in text
     assert "no order was placed" in text and "you cannot get that price" in text
-    assert "29 of 44 closed trades lost money" in text and "50% stays in BTC permanently, 50% follows" in text
+    assert "29 of 44 closed trades lost money" in text and "Starting split: 50% core BTC (never sold), 50% follows" in text
 
 
 @pytest.mark.unit
@@ -471,3 +515,71 @@ def test_core_weight_comes_from_the_environment_and_is_validated(monkeypatch):
     monkeypatch.setenv("TREND_CORE_WEIGHT", "1.5")
     with pytest.raises(ValueError):
         trend.core_weight()
+
+
+# --- /paper shows the real BTC weight, filled apart from pending -----------------------------------
+
+
+def _paper_expected(frame, start, last, weight=0.5):
+    """BTC value / book value at ``last``, from an explicit units loop, and whether the sleeve holds BTC."""
+    part = frame.loc[start:last]
+    state = trend.states(frame["Close"]).loc[start:last]
+    total = _loop_equity(part, state, weight, trend.FEE).iloc[-1]
+    core_units = weight * (1 - trend.FEE) / part["Open"].iloc[1]
+    filled = (state.shift().iloc[-1] == trend.HOLD)
+    sleeve_cash = (1 - weight) * (_loop_equity(part, state, 0.0, trend.FEE).iloc[-1])
+    btc = core_units * part["Close"].iloc[-1] + (0 if not filled else sleeve_cash)
+    return btc / total, filled
+
+
+@pytest.mark.unit
+def test_paper_text_reports_the_real_btc_weight_after_the_core_sleeve_drifted():
+    frame = _crafted()
+    state, flips = _flips(frame)
+    start, last = frame.index[250], frame.index[299]  # the price fell 70% from its peak, sleeves are not rebalanced
+    assert state[last] == trend.CASH and flips[0] < last - timedelta(days=2)
+    _replay(frame[:last], [], start)
+    expected, filled = _paper_expected(frame, start, last)
+    out = trend.paper_text("BTCUSDT")
+    assert not filled and expected < 0.45
+    assert f"{expected:.1%} of the book in BTC" in out and "Now: 50%" not in out and "Pending at the next open" not in out
+
+
+@pytest.mark.unit
+def test_paper_text_keeps_a_pending_signal_apart_from_the_filled_position():
+    frame = _crafted()
+    flip = _flips(frame)[1][0]  # the first flip, to CASH
+    start = frame.index[250]
+    _replay(frame[:flip], [], start)  # stop on the signal day itself: still in BTC, the sale waits for the next open
+    out = trend.paper_text("BTCUSDT")
+    expected, filled = _paper_expected(frame, start, flip)
+    assert filled and f"{expected:.1%} of the book in BTC" in out
+    assert f"Pending at the next open: trend sleeve to CASH (signal of {flip.date()})" in out
+    _check(frame, flip + timedelta(days=1), [])  # the next open has filled it
+    out = trend.paper_text("BTCUSDT")
+    expected, filled = _paper_expected(frame, start, flip + timedelta(days=1))
+    assert not filled and f"{expected:.1%} of the book in BTC" in out and "Pending at the next open" not in out
+
+
+# --- an undelivered alert stays queued when a newer one is made -------------------------------------
+
+
+@pytest.mark.unit
+def test_an_older_undelivered_alert_stays_queued_when_the_signal_reverses_next_day():
+    close = np.r_[100 + 0.5 * np.arange(260), 150.0, 235.0, 236.0, 237.0]  # one day under the SMA200, then back above
+    frame = _frame(close)
+    state, flips = _flips(frame)
+    assert [f.date() for f in flips] == [frame.index[260].date(), frame.index[261].date()]
+    _check(frame, frame.index[259], [], CHATS)
+    sent = []
+    with pytest.raises(trend.SendFailed):
+        _check(frame, frame.index[260], sent, CHATS, fail=("b",))  # b misses the CASH alert
+    assert sorted(c for c, _ in sent) == ["a", "c"]
+    _check(frame, frame.index[261], sent, CHATS)  # the next day reverses; b is reachable again
+    to_b = [t for c, t in sent if c == "b"]
+    assert len(to_b) == 2 and "DOWN" in to_b[0] and "UP" in to_b[1]  # both, in order
+    assert [t for c, t in sent if c == "a"] == [t for c, t in sent if c == "c"] and len([1 for c, _ in sent if c == "a"]) == 2
+    entry = trend._load()["BTCUSDT"]
+    assert entry["pending"] == [] and all(sorted(r["sent"]) == CHATS for r in entry["ledger"])
+    _check(frame, frame.index[261], sent, CHATS)
+    assert len(sent) == 6  # nothing is repeated
