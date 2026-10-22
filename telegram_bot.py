@@ -37,8 +37,12 @@ TRIGGER = re.compile(rf"\bcloses?\b(?: a day| back| decisively)?\s+(above|below)
 GAPS_LABEL = re.compile(r"data (?:conflict and )?gaps?|gaps?|missing\b", re.I)
 GAP_SENTENCE = re.compile(
     r"^(?:missing|data gaps?|gaps?)\b|^no\b[^.]{0,80}\b(?:data|figures?|feeds?|series|inputs?|information)\b"
-    r"|\b(?:was|were) not provided\b|\bunavailable\b", re.I)
+    r"|\b(?:was|were) not provided\b|\bunavailable\b|\b(?:data|key|feeds?|series|figures?)\b[^.]{0,40}\bmissing\b"
+    r"|\bholdings are unknown\b", re.I)
 CONCLUSION = re.compile(r"\b(?:therefore|stands|intact|weak|not supported|too even|favou?rs?|wins?|decisive|balanced)\b", re.I)
+
+
+INLINE_LABEL = re.compile(r"([A-Z][^:.\d]{2,40}):\s+(\S.*)", re.S)
 
 
 def sentences(text):
@@ -107,6 +111,12 @@ def summarize(ticker, date, decision, trade_plan=""):
             raw.append(m.groups() if ok else ("", para.strip()))
     blocks = [(label, sentences(body)) for label, body in raw]
     prose = [x for label, ss in blocks if not GAPS_LABEL.match(label) for x in ss]
+    while sum(not GAPS_LABEL.match(label) for label, _ in blocks) < 3:  # few blocks: halve the longest
+        i = max(range(len(blocks)), key=lambda j: len(blocks[j][1]) if not GAPS_LABEL.match(blocks[j][0]) else 0)
+        label, ss = blocks[i]
+        if GAPS_LABEL.match(label) or len(ss) < 2:
+            break
+        blocks[i:i + 1] = [(label, ss[:len(ss) // 2]), ("", ss[len(ss) // 2:])]
 
     # Trigger levels, as their own line: every "close above/below N" the PM states (summary first).
     triggers = {}
@@ -128,8 +138,15 @@ def summarize(ticker, date, decision, trade_plan=""):
         usable = [x for x in ss if 20 <= len(x) <= 170 and x[-1] != ":" and not TRIGGER.search(x)
                   and not GAP_SENTENCE.search(x) and x not in summary]  # a trailing ":" is a lead-in
         if usable:
+            label = label.strip()
             pick = next((x for x in usable if CONCLUSION.search(x)), usable[0])
-            bullets.append(f"• {f'<b>{e(label)}</b> ' if label and len(label) <= 40 else ''}{e(pick)}")
+            if len(pick) < 40:  # a bare "The trend is intact." says little: add the sentence after it
+                nxt = usable[usable.index(pick) + 1:][:1] or [x for x in usable if x != pick][:1]
+                pick = fit([pick] + nxt, 170)
+            if not label and (m := INLINE_LABEL.match(pick)):  # "Why not Sell: text" written inline
+                label, pick = m.groups()
+            tag = f"<b>{e(label)}:</b> " if label and len(label) <= 40 and label.lower() != "rating" else ""
+            bullets.append(f"• {tag}{e(pick)}")
     if bullets:
         out += [""] + bullets
 
@@ -139,9 +156,8 @@ def summarize(ticker, date, decision, trade_plan=""):
         if GAPS_LABEL.match(label) and (items := fit([x if x[-1] in ".!?" else x + "." for x in ss], 260)):
             gap_text = ("Missing: " if label.lower().startswith("missing") else "Gaps: ") + items
             break
-    gap_text = gap_text or fit([x for x in prose if GAP_SENTENCE.search(x)], 260)
-    if gap_text:
-        out += ["", f"⚠️ <i>{e(gap_text)}</i>"]
+    gap_text = gap_text or fit([INLINE_LABEL.sub(r"\2", x) for x in prose if GAP_SENTENCE.search(x)], 260)
+    out += ["", f"⚠️ <i>{e(gap_text) or 'Gaps: none stated in the decision.'}</i>"]
     out += ["", "📎 Full report attached."]
     return "\n".join(out)
 
