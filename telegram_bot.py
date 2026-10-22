@@ -33,11 +33,12 @@ def say(chat, text, **kw):
 
 EMOJI = {"Buy": "🟢", "Overweight": "🟢", "Hold": "🟡", "Underweight": "🔴", "Sell": "🔴"}
 NUM = r"~?\$?\d+(?:,\d{3})*(?:\.\d+)?k?"
-TRIGGER = re.compile(rf"\bcloses?\b(?: a day| back| decisively)?\s+(above|below)\s+(?:about |roughly |~)?({NUM})", re.I)
+TRIGGER = re.compile(rf"\bcloses?\b(?: a day| back| decisively)?\s+(above|below)\s+(?:about |roughly |~)?({NUM})(?![\d.,]*%)", re.I)  # a % is a yield, not a price
 GAPS_LABEL = re.compile(r"data (?:conflict and )?gaps?|gaps?|missing\b", re.I)
 GAP_SENTENCE = re.compile(
     r"^(?:missing|data gaps?|gaps?)\b|^no\b[^.]{0,80}\b(?:data|figures?|feeds?|series|inputs?|information)\b"
     r"|\b(?:was|were) not provided\b|\bunavailable\b|\b(?:data|key|feeds?|series|figures?)\b[^.]{0,40}\bmissing\b"
+    r"|\b(?:is|are)(?: also)? missing\b|^no\b[^.]{0,80}\b(?:news|fundamentals)\b"
     r"|\bholdings are unknown\b", re.I)
 CONCLUSION = re.compile(r"\b(?:therefore|stands|intact|weak|not supported|too even|favou?rs?|wins?|decisive|balanced)\b", re.I)
 
@@ -83,7 +84,7 @@ def summarize(ticker, date, decision, trade_plan=""):
         return value if value and value.strip().lower() != "not provided" else None
 
     rating, horizon = f["Rating"], given(f.get("Time Horizon"))
-    if horizon and len(horizon) > 60:  # "2-6 weeks, or until ..." -> the period itself
+    if horizon:  # "2-6 weeks, reviewed on ..." -> the period itself
         horizon = horizon.split(",")[0]
     out = [f"{EMOJI.get(rating, '⚪')} <b>{e(ticker)}</b> · {e(date)}",
            f"<b>{e(rating)}</b>" + (f" · horizon {e(horizon)}" if horizon else "")]
@@ -106,7 +107,7 @@ def summarize(ticker, date, decision, trade_plan=""):
     raw = re.findall(r"\*\*([^*\n]+?)[.:]?\*\*[.:]?\s*(.*?)(?=\n\*\*|\Z)", thesis, re.DOTALL)
     if not raw:
         for para in re.split(r"\n\s*\n", thesis):
-            m = re.match(rf"((?:{GAPS_LABEL.pattern})[^.:\n]*|[^.:\n]{{3,40}})\s*[.:]\s*(.*)", para.strip(), re.DOTALL | re.I)
+            m = re.match(rf"((?:{GAPS_LABEL.pattern})[^.:\n]*|[^.:\n]{{3,60}})\s*[.:]\s*(.*)", para.strip(), re.DOTALL | re.I)
             ok = m and (GAPS_LABEL.match(m.group(1)) or para.strip()[len(m.group(1))] == ":")
             raw.append(m.groups() if ok else ("", para.strip()))
     blocks = [(label, sentences(body)) for label, body in raw]
@@ -138,7 +139,7 @@ def summarize(ticker, date, decision, trade_plan=""):
         usable = [x for x in ss if 20 <= len(x) <= 170 and x[-1] != ":" and not TRIGGER.search(x)
                   and not GAP_SENTENCE.search(x) and x not in summary]  # a trailing ":" is a lead-in
         if usable:
-            label = label.strip()
+            label = label.split(",")[0].strip()  # "Why not Sell, and why not 75%" -> "Why not Sell"
             pick = next((x for x in usable if CONCLUSION.search(x)), usable[0])
             if len(pick) < 40:  # a bare "The trend is intact." says little: add the sentence after it
                 nxt = usable[usable.index(pick) + 1:][:1] or [x for x in usable if x != pick][:1]
@@ -156,7 +157,11 @@ def summarize(ticker, date, decision, trade_plan=""):
         if GAPS_LABEL.match(label) and (items := fit([x if x[-1] in ".!?" else x + "." for x in ss], 260)):
             gap_text = ("Missing: " if label.lower().startswith("missing") else "Gaps: ") + items
             break
-    gap_text = gap_text or fit([INLINE_LABEL.sub(r"\2", x) for x in prose if GAP_SENTENCE.search(x)], 260)
+    if not gap_text:  # only the clause that names the gap: "Why not Sell: price is up, and the feed is missing."
+        clauses = [re.sub(r"^(?:and|but|so|while)\s+", "", c).rstrip(".")
+                   for x in prose for c in re.split(r"[,;:]\s+(?![^(]*\))", x)]
+        found = [c[0].upper() + c[1:] + "." for c in clauses if GAP_SENTENCE.search(c)]
+        gap_text = "Gaps: " + fit(found, 254) if found else ""
     out += ["", f"⚠️ <i>{e(gap_text) or 'Gaps: none stated in the decision.'}</i>"]
     out += ["", "📎 Full report attached."]
     return "\n".join(out)
