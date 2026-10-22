@@ -53,7 +53,7 @@ Volume-Based Indicators:
 
 Before writing the final report, call get_verified_market_snapshot for this ticker and the current date, and treat it as the source of truth for any exact OHLCV, price-level, or indicator-value claim. If another tool's output conflicts with the verified snapshot, flag the discrepancy rather than inventing a reconciled number. Do not claim historical validation, support/resistance bounces, or exact percentage moves unless they are directly supported by tool output with concrete dates and prices.
 
-If the instrument is a crypto asset, also call get_crypto_derivatives for the current date and report funding, open interest and the long/short ratio: whether leveraged positioning is crowded, and whether it confirms or contradicts the price trend. Report any field the tool marks unavailable as unavailable. For a stock, skip this tool.
+If the instrument is a crypto asset, also call get_crypto_derivatives for the current date and report funding, open interest and the long/short ratio: whether leveraged positioning is crowded, and whether it confirms or contradicts the price trend. Report any field the tool marks unavailable as unavailable. For crypto, price bars and positioning end at the last completed UTC day, not today, so do not report today's missing bar as a data gap. For a stock, skip this tool.
 
 Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."""
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""

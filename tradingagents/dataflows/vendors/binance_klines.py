@@ -6,9 +6,11 @@ serves every UTC day, so crypto symbols take their bars from here first and fall
 back to Yahoo only when Binance cannot be reached (it refuses restricted regions
 such as the US).
 
-Bars are keyed on the UTC open date, like Yahoo's crypto bars. ``Volume`` is the
-USDT turnover, which is what Yahoo reports for a crypto pair, not the base-coin
-count Binance calls volume. A USD or USDC quote maps to the USDT pair, the only
+Bars are keyed on the UTC open date, like Yahoo's crypto bars. The still-open
+current UTC day is dropped: its OHLC, volume and indicators are partial and the
+decision rules read closes, so the newest bar is the last completed day.
+``Volume`` is the USDT turnover, which is what Yahoo reports for a crypto pair,
+not the base-coin count Binance calls volume. A USD or USDC quote maps to the USDT pair, the only
 dollar pair Binance lists across these coins.
 """
 
@@ -83,4 +85,5 @@ def fetch_daily_klines(symbol: str, start_date: str, end_date: str) -> pd.DataFr
         "Close": [float(r[4]) for r in rows],
         "Volume": [float(r[7]) for r in rows],
     })
-    return frame.set_index("Date")
+    frame = frame[frame["Date"].dt.date < datetime.now(UTC).date()]
+    return frame.set_index("Date") if not frame.empty else None

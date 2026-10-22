@@ -3,7 +3,7 @@
 All API access is mocked, so these run without a network connection.
 """
 import copy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest import mock
 
 import pytest
@@ -146,3 +146,13 @@ def test_tool_skips_stocks_and_clamps_the_date_for_crypto():
     with mock.patch.object(tools, "route_to_vendor", return_value="ok") as route:
         tools.get_crypto_derivatives.func("BTCUSDT", "2026-09-30", trade_date=DATE)
     route.assert_called_once_with("get_crypto_derivatives", "BTCUSDT", DATE, 30)
+
+
+@pytest.mark.unit
+def test_the_open_day_is_left_out_of_the_report():
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%d")
+    rows = [{"time": _ms(day, 8), "fundingRate": "0.0001"} for day in (yesterday, today)]
+    with mock.patch.object(cd, "_get", return_value=rows):
+        out = cd.get_hyperliquid("BTCUSDT", today, 7)
+    assert f"| {yesterday} |" in out and f"| {today} |" not in out
