@@ -6,6 +6,7 @@ from tradingagents.dataflows.errors import (
     VendorNotConfiguredError,
     VendorUnavailableError,
 )
+from tradingagents.dataflows.vendors import crypto_derivatives
 from tradingagents.dataflows.vendors.alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
     get_cashflow as get_alpha_vantage_cashflow,
@@ -84,6 +85,12 @@ TOOLS_CATEGORIES = {
         "tools": [
             "get_prediction_markets",
         ]
+    },
+    "crypto_derivatives": {
+        "description": "Perpetual-futures funding, open interest and long/short ratio",
+        "tools": [
+            "get_crypto_derivatives",
+        ]
     }
 }
 
@@ -92,7 +99,7 @@ TOOLS_CATEGORIES = {
 # sentinel instead of aborting the run (a bad LLM-supplied indicator, a missing
 # key, or a network blip should not crash an analysis over flavour data). Core
 # categories (prices, fundamentals, news) still raise so a broken primary is loud.
-OPTIONAL_CATEGORIES = {"macro_data", "prediction_markets"}
+OPTIONAL_CATEGORIES = {"macro_data", "prediction_markets", "crypto_derivatives"}
 
 # Mapping of methods to their vendor-specific implementations
 VENDOR_METHODS = {
@@ -147,6 +154,12 @@ VENDOR_METHODS = {
     # prediction_markets
     "get_prediction_markets": {
         "polymarket": get_polymarket_prediction_markets,
+    },
+    # crypto_derivatives
+    "get_crypto_derivatives": {
+        "binance": crypto_derivatives.get_binance,
+        "okx": crypto_derivatives.get_okx,
+        "hyperliquid": crypto_derivatives.get_hyperliquid,
     },
 }
 
