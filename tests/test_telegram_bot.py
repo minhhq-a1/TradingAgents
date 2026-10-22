@@ -128,7 +128,7 @@ def test_summary_real_report_shape(bot):
     assert "🎯 ▲ close above <b>86,620</b> · ▼ close below <b>80,191</b>" in out
     bullets = [x for x in out.splitlines() if x.startswith("• ")]
     assert len(bullets) == 3 and all(x.endswith(".") for x in bullets)
-    assert "⚠️ <i>No on-chain data or ETF flow series were provided" in out
+    assert "⚠️ <i>Gaps: No on-chain data or ETF flow series were provided" in out
 
 
 def test_summary_one_paragraph_thesis_gives_three_bullets(bot):
@@ -144,6 +144,24 @@ def test_summary_always_has_a_gaps_line(bot):
     out = mod.summarize("BTC", "d", "**Rating**: Hold\n\n**Executive Summary**: Hold.\n\n**Investment Thesis**: Fine.",
                         "")
     assert "⚠️ <i>Gaps: none stated in the decision.</i>" in out
+
+
+def test_summary_live_run_shapes(bot):
+    """Shapes from live runs: a yield % is not a price trigger, the gaps line keeps only the gap clause,
+    the horizon is the period, and a long label is cut at its comma."""
+    mod, _ = bot
+    out = mod.summarize("ETHUSDT", "d", (
+        "**Rating**: Underweight\n\n**Executive Summary**: Trim. Add back on a daily close above 2,552.\n\n"
+        "**Investment Thesis**: Price is below the 50 SMA and momentum is negative.\n\n"
+        "Why the call is not Sell, and why 75% is too aggressive:\n- RSI never reached 30 so there was no capitulation.\n"
+        "- If the 10-year closes above 5.31% and holds, don't add.\n\n"
+        "Why not Sell: price is above a rising 200 SMA, the 10 EMA has been reclaimed, and the news feed is missing.\n"
+        "CPI and core PCE are missing.\n\n"
+        "**Price Target**: 2296.0\n\n**Time Horizon**: 2-6 weeks, reviewed on daily closes against 1.29 and 1.41"), "")
+    assert "<b>Underweight</b> · horizon 2-6 weeks\n" in out
+    assert "🎯 ▲ close above <b>2,552</b>\n" in out and "5.31" not in out.split("🎯")[1].split("\n")[0]
+    assert "<b>Why the call is not Sell:</b> RSI never reached 30" in out
+    assert "⚠️ <i>Gaps: The news feed is missing. CPI and core PCE are missing.</i>" in out
 
 
 def test_analyze_sends_card_then_report(bot, monkeypatch):
