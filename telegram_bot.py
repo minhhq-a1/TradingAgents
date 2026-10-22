@@ -4,6 +4,7 @@ Long-polling, so it needs no public URL. Env: TELEGRAM_BOT_TOKEN and
 TELEGRAM_ALLOWED_CHAT_IDS (comma-separated; anyone else is ignored).
 """
 import datetime
+import html
 import os
 import re
 import tempfile
@@ -26,35 +27,62 @@ def call(method, **kw):
     return r.json()["result"]
 
 
-def say(chat, text):
-    call("sendMessage", json={"chat_id": chat, "text": text[:4096]})
+def say(chat, text, **kw):
+    call("sendMessage", json={"chat_id": chat, "text": text[:4096], **kw})
 
 
-def summarize(ticker, date, decision, limit=4096):
-    """Chat summary of the Portfolio Manager's decision, within Telegram's message cap.
+EMOJI = {"Buy": "🟢", "Overweight": "🟢", "Hold": "🟡", "Underweight": "🔴", "Sell": "🔴"}
 
-    The decision is rendered by `render_pm_decision` with fixed `**Label**:` fields,
-    so the fields are split by label; the thesis is cut at a line boundary to fit,
-    but its "Data gaps" block is always kept.
+
+def clip(text, n):
+    """Cut at a word boundary so a number is never split."""
+    text = text.replace("**", "").strip()
+    return text if len(text) <= n else text[:n].rsplit(" ", 1)[0] + "…"
+
+
+def summarize(ticker, date, decision, trade_plan=""):
+    """Short HTML chat card from the Portfolio Manager's decision and the Trader's levels.
+
+    Both are rendered with fixed `**Label**:` fields (render_pm_decision,
+    render_trader_proposal), so levels are read by label and stay exact; only prose is
+    clipped. The full text goes in the attached report.
     """
-    parts = re.split(r"\*\*(Rating|Executive Summary|Investment Thesis|Price Target|Time Horizon)\*\*: ", decision)
+    labels = "Rating|Executive Summary|Investment Thesis|Price Target|Time Horizon"
+    parts = re.split(rf"\*\*({labels})\*\*: ", decision)
     f = {k: v.strip() for k, v in zip(parts[1::2], parts[2::2], strict=True)}
     if "Rating" not in f:  # shortcut: unknown shape, send it raw; fix if render_pm_decision changes
-        return decision[:limit]
+        return html.escape(decision[:3500], quote=False)
+    def e(x):
+        return html.escape(x, quote=False)  # Telegram only needs & < > escaped
+
+    rating = f["Rating"]
+    out = [f"{EMOJI.get(rating, '⚪')} <b>{e(ticker)}</b> · {e(date)}", f"<b>{e(rating)}</b> · horizon {e(clip(f.get('Time Horizon', 'n/a'), 60))}"]
+
+    t = dict(re.findall(r"\*\*(Entry Price|Stop Loss|Position Sizing)\*\*: (.+)", trade_plan))
+    levels = {"Entry": t.get("Entry Price"), "Stop": t.get("Stop Loss"), "Target": f.get("Price Target"),
+              "Size": t.get("Position Sizing")}
+    levels = [f"{k} <b>{e(v.strip())}</b>" for k, v in levels.items() if v and v.strip() != "not provided"]
+    if levels:
+        out += ["", "📍 " + " · ".join(levels)]
+
+    out += ["", e(clip(f.get("Executive Summary", ""), 600))]
+
     thesis = f.get("Investment Thesis", "")
-    gaps = re.search(r"\*\*Data gaps:?\*\*:?.*?(?=\n\*\*|\Z)", thesis, re.DOTALL)
+    gaps = re.search(r"\*\*Data gaps:?\*\*:?(.*?)(?=\n\*\*|\Z)", thesis, re.DOTALL)
     if gaps:
-        thesis = thesis.replace(gaps.group(0), "").strip()
-    head = (f"{ticker} {date}: {f['Rating']}\n"
-            f"Target: {f.get('Price Target', 'n/a')} | Horizon: {f.get('Time Horizon', 'n/a')}\n\n"
-            f"{f.get('Executive Summary', '')}")
-    tail = (gaps.group(0) if gaps else "") + "\n\nFull report attached."
-    room = limit - len(head) - len(tail) - 20
-    if room > 0 and thesis:
-        if len(thesis) > room:
-            thesis = thesis[:room].rsplit("\n", 1)[0] + "\n..."
-        head += f"\n\n{thesis}"
-    return (head + "\n\n" + tail.strip()).replace("**", "")[:limit]
+        thesis = thesis.replace(gaps.group(0), "")
+    # First bullet of the first, second and last bold section: for and against, then what flips the view.
+    sections = [b for b in re.split(r"\n\*\*", thesis)[1:] if "\n- " in b]
+    firsts = [re.search(r"\n- (.+)", b).group(1) for b in sections]
+    picks = [firsts[i] for i in sorted({0, 1, len(firsts) - 1}) if i < len(firsts)] if firsts else []
+    if picks:
+        out += [""] + [f"• {e(clip(x, 160))}" for x in picks]
+
+    if gaps:
+        items = [x.strip("- ").strip().rstrip(".") for x in gaps.group(1).strip().splitlines() if x.strip()]
+        out += ["", f"⚠️ <i>Gaps: {e(clip('; '.join(items), 200))}</i>"]
+    out += ["", "📎 Full report attached."]
+    return "\n".join(out)
 
 
 def analyze(chat, ticker, date):
@@ -62,7 +90,8 @@ def analyze(chat, ticker, date):
     analysts = [a.value for a in filter_analysts_for_asset_type(list(AnalystType), kind)]
     graph = TradingAgentsGraph(selected_analysts=analysts, config=DEFAULT_CONFIG.copy())
     state, _ = graph.propagate(ticker, date, asset_type=kind.value)
-    say(chat, summarize(ticker, date, state["final_trade_decision"]))
+    say(chat, summarize(ticker, date, state["final_trade_decision"], state.get("trader_investment_plan", "")),
+        parse_mode="HTML")
     # Telegram caps a message at 4096 chars, so the full report goes as a file.
     with tempfile.TemporaryDirectory() as tmp:
         report = graph.save_reports(state, ticker, tmp, html=False)

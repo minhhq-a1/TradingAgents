@@ -54,16 +54,26 @@ DECISION = """**Rating**: Hold
 **Time Horizon**: 2-6 weeks"""
 
 
-def test_summary_has_fields_and_keeps_gaps(bot):
+PLAN = """**Action**: Hold
+
+**Entry Price**: 81400.0
+
+**Stop Loss**: not provided
+
+**Position Sizing**: 1% of book"""
+
+
+def test_summary_card(bot):
     mod, _ = bot
-    out = mod.summarize("BTCUSDT", "2026-10-22", DECISION)
-    assert out.startswith("BTCUSDT 2026-10-22: Hold\nTarget: not provided | Horizon: 2-6 weeks")
-    assert "Overweight above 84,300" in out and "The 10-21 row is missing" in out
+    out = mod.summarize("BTCUSDT", "2026-10-22", DECISION, PLAN)
+    assert out.startswith("🟡 <b>BTCUSDT</b> · 2026-10-22\n<b>Hold</b> · horizon 2-6 weeks")
+    assert "Entry <b>81400.0</b> · Size <b>1% of book</b>" in out and "Stop" not in out
+    assert "Overweight above 84,300" in out and "Price above the 200 SMA" in out
+    assert "Gaps: The 10-21 row is missing; FRED macro data was unavailable" in out
     assert "**" not in out
 
 
-def test_summary_fits_telegram_limit(bot):
+def test_summary_escapes_html_and_stays_short(bot):
     mod, _ = bot
-    long = DECISION.replace("- Price above the 200 SMA.", "\n".join(f"- point {i} " + "x" * 80 for i in range(200)))
-    out = mod.summarize("BTCUSDT", "2026-10-22", long)
-    assert len(out) <= 4096 and "The 10-21 row is missing" in out and out.endswith("Full report attached.")
+    out = mod.summarize("BTC", "d", DECISION.replace("Hold. Overweight", "a<b>& " + "x" * 5000 + " Overweight"), "")
+    assert "a<b>&" not in out and "a&lt;b&gt;&amp;" in out and len(out) < 1500
