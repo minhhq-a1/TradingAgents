@@ -247,3 +247,20 @@ def test_analyze_falls_back_to_plain_text_when_html_rejected(bot, monkeypatch):
     mod.analyze("1", "BTCUSDT", "2026-10-22")
     assert [m for m, _ in sent] == ["sendMessage", "sendMessage", "sendPhoto", "sendDocument"]
     assert sent[1][1]["json"]["text"].startswith("**Rating**: Hold")
+
+
+def test_trend_command_replies_with_the_trend_state(bot, monkeypatch):
+    mod, sent = bot
+    monkeypatch.setattr(mod.trend, "status_text", lambda symbol: f"state of {symbol}")
+    mod.handle({"chat": {"id": 1}, "text": "/trend"})
+    mod.handle({"chat": {"id": 1}, "text": "/trend@MyBot ETHUSDT"})
+    mod.handle({"chat": {"id": 2}, "text": "/trend"})  # unlisted chat: ignored
+    assert sent == ["state of BTCUSDT", "state of ETHUSDT"]
+
+
+def test_paper_command_and_analysis_label(bot, monkeypatch):
+    mod, sent = bot
+    monkeypatch.setattr(mod.trend, "paper_text", lambda symbol: f"book of {symbol}")
+    mod.handle({"chat": {"id": 1}, "text": "/paper"})
+    assert sent == ["book of BTCUSDT"]
+    assert "không phải tín hiệu giao dịch" in mod.REFERENCE and "<i>" in mod.REFERENCE
