@@ -70,7 +70,7 @@ def test_summary_card(bot):
     assert out.startswith("🟡 <b>BTCUSDT</b> · 2026-10-22\n<b>Hold</b> · horizon 2-6 weeks")
     assert "Entry <b>81400.0</b> · Size <b>1% of book</b>" in out and "Stop" not in out
     assert "Overweight above 84,300" in out and "<b>Bullish evidence</b> Price above the 200 SMA and rising" in out
-    assert "Gaps: The 10-21 row is missing; FRED macro data was unavailable" in out
+    assert "Gaps: The 10-21 row is missing. FRED macro data was unavailable." in out
     assert "**" not in out
 
 
@@ -89,7 +89,7 @@ def test_summary_paragraph_thesis_long_size_and_period_gaps(bot):
     plan = "**Stop Loss**: 78631.0\n\n**Position Sizing**: " + "long " * 20
     out = mod.summarize("BTC", "d", decision, plan)
     assert "<b>Trend (supports holding)</b> Price is 13.6% above the 200 SMA (72,843) today." in out
-    assert "Gaps: No live price. Volume looks incomplete" in out
+    assert "Gaps: No live price. Volume looks incomplete." in out
     assert "Stop <b>78631.0</b>" in out and "Size" not in out
 
 
@@ -103,7 +103,7 @@ def test_summary_plain_paragraph_thesis(bot):
     out = mod.summarize("BTC", "d", decision, "")
     assert "• The evidence is balanced after weighing, so Hold stands." in out
     assert "• <b>For the bull</b> price is above the 10 EMA (82,733)" in out
-    assert "Missing: spot volume and ETF flow size" in out and "Sizing is relative" in out
+    assert "Missing: spot volume and ETF flow size. Sizing is relative." in out
 
 
 def test_analyze_sends_card_then_report(bot, monkeypatch):

@@ -31,73 +31,117 @@ def say(chat, text, **kw):
     call("sendMessage", json={"chat_id": chat, "text": text[:4096], **kw})
 
 
-GAPS = r"data (?:conflict and )?gaps?|gaps?|missing\b"
-GAPS_RE = re.compile(GAPS, re.I)
 EMOJI = {"Buy": "🟢", "Overweight": "🟢", "Hold": "🟡", "Underweight": "🔴", "Sell": "🔴"}
+NUM = r"~?\$?\d+(?:,\d{3})*(?:\.\d+)?k?"
+TRIGGER = re.compile(rf"\bcloses?\b(?: a day| back| decisively)?\s+(above|below)\s+(?:about |roughly |~)?({NUM})", re.I)
+GAPS_LABEL = re.compile(r"data (?:conflict and )?gaps?|gaps?|missing\b", re.I)
+GAP_SENTENCE = re.compile(
+    r"^(?:missing|data gaps?|gaps?)\b|^no\b[^.]{0,80}\b(?:data|figures?|feeds?|series|inputs?|information)\b"
+    r"|\b(?:was|were) not provided\b|\bunavailable\b", re.I)
+CONCLUSION = re.compile(r"\b(?:therefore|stands|intact|weak|not supported|too even|favou?rs?|wins?|decisive|balanced)\b", re.I)
 
 
-def clip(text, n):
-    """Cut at a word boundary so a number is never split."""
-    text = text.replace("**", "").strip()
-    return text if len(text) <= n else text[:n].rsplit(" ", 1)[0] + "…"
+def sentences(text):
+    """Whole sentences, list items and markdown stripped; the card never cuts one."""
+    out = []
+    for line in text.replace("**", "").splitlines():
+        line = re.sub(r"^\s*(?:[-•]|\d+[.)])\s+", "", line).strip()
+        out += re.split(r"(?<=[.!?])\s+(?=[A-Z$\d(\"'])", line) if line else []
+    return out
+
+
+def fit(parts, limit, sep=" "):
+    """Join whole parts in order while they fit; a part that does not fit is skipped, not cut."""
+    kept = []
+    for part in parts:
+        if len(sep.join(kept + [part])) <= limit:
+            kept.append(part)
+    return sep.join(kept)
 
 
 def summarize(ticker, date, decision, trade_plan=""):
     """Short HTML chat card from the Portfolio Manager's decision and the Trader's levels.
 
     Both are rendered with fixed `**Label**:` fields (render_pm_decision,
-    render_trader_proposal), so levels are read by label and stay exact; only prose is
-    clipped. The full text goes in the attached report.
+    render_trader_proposal), so levels are read by label and stay exact. Prose is only ever
+    chosen by whole sentence, never cut; the full text goes in the attached report.
     """
     labels = "Rating|Executive Summary|Investment Thesis|Price Target|Time Horizon"
     parts = re.split(rf"\*\*({labels})\*\*: ", decision)
     f = {k: v.strip() for k, v in zip(parts[1::2], parts[2::2], strict=True)}
     if "Rating" not in f:  # shortcut: unknown shape, send it raw; fix if render_pm_decision changes
         return html.escape(decision[:3500], quote=False)
+
     def e(x):
         return html.escape(x, quote=False)  # Telegram only needs & < > escaped
 
-    rating = f["Rating"]
-    out = [f"{EMOJI.get(rating, '⚪')} <b>{e(ticker)}</b> · {e(date)}", f"<b>{e(rating)}</b> · horizon {e(clip(f.get('Time Horizon', 'n/a'), 60))}"]
+    def given(value):
+        return value if value and value.strip().lower() != "not provided" else None
+
+    rating, horizon = f["Rating"], given(f.get("Time Horizon"))
+    if horizon and len(horizon) > 60:  # "2-6 weeks, or until ..." -> the period itself
+        horizon = horizon.split(",")[0]
+    out = [f"{EMOJI.get(rating, '⚪')} <b>{e(ticker)}</b> · {e(date)}",
+           f"<b>{e(rating)}</b>" + (f" · horizon {e(horizon)}" if horizon else "")]
 
     t = dict(re.findall(r"\*\*(Entry Price|Stop Loss|Position Sizing)\*\*: (.+)", trade_plan))
     levels = {"Entry": t.get("Entry Price"), "Stop": t.get("Stop Loss"), "Target": f.get("Price Target"),
               "Size": t.get("Position Sizing")}
     # A long sizing paragraph belongs in the report; the card shows only a short one.
-    levels = [f"{k} <b>{e(v.strip())}</b>" for k, v in levels.items()
-              if v and v.strip() != "not provided" and len(v) <= 40]
+    levels = [f"{k} <b>{e(v.strip())}</b>" for k, v in levels.items() if given(v) and len(v) <= 40]
     if levels:
         out += ["", "📍 " + " · ".join(levels)]
 
-    out += ["", e(clip(f.get("Executive Summary", ""), 600))]
+    summary = sentences(f.get("Executive Summary", ""))
+    # shortcut: a lone sentence over the limit is cut at a word (rare); fix if the PM starts writing run-ons
+    out += ["", e(fit(summary, 600) or summary[0][:600].rsplit(" ", 1)[0] + "…" if summary else "")]
 
-    # The thesis is bold-led blocks ("**Trend.** text" or "**Bullish evidence:**\n- item") or, when the
-    # PM writes plain paragraphs, one block per paragraph ("For the bull: text"). Show label + first bullet
-    # or sentence of the first three, and fold the gaps block into one line.
+    # The thesis is bold-led blocks ("**Trend.** text", "**Evidence:**\n- item") or plain paragraphs
+    # ("For the bull: text"). A block is (label, sentences).
     thesis = f.get("Investment Thesis", "")
-    blocks = re.findall(r"\*\*([^*\n]+?)[.:]?\*\*[.:]?\s*(.*?)(?=\n\*\*|\Z)", thesis, re.DOTALL)
-    if not blocks:  # plain paragraphs: "Data gap. text", "Gaps: text", "For the bull: text"
-        blocks = [m.groups() if (m := re.match(rf"((?:{GAPS})[^.:\n]*|[^.:\n]{{3,40}})\s*[.:]\s*(.*)", para.strip(), re.DOTALL | re.I))
-                  and (GAPS_RE.match(m.group(1)) or para.strip()[len(m.group(1))] == ":")
-                  else ("", para.strip()) for para in re.split(r"\n\s*\n", thesis)]
+    raw = re.findall(r"\*\*([^*\n]+?)[.:]?\*\*[.:]?\s*(.*?)(?=\n\*\*|\Z)", thesis, re.DOTALL)
+    if not raw:
+        for para in re.split(r"\n\s*\n", thesis):
+            m = re.match(rf"((?:{GAPS_LABEL.pattern})[^.:\n]*|[^.:\n]{{3,40}})\s*[.:]\s*(.*)", para.strip(), re.DOTALL | re.I)
+            ok = m and (GAPS_LABEL.match(m.group(1)) or para.strip()[len(m.group(1))] == ":")
+            raw.append(m.groups() if ok else ("", para.strip()))
+    blocks = [(label, sentences(body)) for label, body in raw]
+    prose = [x for label, ss in blocks if not GAPS_LABEL.match(label) for x in ss]
 
-    def is_gaps(label):
-        return bool(GAPS_RE.match(label))
+    # Trigger levels, as their own line: every "close above/below N" the PM states (summary first).
+    triggers = {}
+    for sentence in summary + prose:
+        for direction, number in TRIGGER.findall(sentence):
+            if len(re.sub(r"\D", "", number)) >= 3 or number.lower().endswith("k"):
+                triggers.setdefault((direction.lower(), number.lstrip("~")), None)
+    ups = [f"close above <b>{e(n)}</b>" for d, n in triggers if d == "above"]
+    downs = [f"close below <b>{e(n)}</b>" for d, n in triggers if d == "below"]
+    if ups or downs:
+        out += ["", "🎯 " + " · ".join([f"▲ {x}" for x in ups[:2]] + [f"▼ {x}" for x in downs[:2]])]
 
-    gaps = [(label, body) for label, body in blocks if is_gaps(label)]
+    # Up to three conclusions: per block, a whole sentence that is short enough and not already a trigger,
+    # a gap or the summary; one that states a conclusion is preferred.
     bullets = []
-    for label, body in [x for x in blocks if not is_gaps(x[0])]:
-        body = body.strip()
-        first = re.match(r"- (.+)", body) or re.match(r"(.+?[.!?])(?:\s|$)", body, re.DOTALL)
-        if first and len(first.group(1)) > 25 and len(bullets) < 3:  # a bare "Aggressive:" sub-label says nothing
-            bullets.append(f"• {f'<b>{e(clip(label, 40))}</b> ' if label else ''}{e(clip(first.group(1), 150))}")
+    for label, ss in blocks:
+        if GAPS_LABEL.match(label) or len(bullets) == 3:
+            continue
+        usable = [x for x in ss if 20 <= len(x) <= 170 and x[-1] != ":" and not TRIGGER.search(x)
+                  and not GAP_SENTENCE.search(x) and x not in summary]  # a trailing ":" is a lead-in
+        if usable:
+            pick = next((x for x in usable if CONCLUSION.search(x)), usable[0])
+            bullets.append(f"• {f'<b>{e(label)}</b> ' if label and len(label) <= 40 else ''}{e(pick)}")
     if bullets:
         out += [""] + bullets
-    if gaps:
-        label, body = gaps[0]
-        items = [x.strip("- ").strip().rstrip(".") for x in body.strip().splitlines() if x.strip()]
-        lead = "Missing: " if label.lower().startswith("missing") else "Gaps: "
-        out += ["", f"⚠️ <i>{lead}{e(clip('; '.join(items), 260))}</i>"]
+
+    # Gaps: a labelled block's items, else any sentence that says something was not provided.
+    gap_text = ""
+    for label, ss in blocks:
+        if GAPS_LABEL.match(label) and (items := fit([x if x[-1] in ".!?" else x + "." for x in ss], 260)):
+            gap_text = ("Missing: " if label.lower().startswith("missing") else "Gaps: ") + items
+            break
+    gap_text = gap_text or fit([x for x in prose if GAP_SENTENCE.search(x)], 260)
+    if gap_text:
+        out += ["", f"⚠️ <i>{e(gap_text)}</i>"]
     out += ["", "📎 Full report attached."]
     return "\n".join(out)
 
