@@ -3,7 +3,7 @@ it against its benchmark and record a reflection on it in the memory log."""
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.market import get_closes
@@ -35,7 +35,7 @@ def resolve_benchmark(ticker: str, config: dict) -> str:
     return benchmark_map.get("", "SPY")
 
 
-def _by_day(closes):
+def _by_day(closes, now: datetime):
     """Closes keyed by the calendar day of their bar, missing closes dropped.
 
     Yahoo stamps a daily bar at midnight in its market's time zone (UTC for a
@@ -44,7 +44,16 @@ def _by_day(closes):
     score on.
     """
     closes = closes[closes > 0]
-    if getattr(closes.index, "tz", None) is not None:
+    if closes.empty:
+        return closes
+    # A daily candle's Close is still a live quote during its session. Without
+    # a final-bar marker, wait until the next local day before settling it.
+    # Yahoo supplies the exchange timezone; missing timezone metadata falls
+    # back to UTC, never the machine's local timezone.
+    zone = getattr(closes.index, "tz", None)
+    today = now.astimezone(zone or UTC).date()
+    closes = closes[closes.index.date < today]
+    if zone is not None:
         closes = closes.tz_localize(None)
     return closes
 
@@ -63,7 +72,9 @@ def fetch_returns(
     holding_days, resolution_date)`` — where ``resolution_date`` is the date
     of the last price bar used, i.e. when the outcome became known (#1251) —
     or ``(None, None, None, None)`` when the full holding window has not traded
-    yet (#1169). A failure to get or read the prices is raised, for the caller
+    yet (#1169). Current-day candles are withheld until the next day in their
+    market's timezone (UTC when absent), even after the market closes.
+    A failure to get or read the prices is raised, for the caller
     to report.
     """
     start = datetime.strptime(trade_date, "%Y-%m-%d")
@@ -71,14 +82,15 @@ def fetch_returns(
     # calendar span they occupy (about 7 for every 5) plus a week for holidays.
     end = start + timedelta(days=round((holding_days + 1) * 7 / 5) + 7)
     end_str = end.strftime("%Y-%m-%d")
+    now = datetime.now(UTC)
 
     # Closes for the instrument the analysis priced (XAUUSD -> GC=F, #984),
     # from the first session after the decision date.
-    stock = _by_day(get_closes(ticker, trade_date, end_str))
+    stock = _by_day(get_closes(ticker, trade_date, end_str), now)
     stock = stock[stock.index > start]
     # From a week earlier, so the benchmark has a close on or before entry.
     bench_start = (start - timedelta(days=7)).strftime("%Y-%m-%d")
-    bench = _by_day(get_closes(benchmark, bench_start, end_str))
+    bench = _by_day(get_closes(benchmark, bench_start, end_str), now)
 
     # Require the full holding window to have traded. A rerun before it has
     # leaves the entry pending to retry next run, rather than settling on a

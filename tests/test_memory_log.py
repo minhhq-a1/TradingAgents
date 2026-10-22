@@ -1314,3 +1314,63 @@ def test_a_run_does_not_wait_on_another_settlement_pass(tmp_path):
     worker.join()
 
     assert elapsed < 1 and result.settled == [] and result.failed == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('zone', ['America/New_York', 'Asia/Tokyo', 'UTC', None])
+def test_settlement_waits_for_next_market_day(tmp_path, monkeypatch, zone):
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    market_zone = ZoneInfo(zone) if zone else UTC
+
+    class Clock(datetime):
+        instant = datetime(2026, 10, 22, 13, tzinfo=market_zone)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.instant.astimezone(tz)
+
+    monkeypatch.setattr(settlement, 'datetime', Clock)
+    idx = pd.bdate_range('2026-10-15', '2026-10-22', tz=zone)
+    stock = pd.Series([100., 101., 102., 103., 104., 110.], index=idx)
+    bench = pd.Series(100., index=idx)
+    monkeypatch.setattr(settlement, 'get_closes', lambda ticker, *_: stock if ticker == 'AAPL' else bench)
+    log = make_log(tmp_path)
+    log.store_decision('AAPL', '2026-10-14', DECISION_BUY)
+    reflector = MagicMock()
+    reflector.reflect_on_final_decision.return_value = 'lesson'
+
+    result = settlement.settle_pending('AAPL', log, reflector, {})
+    assert not result.settled and not result.failed
+    assert len(log.get_pending_entries()) == 1
+    reflector.reflect_on_final_decision.assert_not_called()
+
+    # The final close reverses the intraday gain. Only that final value is saved.
+    stock.iloc[-1] = 90.
+    Clock.instant = datetime(2026, 10, 23, 0, 1, tzinfo=market_zone)
+    result = settlement.settle_pending('AAPL', log, reflector, {})
+    assert result.settled == [('AAPL', '2026-10-14')]
+    assert log.load_entries()[0]['raw'] == '-10.0%'
+    reflector.reflect_on_final_decision.assert_called_once()
+
+
+@pytest.mark.unit
+def test_settlement_waits_for_benchmark_local_day_to_finish(monkeypatch):
+    from datetime import UTC, datetime
+
+    class Clock(datetime):
+        # Already Oct 23 in Tokyo, but the Oct 22 US candle is still live.
+        instant = datetime(2026, 10, 22, 16, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.instant.astimezone(tz)
+
+    monkeypatch.setattr(settlement, 'datetime', Clock)
+    stock = pd.Series(100., index=pd.bdate_range('2026-10-15', '2026-10-22', tz='Asia/Tokyo'))
+    bench = pd.Series(100., index=pd.bdate_range('2026-10-15', '2026-10-22', tz='America/New_York'))
+    monkeypatch.setattr(settlement, 'get_closes', lambda ticker, *_: bench if ticker == 'SPY' else stock)
+    assert settlement.fetch_returns('7203.T', '2026-10-14') == (None, None, None, None)
+    Clock.instant = datetime(2026, 10, 23, 4, 1, tzinfo=UTC)
+    assert settlement.fetch_returns('7203.T', '2026-10-14') == (0., 0., 5, '2026-10-22')

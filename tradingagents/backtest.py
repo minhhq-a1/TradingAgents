@@ -149,7 +149,10 @@ def run_backtest(
     run_dir = Path(config["results_dir"]) / "backtest" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     run_config = {**config, "results_dir": str(run_dir),
-                  "memory_log_path": str(run_dir / "trading_memory.md")}
+                  "memory_log_path": str(run_dir / "trading_memory.md"),
+                  # This log is also the results table and resume ledger.
+                  # Rotating it would erase scores and rerun completed cells.
+                  "memory_log_max_entries": None}
 
     graph = TradingAgentsGraph(selected_analysts, config=run_config)
     result = BacktestResult(run_id=run_id, log_path=Path(run_config["memory_log_path"]))
@@ -174,7 +177,11 @@ def run_backtest(
     # last cell would stay pending without this pass.
     for ticker in tickers:
         try:
-            graph.settle_pending(ticker)
+            outcome = graph.settle_pending(ticker)
+            result.settlement_failures.extend(
+                (failed_ticker, f"{date}: {reason}")
+                for failed_ticker, date, reason in outcome.failed
+            )
         except Exception as exc:  # reflection calls an LLM; one failure is not the sweep's
             logger.warning("Settling %s failed: %s", ticker, exc)
             result.settlement_failures.append((ticker, str(exc)))
