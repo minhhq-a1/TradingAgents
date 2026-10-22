@@ -170,6 +170,7 @@ class TestRenderResearchPlan:
 def _make_trader_state():
     return {
         "company_of_interest": "NVDA",
+        "trade_date": "2026-08-14",
         "investment_plan": "**Recommendation**: Buy\n**Rationale**: ...\n**Strategic Actions**: ...",
         "market_report": "Current price $189.5; 14-day ATR 4.2; support $178, resistance $196.",
     }

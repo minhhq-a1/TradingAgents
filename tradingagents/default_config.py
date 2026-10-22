@@ -161,7 +161,8 @@ def build_default_config() -> dict:
             # Statements come from SEC EDGAR as filed (US filers), then Yahoo; the
         # overview and insider tools, which SEC EDGAR does not serve, from Yahoo.
         "fundamental_data": "sec_edgar,yfinance",  # Options: sec_edgar, alpha_vantage, yfinance
-            "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+            # crypto_rss serves crypto only (Yahoo tags no news to most altcoins).
+            "news_data": "yfinance,crypto_rss",  # Options: alpha_vantage, yfinance, crypto_rss
             "macro_data": "fred,yfinance",       # Options: fred (needs FRED_API_KEY), yfinance (rates/DXY/VIX only)
             "prediction_markets": "polymarket",  # Options: polymarket (keyless)
             # Keyless. Binance refuses restricted regions (the US), so the chain falls back.

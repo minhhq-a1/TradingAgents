@@ -51,6 +51,7 @@ def test_trader_prompt_states_constraint():
     llm = _capturing_llm(captured, TraderProposal(action=TraderAction.BUY, reasoning="x"))
     create_trader(llm)({
         "company_of_interest": "NVDA",
+        "trade_date": "2026-08-14",
         "investment_plan": "**Recommendation**: Buy",
         "market_report": "Current price $189.5; ATR 4.2.",
     })

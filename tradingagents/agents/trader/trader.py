@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pandas as pd
 from langchain_core.messages import AIMessage
 
 from tradingagents.agents.context import (
@@ -9,12 +10,63 @@ from tradingagents.agents.context import (
     get_language_instruction,
     get_portfolio_context_from_state,
 )
-from tradingagents.agents.schemas import TraderProposal, render_trader_proposal
+from tradingagents.agents.schemas import TraderAction, TraderProposal, render_trader_proposal
 from tradingagents.agents.structured import (
     NO_EXTERNAL_TOOLS,
     bind_structured,
     invoke_structured_or_freetext,
 )
+from tradingagents.dataflows.errors import VendorError
+from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
+
+STOP_ATR_MULTIPLE = 1.5
+ATR_WINDOW = 14
+
+
+def _atr(symbol: str, trade_date: str) -> float:
+    """Average true range over the last ``ATR_WINDOW`` bars up to ``trade_date``."""
+    bars = load_ohlcv(symbol, trade_date)
+    close_before = bars["Close"].shift()
+    true_range = pd.concat(
+        [bars["High"] - bars["Low"], (bars["High"] - close_before).abs(),
+         (bars["Low"] - close_before).abs()], axis=1,
+    ).max(axis=1)
+    return float(true_range.tail(ATR_WINDOW).mean())
+
+
+def check_levels(proposal: TraderProposal, symbol: str, trade_date: str) -> TraderProposal:
+    """A proposal whose stop sits on the losing side of its entry.
+
+    A Buy loses below its entry and a Sell above it, so a Buy stop at or above
+    entry (or a Sell stop at or below) is a contradictory order that would fill
+    at once. The model writes these (a trim of a long reads as a Sell with the
+    long's stop), so the code, not the model, fixes the level: the stop is
+    recomputed as entry -/+ ``STOP_ATR_MULTIPLE`` x ATR, or dropped when no
+    price history is available, and the correction is stated in the reasoning.
+    """
+    entry, stop, action = proposal.entry_price, proposal.stop_loss, proposal.action
+    if entry is None or stop is None or action is TraderAction.HOLD:
+        return proposal
+    buying = action is TraderAction.BUY
+    if stop < entry if buying else stop > entry:
+        return proposal
+
+    side = "below" if buying else "above"
+    try:
+        atr = _atr(symbol, trade_date)
+    except VendorError:
+        atr = None
+    if atr is None or pd.isna(atr):
+        fixed, how = None, "dropped it, as no price history was available to recompute it"
+    else:
+        distance = STOP_ATR_MULTIPLE * atr
+        fixed = round(entry - distance if buying else entry + distance, 6)
+        how = f"replaced it with {fixed} ({STOP_ATR_MULTIPLE} x ATR({ATR_WINDOW}) = {distance:.6g} {side} entry)"
+    note = (
+        f" [Level check: the proposed stop-loss {stop} is not {side} the {entry} entry "
+        f"of a {action.value}, so the order contradicted itself; the system {how}.]"
+    )
+    return proposal.model_copy(update={"stop_loss": fixed, "reasoning": proposal.reasoning + note})
 
 
 def create_trader(llm):
@@ -57,6 +109,7 @@ def create_trader(llm):
                     "instrument's quote currency (for example 189.5), never a percentage "
                     "or a range; convert a percentage distance to the price level it "
                     "implies, or omit the field if you cannot state a number. "
+                    "A Buy's stop-loss is below its entry price and a Sell's is above it. "
                     + NO_EXTERNAL_TOOLS
                     + get_language_instruction()
                 ),
@@ -86,7 +139,10 @@ def create_trader(llm):
             structured_llm,
             llm,
             messages,
-            render_trader_proposal,
+            # shortcut: a free-text fallback reply is not parsed, so its levels go unchecked.
+            lambda proposal: render_trader_proposal(
+                check_levels(proposal, company_name, state["trade_date"])
+            ),
             "Trader",
         )
 
