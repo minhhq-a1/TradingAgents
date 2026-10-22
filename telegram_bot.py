@@ -30,12 +30,39 @@ def say(chat, text):
     call("sendMessage", json={"chat_id": chat, "text": text[:4096]})
 
 
+def summarize(ticker, date, decision, limit=4096):
+    """Chat summary of the Portfolio Manager's decision, within Telegram's message cap.
+
+    The decision is rendered by `render_pm_decision` with fixed `**Label**:` fields,
+    so the fields are split by label; the thesis is cut at a line boundary to fit,
+    but its "Data gaps" block is always kept.
+    """
+    parts = re.split(r"\*\*(Rating|Executive Summary|Investment Thesis|Price Target|Time Horizon)\*\*: ", decision)
+    f = {k: v.strip() for k, v in zip(parts[1::2], parts[2::2], strict=True)}
+    if "Rating" not in f:  # shortcut: unknown shape, send it raw; fix if render_pm_decision changes
+        return decision[:limit]
+    thesis = f.get("Investment Thesis", "")
+    gaps = re.search(r"\*\*Data gaps:?\*\*:?.*?(?=\n\*\*|\Z)", thesis, re.DOTALL)
+    if gaps:
+        thesis = thesis.replace(gaps.group(0), "").strip()
+    head = (f"{ticker} {date}: {f['Rating']}\n"
+            f"Target: {f.get('Price Target', 'n/a')} | Horizon: {f.get('Time Horizon', 'n/a')}\n\n"
+            f"{f.get('Executive Summary', '')}")
+    tail = (gaps.group(0) if gaps else "") + "\n\nFull report attached."
+    room = limit - len(head) - len(tail) - 20
+    if room > 0 and thesis:
+        if len(thesis) > room:
+            thesis = thesis[:room].rsplit("\n", 1)[0] + "\n..."
+        head += f"\n\n{thesis}"
+    return (head + "\n\n" + tail.strip()).replace("**", "")[:limit]
+
+
 def analyze(chat, ticker, date):
     kind = detect_asset_type(ticker)
     analysts = [a.value for a in filter_analysts_for_asset_type(list(AnalystType), kind)]
     graph = TradingAgentsGraph(selected_analysts=analysts, config=DEFAULT_CONFIG.copy())
-    state, signal = graph.propagate(ticker, date, asset_type=kind.value)
-    say(chat, f"{ticker} {date}: {signal}")
+    state, _ = graph.propagate(ticker, date, asset_type=kind.value)
+    say(chat, summarize(ticker, date, state["final_trade_decision"]))
     # Telegram caps a message at 4096 chars, so the full report goes as a file.
     with tempfile.TemporaryDirectory() as tmp:
         report = graph.save_reports(state, ticker, tmp, html=False)
