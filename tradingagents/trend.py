@@ -1,19 +1,23 @@
 """BTC trend rule, paper only: UTC close above its 200-day SMA means hold BTC, otherwise cash.
 
-The rule is fixed, with nothing to tune. ``check`` reads the last *closed* UTC daily bar
-(Binance first, Yahoo as the fallback), compares the state with the one saved in the data
-volume, and sends a message only when it flipped. The decision is made here from prices; any
-text written around it can never change it. No order is ever placed.
+The rule is fixed, with nothing to tune. ``check`` reads the last *closed* UTC daily bars
+(Binance first, Yahoo as the fallback), turns each new bar into a state, and messages Telegram
+only when the state flips. The decision is made here from prices; any text written around it can
+never change it. No order is ever placed.
 
-The book is split: ``TREND_CORE_WEIGHT`` (default 0.5) of it is held in BTC permanently and the
-rest follows the rule. ``simulate`` is the one model of that book, used by ``/paper`` and by
-``scripts/core_trend_backtest.py``: a signal read at a close fills at the next open, 0.1% fee per
-side, no rebalancing between the two sleeves.
+Two things are kept apart. The *rule* is what the SMA200 says on every closed day. The *operated*
+book is what this bot actually saw: a day processed late, after the bot was down, is a day nobody
+could act on, so the operated book holds its position through an outage and catches up when the
+bot is back. ``/paper`` shows both, from the bars stored when each day was processed, so a later
+data revision or a changed ``TREND_CORE_WEIGHT`` cannot rewrite the past.
 
-State is saved before a message goes out and cleared once it is delivered, so a restart can
-neither skip an alert nor repeat a delivered one. The ledger keeps the detection time and the
-send time apart: the backtest fills at the next 00:00 UTC open, which nobody who reads a message
-afterwards can get.
+The book starts as cash at the close of its first day and every signal, the first included,
+fills at the next open: 0.1% fee per side, ``TREND_CORE_WEIGHT`` (default 0.5) of the capital in
+a BTC sleeve that is never sold, the rest in a sleeve that follows the rule, no rebalancing.
+``simulate`` is that one model, shared with ``tradingagents.trend_backtest``.
+
+State is saved before a message goes out and each chat's delivery is recorded on its own, so a
+restart can neither lose a flip nor repeat a delivered one, and one failing chat blocks no other.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ FEE = 0.001  # per side, as in the validation
 WATCH = ("BTCUSDT",)  # the only symbol the rule was validated on
 RUN_AT = (0, 5)  # UTC hour, minute: the daily bar is final a few minutes after midnight
 RETRY_SECONDS, RETRIES = 600, 12  # a late bar or a failed fetch is retried for about two hours
+REVISION = 0.005  # a stored close that a later fetch moves by more than this is a data event
 DIR = os.path.join(os.path.expanduser("~"), ".tradingagents", "trend")
 
 HOLD, CASH = "HOLD", "CASH"
@@ -51,6 +56,14 @@ class StaleData(Exception):
     """The newest closed bar is older than yesterday (UTC), so the signal is not for today."""
 
 
+class DataGap(Exception):
+    """A calendar day is missing from the bars the signal needs, so no signal is made."""
+
+
+class SendFailed(Exception):
+    """At least one chat did not get a message; the others did, and only this one is retried."""
+
+
 def core_weight() -> float:
     """Share of the book held in BTC permanently (env ``TREND_CORE_WEIGHT``, default 0.5)."""
     weight = float(os.environ.get("TREND_CORE_WEIGHT", "0.5"))
@@ -59,16 +72,27 @@ def core_weight() -> float:
     return weight
 
 
-def bars(symbol: str, today: datetime | None = None) -> pd.DataFrame:
-    """Open and Close of the completed UTC days, oldest first, indexed by date."""
+def bars(symbol: str, today: datetime | None = None) -> tuple[pd.DataFrame, str]:
+    """Open and Close of the completed UTC days, oldest first, indexed by date, and where they came from."""
     today = (today or datetime.now(UTC)).date()
     frame = fetch_daily_klines(symbol, (today - timedelta(days=900)).isoformat(), today.isoformat())
-    if frame is None:  # Binance unreachable: the fallback, with the open day cut off
-        frame = load_ohlcv(symbol, (today - timedelta(days=1)).isoformat()).set_index("Date")
+    source = "binance"
+    if frame is None:  # Binance unreachable: the fallback, with the open day cut off and no gaps filled in
+        source = "yahoo"
+        frame = load_ohlcv(symbol, (today - timedelta(days=1)).isoformat(), fill_gaps=False).set_index("Date")
         frame = frame[frame.index.normalize().date < today]
     out = frame[["Open", "Close"]].astype(float)
     out.index = pd.DatetimeIndex(out.index).tz_localize(None).normalize()
-    return out
+    return out, source
+
+
+def require_continuous(frame: pd.DataFrame, extra: int = 0) -> None:
+    """Every calendar day of the SMA window (plus ``extra`` newer days) must be present."""
+    last = frame.index[-1]
+    expected = pd.date_range(end=last, periods=WINDOW + extra, freq="D")
+    missing = expected.difference(frame.index)
+    if len(missing):
+        raise DataGap(f"{len(missing)} day(s) missing from the last {len(expected)}, first {missing[0].date()}")
 
 
 def states(close: pd.Series) -> pd.Series:
@@ -77,27 +101,29 @@ def states(close: pd.Series) -> pd.Series:
     return pd.Series(HOLD, index=close.index).where(close > sma, CASH)[sma.notna()]
 
 
-def simulate(frame: pd.DataFrame, weight: float = 0.5, fee: float = FEE) -> pd.DataFrame:
-    """Equity of the hold sleeve, the trend sleeve and their mix, each 1.0 at the first signal day.
-
-    The signal read at a close fills at the next open. A day's return is close to close while the
-    position carries over, open to close on the day it is bought, and previous close to open on
-    the day it is sold; each trade costs ``fee``. The sleeves are never rebalanced.
-    """
-    state = states(frame["Close"])
-    frame = frame.loc[state.index[0]:]
-    held = (state == HOLD).astype(float)
-    during = held.shift(fill_value=held.iloc[0])  # the signal of the previous close, in force all day
-    before = during.shift(fill_value=held.iloc[0])  # what was carried in from the previous close
+def _sleeve(frame: pd.DataFrame, held: pd.Series, fee: float) -> pd.Series:
+    """Equity of one sleeve: cash on the first day, a signal read at a close fills at the next open."""
+    during = held.shift(fill_value=0.0)  # the previous close's signal, in force all day
+    before = during.shift(fill_value=0.0)  # what was carried in from the previous close
     prev, open_, close = frame["Close"].shift(), frame["Open"], frame["Close"]
     gross = np.select(
         [(before == 1) & (during == 1), (before == 1) & (during == 0), (before == 0) & (during == 1)],
         [close / prev - 1, open_ / prev - 1, close / open_ - 1], 0.0)
-    ret = pd.Series(gross, index=frame.index)
-    ret = ((1 + ret) * (1 - fee * (before != during))) - 1
+    ret = ((1 + pd.Series(gross, index=frame.index)) * (1 - fee * (before != during))) - 1
     ret.iloc[0] = 0.0
-    trend = (1 + ret).cumprod() * (1 - fee * held.iloc[0])  # the opening position is bought at the first close
-    hold = close / close.iloc[0] * (1 - fee)
+    return (1 + ret).cumprod()
+
+
+def simulate(frame: pd.DataFrame, state: pd.Series, weight: float = 0.5, fee: float = FEE) -> pd.DataFrame:
+    """Equity of the hold sleeve, the trend sleeve and their mix, each 1.0 (all cash) on the first day.
+
+    ``state`` is the HOLD/CASH decided at each close, on the same days as ``frame``. A day's return
+    is close to close while the position carries over, open to close on the day it is bought, and
+    previous close to open on the day it is sold; each trade costs ``fee``.
+    """
+    assert frame.index.equals(state.index), "frame and state must cover the same days"
+    hold = _sleeve(frame, pd.Series(1.0, index=frame.index), fee)
+    trend = _sleeve(frame, (state == HOLD).astype(float), fee)
     return pd.DataFrame({"hold": hold, "trend": trend, "mix": weight * hold + (1 - weight) * trend})
 
 
@@ -109,7 +135,7 @@ def metrics(equity: pd.Series) -> dict:
 
 
 def latest(symbol: str, today: datetime | None = None, frame: pd.DataFrame | None = None) -> dict:
-    frame = frame if frame is not None else bars(symbol, today)
+    frame = frame if frame is not None else bars(symbol, today)[0]
     close = frame["Close"]
     state = states(close)
     if state.empty:
@@ -117,6 +143,7 @@ def latest(symbol: str, today: datetime | None = None, frame: pd.DataFrame | Non
     day = state.index[-1]
     if day.date() < ((today or datetime.now(UTC)).date() - timedelta(days=1)):
         raise StaleData(f"{symbol}: newest closed bar is {day.date()}")
+    require_continuous(frame)
     run = state[state != state.iloc[-1]]  # the streak began the day after the last opposite state
     since = state.index[state.index.get_loc(run.index[-1]) + 1] if len(run) else state.index[0]
     return {"symbol": symbol, "state": state.iloc[-1], "date": day.date().isoformat(), "close": float(close.iloc[-1]),
@@ -149,20 +176,37 @@ def _distance(info: dict) -> str:
     return f"UTC close {info['date']}: {info['close']:,.0f} vs SMA200 {info['sma']:,.0f} ({info['close'] / info['sma'] - 1:+.1%})."
 
 
-def _split() -> str:
-    weight = core_weight()
+def _split(weight: float) -> str:
     return f"Book split: {weight:.0%} stays in BTC permanently, {1 - weight:.0%} follows this rule."
 
 
-def alert_text(info: dict, detected_at: str) -> str:
-    entering = info["state"] == HOLD
+def _head(state: str) -> str:
+    return f"{'🟢' if state == HOLD else '🔴'} BTCUSDT trend turned {'UP: rule says HOLD BTC' if state == HOLD else 'DOWN: rule says CASH'}"
+
+
+def alert_text(info: dict, detected_at: str, weight: float | None = None) -> str:
     return "\n".join([
-        f"{'🟢' if entering else '🔴'} {info['symbol']} trend turned {'UP: rule says HOLD BTC' if entering else 'DOWN: rule says CASH'}",
+        f"{_head(info['state'])}",
         _distance(info),
         "Rule: UTC close above SMA200 = hold BTC, otherwise cash. Paper signal only, no order was placed.",
-        _split(),
+        _split(core_weight() if weight is None else weight),
         f"Detected {detected_at[11:16]} UTC. The backtest fills at the 00:00 UTC open after this close; you cannot "
         "get that price, so a real fill will differ.",
+        WHIPSAW,
+    ])
+
+
+def late_text(flips: list[dict], info: dict, outage: dict, detected_at: str, weight: float) -> str:
+    """One message for signal changes found after the bot was offline: nobody could act on them on time."""
+    changes = [f"  {f['signal_date']}: {f['state']} (close {f['signal_close']:,.0f})" for f in flips]
+    return "\n".join([
+        f"⚠️ BTCUSDT trend check was offline from {outage['from']} to {outage['to']} ({outage['days']} days); "
+        f"{len(flips)} signal change(s) were found late, at {detected_at[11:16]} UTC, and could not be acted on in time:",
+        *changes,
+        f"Now: {'HOLD BTC' if info['state'] == HOLD else 'CASH'}. {_distance(info)}",
+        "The paper book shows two lines: the rule (every change filled at its next open) and as operated "
+        "(position held through the outage, moved to the current state when the bot was back).",
+        _split(weight),
         WHIPSAW,
     ])
 
@@ -172,6 +216,7 @@ def status_text(symbol: str = "BTCUSDT") -> str:
         return f"The trend rule was only validated on {', '.join(WATCH)}."
     try:
         info = latest(symbol.upper())
+        weight = (_load().get(symbol.upper()) or {}).get("core", core_weight())
     except Exception as exc:  # report, keep serving
         return f"Trend data unavailable: {exc}"
     now = "HOLD BTC" if info["state"] == HOLD else "CASH"
@@ -179,86 +224,168 @@ def status_text(symbol: str = "BTCUSDT") -> str:
         f"{info['symbol']} trend (paper): {now} since {info['since']}",
         _distance(info),
         "Rule: UTC close above SMA200 = hold BTC, otherwise cash. Fixed, no parameters.",
-        _split(),
+        _split(weight),
         WHIPSAW,
     ])
 
 
-def paper_text(symbol: str = "BTCUSDT", today: datetime | None = None) -> str:
-    """The paper book since the first check: ledger of flips and equity against buy-and-hold."""
+def _book(entry: dict) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """The stored days as bars, the rule's state on each, and the state the operated book held."""
+    days = pd.DataFrame(entry["days"]).set_index("date")
+    days.index = pd.DatetimeIndex(days.index)
+    held = []
+    for state, live in zip(days["state"], days["live"], strict=True):
+        held.append(state if live or not held else held[-1])  # a day processed late is not acted on
+    return days[["Open", "Close"]].astype(float), days["state"], pd.Series(held, index=days.index)
+
+
+def paper_text(symbol: str = "BTCUSDT") -> str:
+    """The paper book since the first check, from the stored days: no fetch, no revision, no env."""
     entry = _load().get(symbol)
     if entry is None:
         return "No paper book yet: the first daily check has not run."
-    try:
-        frame = bars(symbol, today)
-        info = latest(symbol, today, frame)
-    except Exception as exc:
-        return f"Paper data unavailable: {exc}"
-    start = pd.Timestamp(entry["start"]["date"])
-    weight = core_weight()
-    book = simulate(frame, weight).loc[start:]
-    book = book / book.iloc[0]  # shortcut: the opening purchase fee is left out; fees are 0.1% on a book that runs months
-    mix, hold = book["mix"].iloc[-1] * 100 - 100, book["hold"].iloc[-1] * 100 - 100
-    in_btc = weight + (1 - weight) * (info["state"] == HOLD)
+    frame, rule, operated = _book(entry)
+    weight = entry["core"]
+    if len(frame) < 2:
+        return f"{symbol} paper book opened {entry['start']['date']} as cash; no day has closed since, so no equity yet."
+    ideal, ops = simulate(frame, rule, weight), simulate(frame, operated, weight)
+
+    def pct(equity: pd.Series) -> str:
+        return f"{equity.iloc[-1] * 100 - 100:+.1f}%"
+
+    exposure = weight + (1 - weight) * (operated.iloc[-1] == HOLD)
     lines = [
-        f"{symbol} paper book since {entry['start']['date']} ({len(book) - 1} days, no real orders)",
-        f"Now: {in_btc:.0%} in BTC ({weight:.0%} core + trend sleeve {info['state']}). {_distance(info)}",
-        f"Equity: mix {mix:+.1f}% | buy-and-hold {hold:+.1f}% | trend only {book['trend'].iloc[-1] * 100 - 100:+.1f}% (0.1% fee per side, fills at next open)",
-        "Ledger (signal close -> next open fill, detected / sent UTC):",
+        f"{symbol} paper book since {entry['start']['date']} ({len(frame) - 1} days, no real orders), "
+        f"core {weight:.0%} fixed at the start",
+        f"Now: {exposure:.0%} in BTC ({weight:.0%} core + trend sleeve {operated.iloc[-1]}), through {frame.index[-1].date()}. "
+        "Sleeves start as cash and fill at the next open, 0.1% fee per side.",
+        f"Equity, rule (every change filled): mix {pct(ideal['mix'])} | 100% SMA200 {pct(ideal['trend'])} | buy-and-hold {pct(ideal['hold'])}",
     ]
+    if entry["gaps"]:
+        lines.append(f"Equity, as operated: mix {pct(ops['mix'])} | 100% SMA200 {pct(ops['trend'])} "
+                     f"(⚠ {sum(g['days'] for g in entry['gaps'])} offline day(s), position held through them)")
+    for event in entry["data_events"][-2:]:
+        lines.append(f"⚠ Data check: {event}")
+    lines.append("Ledger (signal close -> next open fill; detected / sent UTC):")
     for row in entry["ledger"][-5:]:
         fill = "pending" if row["fill_open"] is None else f"{row['fill_open']:,.0f}"
-        sent = row["sent_at"][5:16].replace("T", " ") if row["sent_at"] else "not yet"
-        detected = row["detected_at"][5:16].replace("T", " ")
-        lines.append(f"  {row['signal_date']} {row['state']}: close {row['signal_close']:,.0f} -> open {fill} "
-                     f"({row['fill_date']}), detected {detected}, sent {sent}")
+        sent = min(row["sent"].values())[5:16].replace("T", " ") if row["sent"] else "not yet"
+        lines.append(f"  {row['signal_date']} {row['state']}{' (late)' if row['late'] else ''}: close {row['signal_close']:,.0f} "
+                     f"-> open {fill} ({row['fill_date']}), detected {row['detected_at'][5:16].replace('T', ' ')}, sent {sent}")
     if not entry["ledger"]:
         lines.append("  no flips yet")
     lines.append("Reference only: " + WHIPSAW)
     return "\n".join(lines)
 
 
-def check(symbol: str, notify, today: datetime | None = None) -> bool:
-    """Compare today's state with the saved one and alert on a flip. True when an alert went out."""
-    frame = bars(symbol, today)
-    info = latest(symbol, today, frame)
+def _day(date: pd.Timestamp, frame: pd.DataFrame, state: pd.Series, sma: pd.Series, source: str, live: bool) -> dict:
+    return {"date": date.date().isoformat(), "Open": float(frame.loc[date, "Open"]), "Close": float(frame.loc[date, "Close"]),
+            "sma": float(sma[date]), "state": state[date], "source": source, "live": live}
+
+
+def _data_events(entry: dict, frame: pd.DataFrame, source: str) -> None:
+    """A new source, or a stored close that a later fetch moved, is logged and shown, never acted on."""
+    notes = []
+    if source != entry["source"]:
+        notes.append(f"source changed from {entry['source']} to {source}")
+    for day in entry["days"]:
+        stamp = pd.Timestamp(day["date"])
+        if stamp in frame.index and abs(frame.loc[stamp, "Close"] / day["Close"] - 1) > REVISION and day["date"] not in entry["revised"]:
+            entry["revised"].append(day["date"])
+            notes.append(f"close of {day['date']} is now {frame.loc[stamp, 'Close']:,.0f}, stored {day['Close']:,.0f} (kept)")
+    for note in notes:
+        entry["data_events"].append(note)
+        _log("data_event", note=note, source=source)
+    entry["source"] = source
+
+
+def check(symbol: str, send, chats, today: datetime | None = None) -> bool:
+    """Process every closed day since the last check and alert on flips.
+
+    ``send(chat, text)`` delivers to one chat. True when an alert was newly delivered to every chat.
+    """
+    now = today or datetime.now(UTC)
+    frame, source = bars(symbol, now)
+    close = frame["Close"]
+    state = states(close)
+    sma = close.rolling(WINDOW).mean()
+    if state.empty:
+        raise StaleData(f"{symbol}: fewer than {WINDOW} closed daily bars")
+    newest = state.index[-1]
+    if newest.date() < now.date() - timedelta(days=1):
+        raise StaleData(f"{symbol}: newest closed bar is {newest.date()}")
     data = _load()
-    saved = data.get(symbol)
-    if saved is None:  # first run: record where we are, alert on nothing
-        data[symbol] = {"state": info["state"], "checked": info["date"], "pending": None, "ledger": [],
-                        "start": {"date": info["date"], "close": info["close"], "state": info["state"]}}
+    entry = data.get(symbol)
+    if entry is None:  # first run: the book opens as cash at this close, and nothing is alerted
+        require_continuous(frame)
+        data[symbol] = entry = {
+            "core": core_weight(), "source": source, "state": state[newest], "checked": newest.date().isoformat(),
+            "start": {"date": newest.date().isoformat(), "close": float(close[newest])},
+            "days": [_day(newest, frame, state, sma, source, True)], "ledger": [], "gaps": [], "data_events": [],
+            "revised": [], "pending": None}
         _save(data)
-        _log("baseline", **info)
+        _log("baseline", source=source, date=newest.date().isoformat())
         return False
 
-    for row in saved["ledger"]:  # the fill price is known once the fill day's bar has closed
-        if row["fill_open"] is None and pd.Timestamp(row["fill_date"]) in frame.index:
-            row["fill_open"] = float(frame.loc[pd.Timestamp(row["fill_date"]), "Open"])
-    if info["state"] != saved["state"]:  # a newer flip replaces an undelivered older one
-        detected = datetime.now(UTC).isoformat(timespec="seconds")
-        fill_date = (pd.Timestamp(info["date"]) + timedelta(days=1)).date().isoformat()
-        saved["ledger"].append({"signal_date": info["date"], "state": info["state"], "signal_close": info["close"],
-                                "sma200": info["sma"], "fill_date": fill_date, "fill_open": None,
-                                "detected_at": detected, "sent_at": None})
-        saved.update(state=info["state"], pending={"info": info, "detected_at": detected, "row": len(saved["ledger"]) - 1})
-        _save(data)  # before sending: a crash now resends once, it cannot lose the flip
-        _log("detected", detected_at=detected, **info)
-    saved["checked"] = info["date"]
-    pending = saved["pending"]
+    new = state.index[state.index > pd.Timestamp(entry["checked"])]
+    require_continuous(frame, len(new))
+    _data_events(entry, frame, source)
+    flips = []
+    for date in new:
+        live = date == newest  # only the newest bar is processed on time; the rest were missed while offline
+        entry["days"].append(_day(date, frame, state, sma, source, live))
+        for row in entry["ledger"]:
+            if row["fill_open"] is None and row["fill_date"] == date.date().isoformat():
+                row["fill_open"] = float(frame.loc[date, "Open"])
+        if state[date] != entry["state"]:
+            entry["state"] = state[date]
+            entry["ledger"].append({"signal_date": date.date().isoformat(), "state": state[date], "signal_close": float(close[date]),
+                                    "sma200": float(sma[date]), "fill_date": (date + timedelta(days=1)).date().isoformat(),
+                                    "fill_open": None, "detected_at": now.isoformat(timespec="seconds"),
+                                    "late": not live, "sent": {}})
+            flips.append(len(entry["ledger"]) - 1)
+        entry["checked"] = date.date().isoformat()
+    outage = None
+    if len(new) > 1:
+        outage = {"from": new[0].date().isoformat(), "to": new[-2].date().isoformat(), "days": len(new) - 1}
+        entry["gaps"].append(outage)
+        _log("outage", **outage)
+    if flips:
+        rows = [entry["ledger"][i] for i in flips]
+        info = latest(symbol, now, frame)
+        detected = now.isoformat(timespec="seconds")
+        text = (late_text(rows, info, outage, detected, entry["core"]) if outage
+                else alert_text(info, detected, entry["core"]))
+        entry["pending"] = {"text": text, "rows": flips, "sent_to": []}  # a newer flip replaces an undelivered older one
+        _log("detected", detected_at=detected, flips=[r["signal_date"] for r in rows], late=bool(outage))
+    _save(data)  # before sending: a crash now resends to the chats not yet reached, it cannot lose the flip
+    return _deliver(data, entry, send, chats)
+
+
+def _deliver(data: dict, entry: dict, send, chats) -> bool:
+    pending = entry["pending"]
     if not pending:
-        _save(data)
         return False
-    try:
-        notify(alert_text(pending["info"], pending["detected_at"]))
-    except Exception as exc:  # stays pending, tried again at the next check
-        _log("send_failed", error=repr(exc), **pending["info"])
+    failed = []
+    for chat in chats:
+        if chat in pending["sent_to"]:
+            continue
+        try:
+            send(chat, pending["text"])
+        except Exception as exc:  # the other chats still get theirs; only this one is retried
+            failed.append(chat)
+            _log("send_failed", chat=chat, error=repr(exc))
+            continue
+        stamp = datetime.now(UTC).isoformat(timespec="seconds")
+        pending["sent_to"].append(chat)
+        for i in pending["rows"]:
+            entry["ledger"][i]["sent"][chat] = stamp
         _save(data)
-        raise
-    sent_at = datetime.now(UTC).isoformat(timespec="seconds")
-    saved["ledger"][pending["row"]]["sent_at"] = sent_at
-    saved["pending"] = None
+        _log("sent", chat=chat, sent_at=stamp, rows=pending["rows"])
+    if failed:
+        raise SendFailed(f"not delivered to {', '.join(failed)}")
+    entry["pending"] = None
     _save(data)
-    _log("sent", detected_at=pending["detected_at"], sent_at=sent_at, **pending["info"])
     return True
 
 
@@ -267,15 +394,26 @@ def _seconds_to_run(now: datetime) -> float:
     return ((run if run > now else run + timedelta(days=1)) - now).total_seconds()
 
 
-def watch(notify) -> None:
+def watch(send, chats) -> None:
     """Check at start-up (catch-up), then every day just after 00:00 UTC. Never returns."""
     while True:
+        error = None
         for _ in range(RETRIES):
             try:
                 for symbol in WATCH:
-                    check(symbol, notify)
+                    check(symbol, send, chats)
+                error = None
                 break
-            except Exception as exc:  # a late bar or a network error: try again shortly
+            except Exception as exc:  # a late bar, a data gap or a network error: try again shortly
+                error = exc
                 logger.warning("trend check failed: %r", exc)
                 time.sleep(RETRY_SECONDS)
+        if error is not None:  # silence would read as "no signal": say that today's check did not happen
+            _log("check_failed", error=repr(error))
+            for chat in chats:
+                try:
+                    send(chat, f"⚠️ BTCUSDT trend check failed after {RETRIES} tries ({error}). No signal was made today; "
+                               "the next check is tomorrow.")
+                except Exception as exc:
+                    logger.warning("could not report the failed check to %s: %r", chat, exc)
         time.sleep(_seconds_to_run(datetime.now(UTC)))

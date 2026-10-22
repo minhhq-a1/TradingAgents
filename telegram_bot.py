@@ -295,8 +295,7 @@ def handle(msg):
 def main():
     assert ALLOWED, "set TELEGRAM_ALLOWED_CHAT_IDS"
     # Own thread: an analysis blocks this loop for minutes, which must not delay a trend alert.
-    threading.Thread(target=trend.watch, args=(lambda text: [say(c, text) for c in sorted(ALLOWED)],),
-                     daemon=True).start()
+    threading.Thread(target=trend.watch, args=(say, sorted(ALLOWED)), daemon=True).start()
     offset = None
     while True:
         try:
