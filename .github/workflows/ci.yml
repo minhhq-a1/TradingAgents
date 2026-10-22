@@ -67,23 +67,54 @@ jobs:
         # (generated results/ is excluded via pyproject extend-exclude).
         run: ruff check .
 
-  # Redeploys the Telegram bot on the VPS after a push to development passes CI.
-  # Lives here, not in its own workflow: workflow_run only fires for files on the
-  # default branch (main), which we never touch. Needs repo secrets VPS_HOST,
-  # VPS_USER, VPS_SSH_KEY, VPS_APP_DIR; VPS_PORT is optional (default 22).
-  deploy:
-    name: deploy telegram bot to VPS
+  # Builds the image on the runner, so the small VPS never has to. Only after the
+  # tests pass, and only for development (the branch that gets deployed).
+  publish-image:
+    name: build and push image
     if: github.event_name == 'push' && github.ref == 'refs/heads/development'
     needs: [test, smoke-install, lint]
     runs-on: ubuntu-latest
-    # A hung build on the small VPS must not block every later deploy (the job queue is serial).
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # The image name must be lowercase; the source label links the package to this repo.
+          tags: |
+            ghcr.io/minhhq-a1/tradingagents:development
+            ghcr.io/minhhq-a1/tradingagents:${{ github.sha }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Redeploys the Telegram bot on the VPS once the image is published. Lives here,
+  # not in its own workflow: workflow_run only fires for files on the default branch
+  # (main), which we never touch. Needs repo secrets VPS_HOST, VPS_USER, VPS_SSH_KEY,
+  # VPS_APP_DIR (VPS_PORT optional, default 22), and a one-time `docker login ghcr.io`
+  # on the VPS with a read:packages token.
+  deploy:
+    name: deploy telegram bot to VPS
+    if: github.event_name == 'push' && github.ref == 'refs/heads/development'
+    needs: [publish-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions: {}
     concurrency:
       group: deploy-vps
       cancel-in-progress: false
     steps:
-      - name: Pull and rebuild over SSH
+      - name: Pull the image and restart over SSH
         env:
           SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
           HOST: ${{ secrets.VPS_HOST }}
@@ -93,6 +124,7 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           install -m 600 /dev/null ~/key && printf '%s\n' "$SSH_KEY" > ~/key
-          # Deploy exactly the commit CI tested, not whatever development is now.
+          # Deploy exactly the commit CI tested and published, not whatever development is now.
+          # The checkout only refreshes docker-compose.yml; the image itself comes from the registry.
           ssh -i ~/key -p "$PORT" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=4 "$USER@$HOST" \
-            "set -e; cd '$APP_DIR'; git fetch origin development; git checkout -q --detach '$SHA'; docker compose --profile telegram up -d --build telegram-bot; docker image prune -f"
+            "set -e; cd '$APP_DIR'; git fetch origin development; git checkout -q --detach '$SHA'; export TRADINGAGENTS_TAG='$SHA'; docker compose --profile telegram pull telegram-bot; docker compose --profile telegram up -d --no-build telegram-bot; docker image prune -f"
