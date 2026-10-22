@@ -237,7 +237,9 @@ def get_macro_indicators(
         "'unemployment', 'fed_funds_rate', '10y_treasury', 'yield_curve', "
         "'real_gdp', 'vix', euro-area aliases such as 'ecb_deposit_rate', "
         "'euro_hicp', 'euro_core_hicp', 'euro_real_gdp', 'germany_10y', "
-        "'france_10y', 'eur_usd', or a raw FRED series ID such as 'CPIAUCSL'.",
+        "'france_10y', 'eur_usd', or a raw FRED series ID such as 'CPIAUCSL'. "
+        "Without a FRED key only '13w_treasury', '5y_treasury', '10y_treasury', "
+        "'30y_treasury', 'dollar_index' and 'vix' are available.",
     ],
     curr_date: Annotated[str, "Current date in yyyy-mm-dd format; the end of the window"],
     look_back_days: Annotated[

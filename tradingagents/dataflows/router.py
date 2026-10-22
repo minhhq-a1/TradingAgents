@@ -33,6 +33,7 @@ from tradingagents.dataflows.vendors.yahoo.fundamentals import (
     get_income_statement as get_yfinance_income_statement,
     get_insider_transactions as get_yfinance_insider_transactions,
 )
+from tradingagents.dataflows.vendors.yahoo.macro import get_macro_data as get_yfinance_macro_data
 from tradingagents.dataflows.vendors.yahoo.market import (
     get_stock_stats_indicators_window,
     get_YFin_data_online,
@@ -141,6 +142,7 @@ VENDOR_METHODS = {
     # macro_data
     "get_macro_indicators": {
         "fred": get_fred_macro_data,
+        "yfinance": get_yfinance_macro_data,
     },
     # prediction_markets
     "get_prediction_markets": {
