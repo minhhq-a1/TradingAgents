@@ -61,26 +61,29 @@ def summarize(ticker, date, decision, trade_plan=""):
     t = dict(re.findall(r"\*\*(Entry Price|Stop Loss|Position Sizing)\*\*: (.+)", trade_plan))
     levels = {"Entry": t.get("Entry Price"), "Stop": t.get("Stop Loss"), "Target": f.get("Price Target"),
               "Size": t.get("Position Sizing")}
-    levels = [f"{k} <b>{e(v.strip())}</b>" for k, v in levels.items() if v and v.strip() != "not provided"]
+    # A long sizing paragraph belongs in the report; the card shows only a short one.
+    levels = [f"{k} <b>{e(v.strip())}</b>" for k, v in levels.items()
+              if v and v.strip() != "not provided" and len(v) <= 40]
     if levels:
         out += ["", "📍 " + " · ".join(levels)]
 
     out += ["", e(clip(f.get("Executive Summary", ""), 600))]
 
-    thesis = f.get("Investment Thesis", "")
-    gaps = re.search(r"\*\*Data gaps:?\*\*:?(.*?)(?=\n\*\*|\Z)", thesis, re.DOTALL)
+    # The thesis is bold-led blocks ("**Trend.** text" or "**Bullish evidence:**\n- item"):
+    # show label + first bullet or sentence of the first three, and fold "Data gaps" into one line.
+    blocks = re.findall(r"\*\*([^*\n]+?)[.:]?\*\*[.:]?\s*(.*?)(?=\n\*\*|\Z)", f.get("Investment Thesis", ""), re.DOTALL)
+    gaps = [body for label, body in blocks if label.lower().startswith("data gaps")]
+    bullets = []
+    for label, body in [x for x in blocks if not x[0].lower().startswith("data gaps")]:
+        body = body.strip()
+        first = re.match(r"- (.+)", body) or re.match(r"(.+?[.!?])(?:\s|$)", body, re.DOTALL)
+        if first and len(first.group(1)) > 25 and len(bullets) < 3:  # a bare "Aggressive:" sub-label says nothing
+            bullets.append(f"• <b>{e(clip(label, 40))}</b> {e(clip(first.group(1), 150))}")
+    if bullets:
+        out += [""] + bullets
     if gaps:
-        thesis = thesis.replace(gaps.group(0), "")
-    # First bullet of the first, second and last bold section: for and against, then what flips the view.
-    sections = [b for b in re.split(r"\n\*\*", thesis)[1:] if "\n- " in b]
-    firsts = [re.search(r"\n- (.+)", b).group(1) for b in sections]
-    picks = [firsts[i] for i in sorted({0, 1, len(firsts) - 1}) if i < len(firsts)] if firsts else []
-    if picks:
-        out += [""] + [f"• {e(clip(x, 160))}" for x in picks]
-
-    if gaps:
-        items = [x.strip("- ").strip().rstrip(".") for x in gaps.group(1).strip().splitlines() if x.strip()]
-        out += ["", f"⚠️ <i>Gaps: {e(clip('; '.join(items), 200))}</i>"]
+        items = [x.strip("- ").strip().rstrip(".") for x in gaps[0].strip().splitlines() if x.strip()]
+        out += ["", f"⚠️ <i>Gaps: {e(clip('; '.join(items), 260))}</i>"]
     out += ["", "📎 Full report attached."]
     return "\n".join(out)
 
