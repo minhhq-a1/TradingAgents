@@ -4,9 +4,9 @@ Long-polling, so it needs no public URL. Env: TELEGRAM_BOT_TOKEN and
 TELEGRAM_ALLOWED_CHAT_IDS (comma-separated; anyone else is ignored).
 """
 import datetime
-import io
 import os
 import re
+import tempfile
 
 import requests
 
@@ -35,11 +35,12 @@ def analyze(chat, ticker, date):
     analysts = [a.value for a in filter_analysts_for_asset_type(list(AnalystType), kind)]
     graph = TradingAgentsGraph(selected_analysts=analysts, config=DEFAULT_CONFIG.copy())
     state, signal = graph.propagate(ticker, date, asset_type=kind.value)
-    report = state["final_trade_decision"]
     say(chat, f"{ticker} {date}: {signal}")
     # Telegram caps a message at 4096 chars, so the full report goes as a file.
-    call("sendDocument", data={"chat_id": chat},
-         files={"document": (f"{ticker}-{date}.md", io.BytesIO(report.encode()))})
+    with tempfile.TemporaryDirectory() as tmp:
+        report = graph.save_reports(state, ticker, tmp, html=False)
+        with open(report, "rb") as f:
+            call("sendDocument", data={"chat_id": chat}, files={"document": (f"{ticker}-{date}.md", f)})
 
 
 def handle(msg):
