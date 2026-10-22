@@ -16,6 +16,7 @@ import requests
 
 import tradingagents.dataflows.config as config_module
 import tradingagents.default_config as default_config
+from tradingagents.agents.context import last_close_line
 from tradingagents.agents.schemas import TraderAction, TraderProposal
 from tradingagents.agents.trader import trader
 from tradingagents.dataflows import router
@@ -296,7 +297,7 @@ def _bars(atr):
 @pytest.mark.unit
 @pytest.mark.parametrize("action, entry, stop", [
     (TraderAction.BUY, 100.0, 95.0), (TraderAction.SELL, 100.0, 105.0),
-    (TraderAction.HOLD, 100.0, 120.0),            # no order, nothing to check
+    (TraderAction.HOLD, None, None),              # no order, nothing to check
     (TraderAction.SELL, None, 90.0), (TraderAction.BUY, 100.0, None),
 ])
 def test_valid_or_absent_levels_are_untouched(action, entry, stop):
@@ -325,3 +326,28 @@ def test_a_wrong_side_stop_is_dropped_when_there_is_no_price_history():
     with mock.patch.object(trader, "load_ohlcv", side_effect=NoMarketDataError("XRPUSDT")):
         fixed = trader.check_levels(_proposal(TraderAction.SELL, 1.38, 1.29), "XRPUSDT", "2026-10-22")
     assert fixed.stop_loss is None and "dropped" in fixed.reasoning
+
+
+@pytest.mark.unit
+def test_a_hold_carries_no_entry_or_stop():
+    with mock.patch.object(trader, "load_ohlcv", side_effect=AssertionError("no data needed")):
+        fixed = trader.check_levels(_proposal(TraderAction.HOLD, 82000.0, 78631.0), "BTCUSDT", "2026-10-22")
+    assert fixed.entry_price is None and fixed.stop_loss is None
+    assert "Hold places no order" in fixed.reasoning
+
+
+# --- Reference price for the agents that never call a price tool ----------------
+
+
+@pytest.mark.unit
+def test_reference_close_line_states_the_last_completed_close():
+    bars = pd.DataFrame({"Date": pd.to_datetime(["2026-10-20", "2026-10-21"]), "Close": [81000.0, 82761.4]})
+    with mock.patch("tradingagents.dataflows.vendors.yahoo.ohlcv.load_ohlcv", return_value=bars):
+        line = last_close_line("BTCUSDT", "2026-10-22")
+    assert "82,761.40" in line and "2026-10-21" in line and "do not call the price unverified" in line
+
+
+@pytest.mark.unit
+def test_reference_close_line_is_empty_when_prices_are_unavailable():
+    with mock.patch("tradingagents.dataflows.vendors.yahoo.ohlcv.load_ohlcv", side_effect=NoMarketDataError("X")):
+        assert last_close_line("BTCUSDT", "2026-10-22") == ""

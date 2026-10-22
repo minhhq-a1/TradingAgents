@@ -46,7 +46,7 @@ Write these sections, in this order, starting with the recommendation on its own
 
 - **Recommendation**: exactly one of Buy / Overweight / Hold / Underweight / Sell
 - **Rationale**: which arguments decided it
-- **Strategic Actions**: concrete steps for the trader, sized against a standard allocation
+- **Strategic Actions**: concrete steps for the trader, sized against a standard allocation. Every trigger names one condition and one price level; when the debate offered two levels, pick the one the evidence supports and drop the other (no "above X, ideally above Y")
 
 {NO_EXTERNAL_TOOLS}""" + get_language_instruction()
 

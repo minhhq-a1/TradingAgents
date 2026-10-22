@@ -3,6 +3,7 @@
 import functools
 import logging
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import Any
 
 from tradingagents.dataflows.date_window import is_historical
@@ -102,6 +103,28 @@ def _identity(ticker: str) -> dict:
         if value:
             identity[target_key] = value
     return identity
+
+
+def last_close_line(ticker: str, trade_date: str | None) -> str:
+    """One sentence giving the last completed daily close, or "" when no price is available.
+
+    Only the market analyst calls a price tool, so the managers and the trader
+    otherwise never see a number and write "verify the live price first". This
+    states the reference price once, from the same bars the market report uses.
+    """
+    from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
+
+    try:
+        bars = load_ohlcv(ticker, trade_date or datetime.now(UTC).strftime("%Y-%m-%d"))
+        close, day = float(bars["Close"].iloc[-1]), bars["Date"].iloc[-1].strftime("%Y-%m-%d")
+    except Exception as exc:  # noqa: BLE001 — fail open, never block the run
+        logger.debug("No reference close for %s: %s", ticker, exc)
+        return ""
+    return (
+        f" Reference price: the last completed daily close was {close:,.2f} on {day}. "
+        "Use it as the current price: no live quote is available and none is needed, so do not "
+        "call the price unverified or tell the reader to verify it."
+    )
 
 
 def build_instrument_context(
