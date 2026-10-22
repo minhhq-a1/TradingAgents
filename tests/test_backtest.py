@@ -12,6 +12,7 @@ import pytest
 
 from tradingagents.backtest import iter_grid, run_backtest, summarize
 from tradingagents.memory import TradingMemoryLog
+from tradingagents.memory.settlement import Settlement
 
 DECISION = "Rating: Buy\n\nbuy it"
 
@@ -58,6 +59,7 @@ class _FakeGraph:
 
     def settle_pending(self, ticker):
         self.settled.append(ticker)
+        return Settlement()
 
 
 @pytest.fixture(autouse=True)
@@ -172,6 +174,7 @@ def test_a_failed_settlement_does_not_lose_the_remaining_tickers(tmp_path, monke
         if ticker == "NVDA":
             raise RuntimeError("reflector timed out")
         settled.append(ticker)
+        return Settlement()
 
     monkeypatch.setattr(_FakeGraph, "settle_pending", _settle, raising=False)
     result = run_backtest(["NVDA", "AAPL"], ["2026-01-05"], _config(tmp_path))
@@ -304,3 +307,45 @@ def test_a_ticker_or_date_given_twice_runs_and_settles_once(tmp_path):
     graph = _FakeGraph.instances[-1]
     assert graph.calls == [("NVDA", "2026-01-05")]
     assert graph.settled == ["NVDA"]
+
+
+@pytest.mark.unit
+def test_rotation_never_erases_backtest_scores_or_resume_progress(tmp_path, monkeypatch):
+    def settle(self, ticker):
+        for entry in self.memory_log.get_pending_entries():
+            if entry['ticker'] == ticker:
+                self.memory_log.update_with_outcome(
+                    ticker, entry['date'], .1, .05, 5, 'lesson', '2026-02-01')
+        return Settlement()
+
+    monkeypatch.setattr(_FakeGraph, 'settle_pending', settle)
+    config = {**_config(tmp_path), 'memory_log_max_entries': 1}
+    dates = ['2026-01-05', '2026-01-12', '2026-01-19']
+    first = run_backtest(['NVDA'], dates, config, run_id='keep-results')
+    assert summarize(first).resolved == 3
+    again = run_backtest(['NVDA'], dates, config, run_id=first.run_id)
+    assert again.cells_run == 0 and again.skipped == 3
+    assert summarize(again).resolved == 3
+    assert config['memory_log_max_entries'] == 1
+
+
+@pytest.mark.unit
+def test_returned_settlement_failures_are_reported_per_date(tmp_path, monkeypatch):
+    visited = []
+
+    def settle(self, ticker):
+        visited.append(ticker)
+        if ticker == 'NVDA':
+            return Settlement(failed=[
+                (ticker, '2026-01-05', 'prices unavailable'),
+                (ticker, '2026-01-12', 'reflection failed'),
+            ])
+        return Settlement()
+
+    monkeypatch.setattr(_FakeGraph, 'settle_pending', settle)
+    result = run_backtest(['NVDA', 'AAPL'], ['2026-01-05', '2026-01-12'], _config(tmp_path))
+    assert visited == ['NVDA', 'AAPL']
+    assert result.settlement_failures == [
+        ('NVDA', '2026-01-05: prices unavailable'),
+        ('NVDA', '2026-01-12: reflection failed'),
+    ]
