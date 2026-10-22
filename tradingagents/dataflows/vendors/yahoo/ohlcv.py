@@ -8,6 +8,7 @@ from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.errors import NoMarketDataError
 from tradingagents.dataflows.files import replace_file
 from tradingagents.dataflows.symbols import normalize_symbol, safe_ticker_component
+from tradingagents.dataflows.vendors.binance_klines import fetch_daily_klines
 from tradingagents.dataflows.vendors.yahoo.common import raise_for_empty, yf_retry
 
 logger = logging.getLogger(__name__)
@@ -209,12 +210,16 @@ def load_ohlcv(symbol: str, as_of_date: str, fill_gaps: bool = True) -> pd.DataF
     if data is None:
         # yf.download catches every error, a rate limit included, and returns
         # an empty frame. Ticker.history raises the rate limit, so it is retried.
-        downloaded = yf_retry(lambda: yf.Ticker(canonical).history(
-            start=start_str,
-            end=end_str,
-            auto_adjust=True,
-            actions=False,
-        ))
+        # Crypto takes Binance's bars first: Yahoo drops days from its daily crypto
+        # series, and a dropped day reads as a non-trading day to the indicators.
+        downloaded = fetch_daily_klines(canonical, start_str, now.strftime("%Y-%m-%d"))
+        if downloaded is None:
+            downloaded = yf_retry(lambda: yf.Ticker(canonical).history(
+                start=start_str,
+                end=end_str,
+                auto_adjust=True,
+                actions=False,
+            ))
         if downloaded is None:
             raise_for_empty(symbol, canonical, "price rows")
         downloaded = _ensure_date_column(downloaded.reset_index())

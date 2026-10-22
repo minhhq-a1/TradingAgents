@@ -9,6 +9,7 @@ from stockstats import wrap
 
 from tradingagents.dataflows.errors import NoMarketDataError, VendorError
 from tradingagents.dataflows.symbols import normalize_symbol
+from tradingagents.dataflows.vendors.binance_klines import fetch_daily_klines
 from tradingagents.dataflows.vendors.yahoo.common import raise_for_empty, yf_retry
 from tradingagents.dataflows.vendors.yahoo.ohlcv import _assert_ohlcv_not_stale, load_ohlcv
 
@@ -31,7 +32,11 @@ def get_YFin_data_online(
     # end_date row (and the current day when end_date is today). Request one day
     # past end_date so the requested range is actually inclusive (#986/#987).
     end_inclusive = (end_dt + relativedelta(days=1)).strftime("%Y-%m-%d")
-    data = yf_retry(lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive))
+    # Crypto takes Binance's bars first; Yahoo drops days from its crypto series.
+    data = fetch_daily_klines(canonical, start_date, end_date)
+    from_binance = data is not None
+    if not from_binance:
+        data = yf_retry(lambda: yf.Ticker(canonical).history(start=start_date, end=end_inclusive))
 
     # Empty result means the symbol is unknown/delisted. Raise a typed error
     # instead of returning prose: the routing layer turns it into a single
@@ -48,8 +53,9 @@ def get_YFin_data_online(
     # turns into one clear unavailable signal (#1021).
     _assert_ohlcv_not_stale(data, end_date, symbol, canonical)
 
-    # Round numerical values to 2 decimal places for cleaner display
-    numeric_columns = ["Open", "High", "Low", "Close", "Adj Close"]
+    # Round numerical values to 2 decimal places for cleaner display. Binance bars
+    # keep their own precision: two places would flatten a sub-dollar coin.
+    numeric_columns = [] if from_binance else ["Open", "High", "Low", "Close", "Adj Close"]
     for col in numeric_columns:
         if col in data.columns:
             data[col] = data[col].round(2)

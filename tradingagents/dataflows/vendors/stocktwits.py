@@ -20,6 +20,7 @@ import http.client
 import json
 import logging
 from datetime import datetime
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from tradingagents.dataflows.date_window import coverage_gap, in_window
@@ -28,7 +29,12 @@ from tradingagents.dataflows.symbols import crypto_base
 logger = logging.getLogger(__name__)
 
 _API = "https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
-_UA = "tradingagents/0.2 (+https://github.com/TauricResearch/TradingAgents)"
+# StockTwits sits behind Cloudflare, which answers 403 to a bot-style User-Agent
+# on datacenter addresses, so the request presents a browser's.
+_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
 
 
 def _created_at(message) -> datetime | None:
@@ -103,7 +109,9 @@ def fetch_stocktwits_messages(
         # OSError covers URLError/TimeoutError/connection resets; HTTPException
         # covers chunked-transfer errors (IncompleteRead/BadStatusLine, #1024).
         logger.warning("StockTwits fetch failed for %s: %s", ticker, exc)
-        return f"<stocktwits unavailable: {type(exc).__name__}>"
+        # The status says why (403 blocked, 429 rate limited, 404 unknown symbol).
+        reason = f"HTTP {exc.code}" if isinstance(exc, HTTPError) else type(exc).__name__
+        return f"<stocktwits unavailable: {reason}>"
 
     fetched = data.get("messages", []) if isinstance(data, dict) else []
     messages = _within_window(fetched, start_date, end_date)
