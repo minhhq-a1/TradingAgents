@@ -1,4 +1,6 @@
-"""Telegram front-end: `/analyze BTCUSDT [YYYY-MM-DD]` -> decision + full report.
+"""Telegram front-end: `/analyze BTCUSDT [YYYY-MM-DD]` -> decision + full report;
+`/trend [BTCUSDT]` -> paper trend state, plus an alert when it flips; `/paper` -> the paper book
+(tradingagents/trend.py). An /analyze report is reference material, not a trading signal.
 
 Long-polling, so it needs no public URL. Env: TELEGRAM_BOT_TOKEN and
 TELEGRAM_ALLOWED_CHAT_IDS (comma-separated; anyone else is ignored).
@@ -10,18 +12,21 @@ import math
 import os
 import re
 import tempfile
+import threading
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
 from cli.models import AnalystType
 from cli.prompts import detect_asset_type, filter_analysts_for_asset_type
+from tradingagents import trend
 from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 API = f"https://api.telegram.org/bot{os.environ.get('TELEGRAM_BOT_TOKEN', '')}"
 ALLOWED = {c.strip() for c in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if c.strip()}
+REFERENCE = "ℹ️ <i>Báo cáo tham khảo, không phải tín hiệu giao dịch.</i>"
 TICKER = re.compile(r"^[A-Za-z0-9.\-^=]{1,20}$")
 
 
@@ -251,9 +256,9 @@ def analyze(chat, ticker, date):
     state, _ = graph.propagate(ticker, date, asset_type=kind.value)
     card = summarize(ticker, date, state["final_trade_decision"], state.get("trader_investment_plan", ""))
     try:
-        say(chat, card, parse_mode="HTML")
+        say(chat, f"{card}\n\n{REFERENCE}", parse_mode="HTML")
     except requests.HTTPError:  # Telegram rejected the markup: still deliver the decision, as plain text
-        say(chat, state["final_trade_decision"])
+        say(chat, f"{state['final_trade_decision']}\n\n{html.unescape(re.sub('<[^>]+>', '', REFERENCE))}")
     try:  # the chart is extra: if it fails, the card and the report still go out
         call("sendPhoto", data={"chat_id": chat}, files={"photo": ("chart.png", chart(ticker, date, card))})
     except Exception as exc:
@@ -262,7 +267,7 @@ def analyze(chat, ticker, date):
     with tempfile.TemporaryDirectory() as tmp:
         report = graph.save_reports(state, ticker, tmp, html=False)
         with open(report, "rb") as f:
-            call("sendDocument", data={"chat_id": chat}, files={"document": (f"{ticker}-{date}.md", f)})
+            call("sendDocument", data={"chat_id": chat, "caption": "Báo cáo tham khảo, không phải tín hiệu giao dịch."}, files={"document": (f"{ticker}-{date}.md", f)})
 
 
 def handle(msg):
@@ -270,6 +275,10 @@ def handle(msg):
     if chat not in ALLOWED:
         return
     parts = (msg.get("text") or "").split()
+    command = parts[0].split("@")[0] if parts else ""
+    if command in ("/trend", "/paper"):
+        report = trend.status_text if command == "/trend" else trend.paper_text
+        return say(chat, report(parts[1] if len(parts) > 1 else "BTCUSDT"))
     if not parts or parts[0].split("@")[0] != "/analyze":
         return say(chat, "Usage: /analyze TICKER [YYYY-MM-DD]")
     ticker = parts[1] if len(parts) > 1 else ""
@@ -285,6 +294,8 @@ def handle(msg):
 
 def main():
     assert ALLOWED, "set TELEGRAM_ALLOWED_CHAT_IDS"
+    # Own thread: an analysis blocks this loop for minutes, which must not delay a trend alert.
+    threading.Thread(target=trend.watch, args=(say, sorted(ALLOWED)), daemon=True).start()
     offset = None
     while True:
         try:
