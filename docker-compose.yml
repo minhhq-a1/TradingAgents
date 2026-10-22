@@ -8,6 +8,17 @@ services:
     tty: true
     stdin_open: true
 
+  telegram-bot:
+    build: .
+    entrypoint: ["python", "telegram_bot.py"]
+    env_file:
+      - .env
+    volumes:
+      - ${TRADINGAGENTS_DATA_DIR:-tradingagents_data}:/home/appuser/.tradingagents
+    restart: unless-stopped
+    profiles:
+      - telegram
+
   ollama:
     image: ollama/ollama:latest
     volumes:
