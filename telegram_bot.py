@@ -5,14 +5,18 @@ TELEGRAM_ALLOWED_CHAT_IDS (comma-separated; anyone else is ignored).
 """
 import datetime
 import html
+import io
+import math
 import os
 import re
 import tempfile
 
 import requests
+from PIL import Image, ImageDraw, ImageFont
 
 from cli.models import AnalystType
 from cli.prompts import detect_asset_type, filter_analysts_for_asset_type
+from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -167,16 +171,93 @@ def summarize(ticker, date, decision, trade_plan=""):
     return "\n".join(out)
 
 
+def level(text):
+    """'$84,093.42' / '84.5k' / '2500.0' -> float; None for anything else."""
+    m = re.fullmatch(r"~?\$?(\d+(?:,\d{3})*(?:\.\d+)?)(k?)", text.strip())
+    return m and float(m[1].replace(",", "")) * (1000 if m[2] else 1)
+
+
+def chart(ticker, date, card):
+    """PNG of the last 90 daily bars with SMA 50/200, Bollinger 20/2 and the card's own levels.
+
+    Prices come from load_ohlcv, which the analysis has just cached, so this makes no extra
+    request. Levels are read back from the rendered card, so the chart shows exactly the card's.
+    """
+    df = load_ohlcv(ticker, date)
+    close = df["Close"]
+    df = df.assign(sma50=close.rolling(50).mean(), sma200=close.rolling(200).mean(),
+                   mid=close.rolling(20).mean(), sd=close.rolling(20).std())
+    df = df.assign(up=df["mid"] + 2 * df["sd"], low=df["mid"] - 2 * df["sd"]).tail(90).reset_index(drop=True)
+    last = float(df["Close"].iloc[-1])
+    lines = [("up" if d == "above" else "down", level(v), (22, 163, 74) if d == "above" else (220, 38, 38))
+             for d, v in re.findall(r"close (above|below) <b>([^<]+)</b>", card)]
+    lines += [(k, level(v), (100, 116, 139)) for k, v in re.findall(r"(Stop|Target) <b>([^<]+)</b>", card)]
+    lines = [x for x in lines if x[1] and last / 3 < x[1] < last * 3]  # a misread unit would flatten the chart
+
+    W, H, L, R, T, B = 1000, 560, 10, 110, 40, 30
+    lo = min([df["Low"].min(), df["low"].min()] + [v for _, v, _ in lines])
+    hi = max([df["High"].max(), df["up"].max()] + [v for _, v, _ in lines])
+    lo, hi = lo - (hi - lo) * 0.03, hi + (hi - lo) * 0.03
+    def y(v):
+        return T + (hi - v) / (hi - lo) * (H - T - B)
+    step = (W - L - R) / len(df)
+    def x(i):
+        return L + (i + 0.5) * step
+
+    img = Image.new("RGB", (W, H), "white")
+    g = ImageDraw.Draw(img)
+    font = ImageFont.load_default(size=14)
+    tick = 10 ** math.floor(math.log10((hi - lo) / 5))
+    tick *= next(k for k in (1, 2, 5, 10) if (hi - lo) / (tick * k) <= 6)
+    for i in range(math.ceil(lo / tick), math.floor(hi / tick) + 1):  # price gridlines
+        g.line([(L, y(i * tick)), (W - R, y(i * tick))], fill=(241, 245, 249))
+        g.text((L + 2, y(i * tick) - 16), f"{i * tick:,.{2 if tick < 1 else 0}f}", fill=(148, 163, 184), font=font)
+    for i, r in df.iterrows():  # month gridlines
+        if i and r["Date"].month != df["Date"][i - 1].month:
+            g.line([(x(i), T), (x(i), H - B)], fill=(235, 235, 235))
+            g.text((x(i) + 3, H - B + 6), r["Date"].strftime("%b"), fill=(120, 120, 120), font=font)
+    for col, color in [("up", (148, 163, 184)), ("low", (148, 163, 184)), ("mid", (203, 213, 225)),
+                       ("sma50", (234, 88, 12)), ("sma200", (124, 58, 237))]:
+        pts = [(x(i), y(v)) for i, v in df[col].items() if v == v]
+        if len(pts) > 1:
+            g.line(pts, fill=color, width=2)
+    for i, r in df.iterrows():
+        color = (22, 163, 74) if r["Close"] >= r["Open"] else (220, 38, 38)
+        g.line([(x(i), y(r["High"])), (x(i), y(r["Low"]))], fill=color)
+        top, bot = sorted([y(r["Open"]), y(r["Close"])])
+        g.rectangle([x(i) - step * 0.35, top, x(i) + step * 0.35, max(bot, top + 1)], fill=color)
+    for tag, v, color in lines + [("", last, (15, 23, 42))]:
+        for x0 in range(L, W - R, 12):  # dashed
+            g.line([(x0, y(v)), (min(x0 + 6, W - R), y(v))], fill=color, width=2 if tag else 1)
+        tx, ty = W - R + 4, y(v)
+        if tag in ("up", "down"):  # the default font has no ▲▼, so draw them
+            d = -5 if tag == "up" else 5
+            g.polygon([(tx, ty - d), (tx + 10, ty - d), (tx + 5, ty + d)], fill=color)
+            tag, tx = "", tx + 14
+        g.text((tx, ty - 8), f"{tag} {v:,.{2 if v < 100 else 0}f}".strip(), fill=color, font=font)
+    g.text((L, 8), f"{ticker} · daily to {df['Date'].iloc[-1]:%Y-%m-%d}", fill=(15, 23, 42), font=font)
+    g.text((L + 330, 8), "SMA50", fill=(234, 88, 12), font=font)
+    g.text((L + 390, 8), "SMA200", fill=(124, 58, 237), font=font)
+    g.text((L + 460, 8), "Bollinger 20/2", fill=(100, 116, 139), font=font)
+    out = io.BytesIO()
+    img.save(out, "PNG")
+    return out.getvalue()
+
+
 def analyze(chat, ticker, date):
     kind = detect_asset_type(ticker)
     analysts = [a.value for a in filter_analysts_for_asset_type(list(AnalystType), kind)]
     graph = TradingAgentsGraph(selected_analysts=analysts, config=DEFAULT_CONFIG.copy())
     state, _ = graph.propagate(ticker, date, asset_type=kind.value)
+    card = summarize(ticker, date, state["final_trade_decision"], state.get("trader_investment_plan", ""))
     try:
-        say(chat, summarize(ticker, date, state["final_trade_decision"], state.get("trader_investment_plan", "")),
-            parse_mode="HTML")
+        say(chat, card, parse_mode="HTML")
     except requests.HTTPError:  # Telegram rejected the markup: still deliver the decision, as plain text
         say(chat, state["final_trade_decision"])
+    try:  # the chart is extra: if it fails, the card and the report still go out
+        call("sendPhoto", data={"chat_id": chat}, files={"photo": ("chart.png", chart(ticker, date, card))})
+    except Exception as exc:
+        print(f"chart failed for {ticker} {date}: {exc!r}")
     # Telegram caps a message at 4096 chars, so the full report goes as a file.
     with tempfile.TemporaryDirectory() as tmp:
         report = graph.save_reports(state, ticker, tmp, html=False)
