@@ -164,6 +164,8 @@ def build_default_config() -> dict:
             "news_data": "yfinance",             # Options: alpha_vantage, yfinance
             "macro_data": "fred,yfinance",       # Options: fred (needs FRED_API_KEY), yfinance (rates/DXY/VIX only)
             "prediction_markets": "polymarket",  # Options: polymarket (keyless)
+            # Keyless. Binance refuses restricted regions (the US), so the chain falls back.
+            "crypto_derivatives": "binance,okx,hyperliquid",  # Options: binance, okx, hyperliquid (funding only)
         },
         # Tool-level configuration (takes precedence over category-level)
         "tool_vendors": {

@@ -12,6 +12,7 @@ from langgraph.prebuilt import InjectedState
 from tradingagents.dataflows.date_window import as_of, as_of_window
 from tradingagents.dataflows.errors import NoMarketDataError, VendorUnavailableError
 from tradingagents.dataflows.router import no_data_available, route_to_vendor, vendor_unavailable
+from tradingagents.dataflows.symbols import crypto_base
 from tradingagents.dataflows.vendors.yahoo.snapshot import build_verified_market_snapshot
 
 
@@ -291,3 +292,29 @@ def get_prediction_markets(
         str: A formatted markdown report of matching prediction markets
     """
     return route_to_vendor("get_prediction_markets", topic, limit, trade_date or None)
+
+
+@tool
+def get_crypto_derivatives(
+    symbol: Annotated[str, InjectedState("company_of_interest")],
+    curr_date: Annotated[str, "Current date in yyyy-mm-dd format; the end of the window"],
+    look_back_days: Annotated[int, "Trailing window length in days"] = 30,
+    trade_date: Annotated[str, InjectedState("trade_date")] = "",
+) -> str:
+    """
+    Retrieve perpetual-futures positioning for a crypto asset: daily funding
+    rate, open interest (USD) and long/short account ratio. Persistently high
+    funding with rising open interest means crowded leveraged longs (squeeze
+    risk); negative funding means crowded shorts. Only applies to crypto.
+    Uses the configured crypto_derivatives vendor chain.
+
+    Args:
+        curr_date (str): Current date in yyyy-mm-dd format
+        look_back_days (int): Trailing window length in days, default 30
+
+    Returns:
+        str: A markdown table of daily funding, open interest and long/short ratio
+    """
+    if crypto_base(symbol) is None:
+        return f"NOT_APPLICABLE: {symbol} is not a crypto pair; perpetual-futures positioning does not apply."
+    return route_to_vendor("get_crypto_derivatives", symbol, as_of(curr_date, trade_date), look_back_days)
