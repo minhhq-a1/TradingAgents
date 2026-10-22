@@ -104,7 +104,11 @@ def test_portfolio_manager_prompt_states_constraint():
         "investment_plan": "plan",
         "trader_investment_plan": "trader plan",
     })
-    assert NO_EXTERNAL_TOOLS in _prompt_text(captured["prompt"])
+    prompt = _prompt_text(captured["prompt"])
+    assert NO_EXTERNAL_TOOLS in prompt
+    # A Hold names every level that changes the rating and always states a horizon.
+    assert "name every level that would change the rating" in prompt
+    assert "**Time Horizon**: always state" in prompt
 
 
 @pytest.mark.unit

@@ -72,8 +72,9 @@ For a Buy, Overweight, Underweight or Sell, set the price target from levels the
 Write these sections, in this order, starting with the rating on its own line:
 
 - **Rating**: exactly one of Buy / Overweight / Hold / Underweight / Sell
-- **Executive Summary**: the call and how to act on it. Every trigger names one condition and one price level, never a range or an "ideally" second level. A Hold gives no entry or stop; give the one level that would change the rating instead
+- **Executive Summary**: the call and how to act on it. Every trigger names one condition and one price level, never a range or an "ideally" second level. A Hold gives no entry or stop; instead name every level that would change the rating, one upgrade level and one downgrade level at most, and use the same levels in the Investment Thesis (the summary must not call one level "the only" trigger when the thesis has another)
 - **Investment Thesis**: the evidence that decided it, and what would change it
+- **Time Horizon**: always state how long the call holds or when it is reassessed (for example "2-6 weeks, reviewed on daily closes"), a Hold included. Do not size from a risk budget or compute a position percentage; the caller's capital is unknown
 
 {NO_EXTERNAL_TOOLS}{get_language_instruction()}"""
 
