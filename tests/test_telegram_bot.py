@@ -83,9 +83,9 @@ PLAN = """**Action**: Hold
 def test_summary_card(bot):
     mod, _ = bot
     out = mod.summarize("BTCUSDT", "2026-10-22", DECISION, PLAN)
-    assert out.startswith("🟡 <b>BTCUSDT</b> · 2026-10-22\n<b>Hold</b> · horizon 2-6 weeks")
-    assert "Entry <b>81400.0</b> · Size <b>1% of book</b>" in out and "Stop" not in out
-    assert "🎯 ▲ close above <b>84,300</b>" in out and "• <b>Bullish evidence:</b> Price above the 200 SMA and rising." in out
+    assert out.startswith("🟡 <b>BTCUSDT · Hold</b>\n2026-10-22 · horizon 2-6 weeks")
+    assert "📍 <b>Levels</b>\nEntry <b>81400.0</b>\nSize <b>1% of book</b>" in out and "Stop" not in out
+    assert "🎯 <b>Triggers</b>\n▲ close above <b>84,300</b>" in out and "• <b>Bullish evidence:</b> Price above the 200 SMA and rising." in out
     assert "Gaps: The 10-21 row is missing. FRED macro data was unavailable." in out
     assert "**" not in out
 
@@ -141,7 +141,7 @@ def test_summary_real_report_shape(bot):
     mod, _ = bot
     out = mod.summarize("BTCUSDT", "2026-10-22", REPORT_4, "")
     assert "not provided" not in out.split("⚠️")[0] and "horizon" not in out
-    assert "🎯 ▲ close above <b>86,620</b> · ▼ close below <b>80,191</b>" in out
+    assert "🎯 <b>Triggers</b>\n▲ close above <b>86,620</b>\n▼ close below <b>80,191</b>\n" in out
     bullets = [x for x in out.splitlines() if x.startswith("• ")]
     assert len(bullets) == 3 and all(x.endswith(".") for x in bullets)
     assert "⚠️ <i>Gaps: No on-chain data or ETF flow series were provided" in out
@@ -174,8 +174,8 @@ def test_summary_live_run_shapes(bot):
         "Why not Sell: price is above a rising 200 SMA, the 10 EMA has been reclaimed, and the news feed is missing.\n"
         "CPI and core PCE are missing.\n\n"
         "**Price Target**: 2296.0\n\n**Time Horizon**: 2-6 weeks, reviewed on daily closes against 1.29 and 1.41"), "")
-    assert "<b>Underweight</b> · horizon 2-6 weeks\n" in out
-    assert "🎯 ▲ close above <b>2,552</b>\n" in out and "5.31" not in out.split("🎯")[1].split("\n")[0]
+    assert "<b>ETHUSDT · Underweight</b>\nd · horizon 2-6 weeks\n" in out
+    assert "▲ close above <b>2,552</b>\n" in out and "5.31" not in out.split("🎯")[1].split("\n\n")[0]
     assert "<b>Why the call is not Sell:</b> RSI never reached 30" in out
     assert "⚠️ <i>Gaps: The news feed is missing. CPI and core PCE are missing.</i>" in out
 
@@ -204,7 +204,7 @@ def test_analyze_sends_card_then_report(bot, monkeypatch):
     monkeypatch.setattr(mod, "chart", lambda ticker, date, card: b"png")
     mod.analyze("1", "BTCUSDT", "2026-10-22")
     (m1, kw1), (m2, kw2), (m3, kw3) = sent
-    assert m1 == "sendMessage" and kw1["json"]["parse_mode"] == "HTML" and "<b>Hold</b>" in kw1["json"]["text"]
+    assert m1 == "sendMessage" and kw1["json"]["parse_mode"] == "HTML" and "<b>BTCUSDT · Hold</b>" in kw1["json"]["text"]
     assert "Entry <b>81400.0</b>" in kw1["json"]["text"]
     assert m2 == "sendPhoto" and kw2["files"]["photo"] == ("chart.png", b"png")
     assert m3 == "sendDocument" and kw3["files"]["document"][0] == "BTCUSDT-2026-10-22.md"
@@ -226,7 +226,7 @@ def test_chart_draws_the_card_levels(bot, monkeypatch):
     df = pd.DataFrame({"Date": pd.date_range("2025-12-01", periods=300), "Open": close - 1, "High": close + 2,
                        "Low": close - 2, "Close": close})
     monkeypatch.setattr(mod, "load_ohlcv", lambda ticker, date: df)
-    card = "🎯 ▲ close above <b>$135</b> · ▼ close below <b>1,200</b>\n📍 Stop <b>118.5</b> · Target <b>n/a</b>"
+    card = "🎯 <b>Triggers</b>\n▲ close above <b>$135</b>\n▼ close below <b>1,200</b>\n📍 <b>Levels</b>\nStop <b>118.5</b>\nTarget <b>n/a</b>"
     png = Image.open(io.BytesIO(mod.chart("NVDA", "2026-09-26", card)))
     assert png.size == (1000, 560)
     assert [mod.level(x) for x in ("$135", "84,093.42", "84.5k", "~2500.0", "1.39 (trim)")] == [

@@ -102,8 +102,8 @@ def summarize(ticker, date, decision, trade_plan=""):
     rating, horizon = f["Rating"], given(f.get("Time Horizon"))
     if horizon:  # "2-6 weeks, reviewed on ..." -> the period itself
         horizon = horizon.split(",")[0]
-    out = [f"{EMOJI.get(rating, '⚪')} <b>{e(ticker)}</b> · {e(date)}",
-           f"<b>{e(rating)}</b>" + (f" · horizon {e(horizon)}" if horizon else "")]
+    out = [f"{EMOJI.get(rating, '⚪')} <b>{e(ticker)} · {e(rating)}</b>",
+           e(date) + (f" · horizon {e(horizon)}" if horizon else "")]
 
     t = dict(re.findall(r"\*\*(Entry Price|Stop Loss|Position Sizing)\*\*: (.+)", trade_plan))
     levels = {"Entry": t.get("Entry Price"), "Stop": t.get("Stop Loss"), "Target": f.get("Price Target"),
@@ -111,11 +111,11 @@ def summarize(ticker, date, decision, trade_plan=""):
     # A long sizing paragraph belongs in the report; the card shows only a short one.
     levels = [f"{k} <b>{e(v.strip())}</b>" for k, v in levels.items() if given(v) and len(v) <= 40]
     if levels:
-        out += ["", "📍 " + " · ".join(levels)]
+        out += ["", "📍 <b>Levels</b>", *levels]
 
     summary = sentences(f.get("Executive Summary", ""))
     # shortcut: a lone sentence over the limit is cut at a word (rare); fix if the PM starts writing run-ons
-    out += ["", e(fit(summary, 600) or summary[0][:600].rsplit(" ", 1)[0] + "…" if summary else "")]
+    out += ["", "📝 <b>Summary</b>", e(fit(summary, 600) or summary[0][:600].rsplit(" ", 1)[0] + "…" if summary else "")]
 
     # The thesis is bold-led blocks ("**Trend.** text", "**Evidence:**\n- item") or plain paragraphs
     # ("For the bull: text"). A block is (label, sentences).
@@ -144,7 +144,7 @@ def summarize(ticker, date, decision, trade_plan=""):
     ups = [f"close above <b>{e(n)}</b>" for d, n in triggers if d == "above"]
     downs = [f"close below <b>{e(n)}</b>" for d, n in triggers if d == "below"]
     if ups or downs:
-        out += ["", "🎯 " + " · ".join([f"▲ {x}" for x in ups[:2]] + [f"▼ {x}" for x in downs[:2]])]
+        out += ["", "🎯 <b>Triggers</b>", *[f"▲ {x}" for x in ups[:2]], *[f"▼ {x}" for x in downs[:2]]]
 
     # Up to three conclusions: per block, a whole sentence that is short enough and not already a trigger,
     # a gap or the summary; one that states a conclusion is preferred.
@@ -165,7 +165,7 @@ def summarize(ticker, date, decision, trade_plan=""):
             tag = f"<b>{e(label)}:</b> " if label and len(label) <= 40 and label.lower() != "rating" else ""
             bullets.append(f"• {tag}{e(pick)}")
     if bullets:
-        out += [""] + bullets
+        out += ["", "<b>Key points</b>", *bullets]
 
     # Gaps: a labelled block's items, else any sentence that says something was not provided.
     gap_text = ""
