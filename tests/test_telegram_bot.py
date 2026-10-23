@@ -34,6 +34,13 @@ def test_rejects_bad_ticker(bot):
     assert sent == ["Usage: /analyze TICKER [YYYY-MM-DD]"]
 
 
+@pytest.mark.parametrize("text", ["/status", "/help", "hello", "/start@my_bot", ""])
+def test_unknown_message_lists_the_commands(bot, text):
+    mod, sent = bot
+    mod.handle({"chat": {"id": 1}, "text": text})
+    assert sent == [mod.COMMANDS] and all(c in mod.COMMANDS for c in ("/analyze", "/trend", "/paper"))
+
+
 DECISION = """**Rating**: Hold
 
 **Executive Summary**: Hold. Overweight above 84,300; underweight below 81,400.
