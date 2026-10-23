@@ -28,7 +28,8 @@ API = f"https://api.telegram.org/bot{os.environ.get('TELEGRAM_BOT_TOKEN', '')}"
 ALLOWED = {c.strip() for c in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if c.strip()}
 REFERENCE = "ℹ️ <i>Báo cáo tham khảo, không phải tín hiệu giao dịch.</i>"
 COMMANDS = ("Commands:\n/analyze TICKER [YYYY-MM-DD]: full analysis report\n"
-            "/trend [SYMBOL]: SMA200 trend rule, current state (paper)\n/paper [SYMBOL]: paper book, equity and ledger")
+            "/trend [SYMBOL]: SMA200 trend rule, current state (paper)\n/paper [SYMBOL]: paper book, equity and ledger\n"
+            "/status: is the daily trend job alive (also /health)")
 TICKER = re.compile(r"^[A-Za-z0-9.\-^=]{1,20}$")
 
 
@@ -278,6 +279,8 @@ def handle(msg):
         return
     parts = (msg.get("text") or "").split()
     command = parts[0].split("@")[0] if parts else ""
+    if command in ("/status", "/health"):
+        return say(chat, trend.health_text(parts[1] if len(parts) > 1 else "BTCUSDT"))
     if command in ("/trend", "/paper"):
         report = trend.status_text if command == "/trend" else trend.paper_text
         return say(chat, report(parts[1] if len(parts) > 1 else "BTCUSDT"))
@@ -297,7 +300,8 @@ def handle(msg):
 def main():
     assert ALLOWED, "set TELEGRAM_ALLOWED_CHAT_IDS"
     # Own thread: an analysis blocks this loop for minutes, which must not delay a trend alert.
-    threading.Thread(target=trend.watch, args=(say, sorted(ALLOWED)), daemon=True).start()
+    for job in (trend.watch, trend.deadman):  # the dead-man alert must not share a thread with the job it watches
+        threading.Thread(target=job, args=(say, sorted(ALLOWED)), daemon=True).start()
     offset = None
     while True:
         try:

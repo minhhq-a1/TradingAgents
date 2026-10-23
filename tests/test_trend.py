@@ -3,15 +3,20 @@ outages, stored-day equity, data checks, first fill at the next open, backtest w
 
 Prices are synthetic and the vendors are mocked, so these run without a network connection.
 """
+import _socket
+import importlib
 import json
+import socket
+import threading
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from tradingagents import trend, trend_backtest
+from tradingagents import trend, trend_backtest, trend_drill
 
 CHATS = ["a", "b", "c"]
 
@@ -39,6 +44,7 @@ def _crafted():
 @pytest.fixture(autouse=True)
 def _state_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(trend, "DIR", str(tmp_path))
+    monkeypatch.setattr(trend, "quote", lambda symbol: None)  # no network; tests that need a price set their own
     monkeypatch.delenv("TREND_CORE_WEIGHT", raising=False)
 
 
@@ -160,7 +166,7 @@ def test_an_outage_with_two_flips_is_flagged_alerted_once_and_kept_out_of_the_op
     assert gap["from"] == (start + timedelta(days=1)).date().isoformat() and gap["to"] == (last - timedelta(days=1)).date().isoformat()
     assert [e["event"] for e in _events()].count("outage") == 1
     out = trend.paper_text("BTCUSDT")
-    assert "Equity, rule (every change filled)" in out and "Equity, as operated" in out and "offline day(s)" in out
+    assert "Equity, rule (every change filled)" in out and "Equity, as operated" in out and "offline, position held through them" in out
     frame_days, rule, operated = trend._book(entry)
     assert (operated == trend.HOLD).all() and (rule == trend.CASH).any()  # the operated book never left the market
     ideal, ops = trend.simulate(frame_days, rule), trend.simulate(frame_days, operated)
@@ -583,3 +589,273 @@ def test_an_older_undelivered_alert_stays_queued_when_the_signal_reverses_next_d
     assert entry["pending"] == [] and all(sorted(r["sent"]) == CHATS for r in entry["ledger"])
     _check(frame, frame.index[261], sent, CHATS)
     assert len(sent) == 6  # nothing is repeated
+
+
+# --- plurals ----------------------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_one_day_is_not_written_as_1_days():
+    assert trend._days(1) == "1 day" and trend._days(2) == "2 days" and trend._days(0) == "0 days"
+    info = {"symbol": "BTCUSDT", "state": trend.HOLD, "date": "2026-10-21", "close": 100.0, "sma": 90.0, "since": "2026-10-21"}
+    row = {"signal_date": "2026-10-20", "state": trend.HOLD, "signal_close": 99.0}
+    one = trend.late_text([row], info, {"from": "2026-10-20", "to": "2026-10-20", "days": 1}, "2026-10-22T00:05:00+00:00", 0.5)
+    assert "(1 day)" in one and "1 signal change was found late" in one and "1 days" not in one
+    two = trend.late_text([row, row], info, {"from": "2026-10-19", "to": "2026-10-20", "days": 2}, "2026-10-22T00:05:00+00:00", 0.5)
+    assert "(2 days)" in two and "2 signal changes were found late" in two
+    frame = _crafted()
+    _check(frame, frame.index[250], [])
+    _check(frame, frame.index[251], [])
+    assert "(1 day, no real orders)" in trend.paper_text("BTCUSDT")
+    with pytest.raises(trend.DataGap, match="1 day missing"):
+        trend.require_continuous(frame.drop(frame.index[-3]))
+
+
+# --- one ops row per run, health, dead-man -----------------------------------------------------------
+
+
+def _watch_once(monkeypatch, frame, send=lambda chat, text: None):
+    """One ``watch`` run on ``frame``'s bars; the sleep until tomorrow ends the loop."""
+    monkeypatch.setattr(trend, "bars", lambda symbol, today=None: (frame, "binance"))
+
+    def stop(seconds):
+        raise SystemExit
+
+    monkeypatch.setattr(trend.time, "sleep", stop)
+    with pytest.raises(SystemExit):
+        trend.watch(send, ["a"])
+
+
+@pytest.mark.unit
+def test_each_run_leaves_one_ops_row_with_the_data_date_equity_and_latency(monkeypatch):
+    frame = _frame(np.r_[100 + 0.5 * np.arange(260), 150.0])  # the last closed bar dips under the SMA200: a flip to send
+    flip = frame.index[-1]
+    assert _flips(frame)[1][-1] == flip
+    _check(frame, frame.index[-2], [])
+    sent = []
+    _watch_once(monkeypatch, frame, lambda chat, text: sent.append((chat, text)))
+    (row,) = trend._ops_rows()
+    assert row["ok"] is True and row["tries"] == 1 and row["errors"] == [] and row["symbol"] == "BTCUSDT"
+    assert row["data_date"] == flip.date().isoformat() and row["state"] == trend.CASH and row["flips"] == [flip.date().isoformat()]
+    assert set(row["equity"]) == {"hold", "trend", "mix"} and row["send_s"] >= 0 and row["lag_s"] >= 0
+    entry = trend._load()["BTCUSDT"]
+    assert entry["last_run"]["data_date"] == flip.date().isoformat() and len(sent) == 1
+    # a second run the same day with nothing new is another row, with no flip and no latency
+    _watch_once(monkeypatch, frame, lambda chat, text: sent.append((chat, text)))
+    assert [r["flips"] for r in trend._ops_rows()] == [[flip.date().isoformat()], []] and trend._ops_rows()[1]["lag_s"] is None
+
+
+@pytest.mark.unit
+def test_a_run_that_never_succeeds_leaves_one_failed_row_with_its_errors(monkeypatch):
+    monkeypatch.setattr(trend, "RETRIES", 2)
+    monkeypatch.setattr(trend, "bars", mock.Mock(side_effect=OSError("no network")))
+    naps = []
+
+    def nap(seconds):
+        naps.append(seconds)
+        if seconds != trend.RETRY_SECONDS:
+            raise SystemExit
+
+    monkeypatch.setattr(trend.time, "sleep", nap)
+    with pytest.raises(SystemExit):
+        trend.watch(lambda chat, text: None, ["a"])
+    (row,) = trend._ops_rows()
+    assert row["ok"] is False and row["tries"] == 2 and len(row["errors"]) == 2 and "no network" in row["errors"][0]
+
+
+@pytest.mark.unit
+def test_health_shows_the_last_completed_run_and_flags_an_overdue_one():
+    now = datetime(2026, 10, 23, 8, 0, tzinfo=UTC)
+    assert "no run has completed yet" in trend.health_text("BTCUSDT", now)
+    frame = _crafted()
+    _check(frame, frame.index[250], [])
+    entry = trend._load()["BTCUSDT"]
+    ran = datetime.fromisoformat(entry["last_run"]["at"])
+    today = ran.replace(hour=12, minute=0)
+    assert trend.health_text("BTCUSDT", today).startswith("BTCUSDT job: OK")
+    text = trend.health_text("BTCUSDT", today)
+    assert "Last completed run" in text and f"data through {frame.index[250].date()}" in text and "Undelivered alerts: 0" in text
+    tomorrow = today + timedelta(days=1)
+    assert trend.overdue(entry, tomorrow.replace(hour=0, minute=29)) is False  # not yet due
+    assert trend.overdue(entry, tomorrow.replace(hour=0, minute=31)) is True
+    assert "OVERDUE" in trend.health_text("BTCUSDT", tomorrow.replace(hour=3))
+
+
+@pytest.mark.unit
+def test_dead_man_alerts_once_a_day_and_only_when_no_run_completed():
+    sent = []
+    frame = _crafted()
+    _check(frame, frame.index[250], [])
+    ran = datetime.fromisoformat(trend._load()["BTCUSDT"]["last_run"]["at"])
+    day2 = (ran + timedelta(days=1)).replace(hour=0, minute=31)
+    send = lambda chat, text: sent.append((chat, text))  # noqa: E731
+    assert trend.alert_overdue("BTCUSDT", send, ["a", "b"], ran.replace(hour=0, minute=31)) is False  # a run completed today
+    assert trend.alert_overdue("BTCUSDT", send, ["a", "b"], day2) is True
+    assert sorted(c for c, _ in sent) == ["a", "b"] and "no run has completed since" in sent[0][1]
+    assert trend.alert_overdue("BTCUSDT", send, ["a", "b"], day2.replace(minute=40)) is False and len(sent) == 2  # once a day
+    assert trend.alert_overdue("BTCUSDT", send, ["a", "b"], day2 + timedelta(days=1)) is True  # and again tomorrow
+    _check(frame, frame.index[251], [])  # the job completed a run: tomorrow-after-that stays quiet
+    ran = datetime.fromisoformat(trend._load()["BTCUSDT"]["last_run"]["at"])
+    assert trend.alert_overdue("BTCUSDT", send, ["a"], ran.replace(hour=0, minute=45)) is False
+
+
+@pytest.mark.unit
+def test_dead_man_alerts_when_the_job_never_completed_and_survives_a_dead_chat():
+    def send(chat, text):
+        if chat == "a":
+            raise OSError("down")
+        sent.append(chat)
+
+    sent = []
+    assert trend.alert_overdue("BTCUSDT", send, ["a", "b"], datetime(2026, 10, 23, 1, 0, tzinfo=UTC)) is True
+    assert sent == ["b"] and any(e["event"] == "send_failed" for e in _events())
+
+
+# --- the price at send time, next to the open the backtest uses -----------------------------------------
+
+
+@pytest.mark.unit
+def test_a_live_signal_records_the_price_at_send_next_to_the_open(monkeypatch):
+    frame = _crafted()
+    flip = _flips(frame)[1][0]
+    _check(frame, flip - timedelta(days=1), [])
+    open_ = float(frame.loc[flip, "Close"])
+    monkeypatch.setattr(trend, "quote", lambda symbol: {"price": open_ * 1.004, "open": open_, "at": "2026-10-22T00:05:07+00:00"})
+    sent = []
+    _check(frame, flip, sent, CHATS)
+    row = trend._load()["BTCUSDT"]["ledger"][0]
+    assert row["quote"]["price"] == pytest.approx(open_ * 1.004) and row["quote"]["open"] == open_
+    out = trend.paper_text("BTCUSDT")
+    assert "price at send" in out and "+0.40% vs open" in out
+
+
+@pytest.mark.unit
+def test_no_price_never_blocks_the_alert_and_a_late_signal_gets_none(monkeypatch):
+    frame = _crafted()
+    flip = _flips(frame)[1][0]
+    _check(frame, flip - timedelta(days=1), [])
+    sent = []
+    _check(frame, flip, sent, CHATS)  # quote() is None here, as when Binance cannot be reached
+    assert len(sent) == 3 and "quote" not in trend._load()["BTCUSDT"]["ledger"][0]
+    asked = []
+    monkeypatch.setattr(trend, "quote", lambda symbol: asked.append(symbol) or {"price": 1.0, "open": 1.0, "at": "x"})
+    _check(frame, frame.index[-1], [], CHATS)  # the second flip arrives after a 40-day outage: late, nobody could act on it
+    assert trend._load()["BTCUSDT"]["ledger"][-1]["late"] is True and asked == []
+
+
+@pytest.mark.unit
+def test_quote_reads_the_price_and_the_open_and_returns_none_when_binance_is_down(monkeypatch):
+    bar = [0, "84000.0", "0", "0", "84210.5", "0"]
+    response = mock.Mock(**{"json.return_value": [bar], "raise_for_status.return_value": None})
+    monkeypatch.undo()  # the autouse stub would hide quote
+    monkeypatch.setattr(trend, "DIR", "/tmp")
+    with mock.patch.object(trend.requests, "get", return_value=response) as get:
+        out = trend.quote("BTCUSDT")
+    assert out["price"] == 84210.5 and out["open"] == 84000.0 and get.call_args.kwargs["params"]["symbol"] == "BTCUSDT"
+    with mock.patch.object(trend.requests, "get", side_effect=trend.requests.ConnectionError("down")):
+        assert trend.quote("BTCUSDT") is None
+    assert trend.quote("AAPL") is None  # not a crypto pair
+
+
+# --- the delivery drill, through the real send path --------------------------------------------------------
+
+
+class _FakeTelegram:
+    """A local Telegram Bot API: records every sendMessage and can answer 500 for a chat."""
+
+    def __init__(self):
+        self.log, self.down = [], set()
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if str(body["chat_id"]) in outer.down:
+                    self.send_response(500)
+                    self.end_headers()
+                    return
+                outer.log.append((str(body["chat_id"]), body["text"]))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok": true, "result": {}}')
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/bottest"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+
+@pytest.fixture
+def telegram(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")  # a proxy in the environment must not sit between the test and its fake
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    # the suite blocks the network; open loopback only, so the fake is reachable and nothing else is
+    real_connect, real_lookup = _socket.socket.connect, _socket.getaddrinfo
+
+    def loopback_only(self, address):
+        if address[0] != "127.0.0.1":
+            raise OSError(f"test tried to reach the network: {address}")
+        return real_connect(self, address)
+
+    monkeypatch.setattr(socket.socket, "connect", loopback_only)
+
+    def lookup(host, *args, **kwargs):
+        if host != "127.0.0.1":
+            raise OSError(f"test tried to reach the network: {host}")
+        return real_lookup(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", lookup)
+    import telegram_bot
+    mod = importlib.reload(telegram_bot)
+    fake = _FakeTelegram()
+    monkeypatch.setattr(mod, "API", fake.url)
+    yield mod, fake
+    fake.server.shutdown()
+
+
+@pytest.mark.unit
+def test_the_delivery_drill_passes_through_the_real_send_path(telegram):
+    mod, fake = telegram
+    results = trend_drill.run(mod.say, ["111", "222"])
+    assert all(ok for _, ok, _ in results), results
+    for chat in ("111", "222"):  # the HTTP requests really arrived, in order, each exactly once
+        texts = [t for c, t in fake.log if c == chat]
+        assert len(texts) == 2 and "turned UP" in texts[0] and "turned DOWN" in texts[1] and texts[0].startswith(trend_drill.PREFIX)
+    assert trend.DIR != "/tmp" and not any(x.endswith("state.json") for x in __import__("os").listdir(trend.DIR))  # the live book is untouched
+
+
+@pytest.mark.unit
+def test_the_drill_runs_with_a_single_test_chat_and_fails_loudly_on_a_bad_chat(telegram):
+    mod, fake = telegram
+    assert all(ok for _, ok, _ in trend_drill.run(mod.say, ["111"]))
+    with pytest.raises(ValueError):
+        trend_drill.run(mod.say, ["111"], fail_chat="999")
+
+
+@pytest.mark.unit
+def test_a_telegram_http_error_is_a_failed_send_that_is_retried_for_that_chat_only(telegram):
+    mod, fake = telegram
+    frame = _crafted()
+    flip = _flips(frame)[1][0]
+    _check(frame, flip - timedelta(days=1), [])
+    fake.down = {"b"}  # the server answers 500 for chat b
+    with mock.patch.object(trend, "bars", return_value=(frame[:flip], "binance")), pytest.raises(trend.SendFailed):
+        trend.check("BTCUSDT", mod.say, ["a", "b"], _at(flip))
+    assert [c for c, _ in fake.log] == ["a"] and trend._load()["BTCUSDT"]["pending"][0]["sent_to"] == ["a"]
+    fake.down = set()
+    with mock.patch.object(trend, "bars", return_value=(frame[:flip], "binance")):
+        trend.check("BTCUSDT", mod.say, ["a", "b"], _at(flip))
+    assert [c for c, _ in fake.log] == ["a", "b"] and trend._load()["BTCUSDT"]["pending"] == []
+
+
+@pytest.mark.unit
+def test_the_drill_command_prints_pass_for_every_step_and_exits_zero(telegram, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["trend_drill", "--chat", "111", "--chat", "222"])
+    assert trend_drill.main() == 0
+    out = capsys.readouterr().out
+    assert out.count("PASS") == 7 and "FAIL" not in out
