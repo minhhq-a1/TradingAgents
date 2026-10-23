@@ -110,7 +110,7 @@ def main() -> int:
     args = parser.parse_args()
     import telegram_bot  # next to the bot script, which holds the real send path
 
-    results = run(telegram_bot.say, args.chat)
+    results = run(telegram_bot.say_html, args.chat)
     for name, ok, detail in results:
         print(f"{'PASS' if ok else 'FAIL'}  {name}{f' ({detail})' if detail and not ok else ''}")
     return 0 if all(ok for _, ok, _ in results) else 1

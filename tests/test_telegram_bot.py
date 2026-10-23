@@ -11,7 +11,7 @@ def bot(monkeypatch):
     import telegram_bot
     mod = importlib.reload(telegram_bot)
     sent = []
-    monkeypatch.setattr(mod, "say", lambda chat, text: sent.append(text))
+    monkeypatch.setattr(mod, "say", lambda chat, text, **kw: sent.append(text))
     monkeypatch.setattr(mod, "analyze", lambda chat, t, d: sent.append(f"ran {t} {d}"))
     return mod, sent
 

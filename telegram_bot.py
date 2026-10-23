@@ -43,6 +43,10 @@ def say(chat, text, **kw):
     call("sendMessage", json={"chat_id": chat, "text": text[:4096], **kw})
 
 
+def say_html(chat, text):
+    say(chat, text, parse_mode="HTML")  # every trend message is Telegram HTML
+
+
 EMOJI = {"Buy": "🟢", "Overweight": "🟢", "Hold": "🟡", "Underweight": "🔴", "Sell": "🔴"}
 NUM = r"~?\$?\d+(?:,\d{3})*(?:\.\d+)?k?"
 TRIGGER = re.compile(rf"\bcloses?\b(?: a day| back| decisively)?\s+(above|below)\s+(?:about |roughly |~)?({NUM})(?![\d.,]*%)", re.I)  # a % is a yield, not a price
@@ -280,10 +284,10 @@ def handle(msg):
     parts = (msg.get("text") or "").split()
     command = parts[0].split("@")[0] if parts else ""
     if command in ("/status", "/health"):
-        return say(chat, trend.health_text(parts[1] if len(parts) > 1 else "BTCUSDT"))
+        return say_html(chat, trend.health_text(parts[1] if len(parts) > 1 else "BTCUSDT"))
     if command in ("/trend", "/paper"):
         report = trend.status_text if command == "/trend" else trend.paper_text
-        return say(chat, report(parts[1] if len(parts) > 1 else "BTCUSDT"))
+        return say_html(chat, report(parts[1] if len(parts) > 1 else "BTCUSDT"))
     if command != "/analyze":  # anything else, /status or /help included, gets the list of commands
         return say(chat, COMMANDS)
     ticker = parts[1] if len(parts) > 1 else ""
@@ -301,7 +305,7 @@ def main():
     assert ALLOWED, "set TELEGRAM_ALLOWED_CHAT_IDS"
     # Own thread: an analysis blocks this loop for minutes, which must not delay a trend alert.
     for job in (trend.watch, trend.deadman):  # the dead-man alert must not share a thread with the job it watches
-        threading.Thread(target=job, args=(say, sorted(ALLOWED)), daemon=True).start()
+        threading.Thread(target=job, args=(say_html, sorted(ALLOWED)), daemon=True).start()
     offset = None
     while True:
         try:

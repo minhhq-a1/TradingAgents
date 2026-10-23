@@ -6,6 +6,7 @@ Prices are synthetic and the vendors are mocked, so these run without a network 
 import _socket
 import importlib
 import json
+import re
 import socket
 import threading
 from datetime import UTC, datetime, timedelta
@@ -17,6 +18,25 @@ import pandas as pd
 import pytest
 
 from tradingagents import trend, trend_backtest, trend_drill
+
+
+def _telegram_html(text: str) -> bool:
+    """Telegram rejects a message with an unknown or unclosed tag, or a bare < or &: that would be a lost alert."""
+    tags = re.findall(r"<(/?)([a-z]*)[^>]*>", text)
+    stack = []
+    for close, name in tags:
+        assert name in ("b", "i", "code", "pre"), name
+        if close:
+            assert stack.pop() == name
+        else:
+            stack.append(name)
+    bare = re.sub(r"</?(?:b|i|code|pre)>", "", text)
+    assert "<" not in bare and not re.search(r"&(?!lt;|gt;|amp;)", bare), text
+    return not stack
+
+
+def _btc_line(out: str) -> str:
+    return re.search(r"<pre>BTC +([\d.]+%)", out).group(1)
 
 CHATS = ["a", "b", "c"]
 
@@ -97,7 +117,7 @@ def test_alerts_fire_on_exactly_the_flip_days_and_never_twice():
     _replay(frame, sent, state.index[0], restart_every=3)
     assert len(flips) >= 6 and len(sent) == len(flips)
     for (_, text), day in zip(sent, flips, strict=True):
-        assert f"UTC close {day.date()}" in text
+        assert f"Close {day.date()}" in text and _telegram_html(text)
         assert ("HOLD BTC" in text) == (state[day] == trend.HOLD)
     assert not trend._load()["BTCUSDT"]["gaps"]  # processed on time every day
 
@@ -161,12 +181,14 @@ def test_an_outage_with_two_flips_is_flagged_alerted_once_and_kept_out_of_the_op
     assert len(sent) == 3 and len({t for _, t in sent}) == 1  # one combined message, to every chat
     text = sent[0][1]
     assert "offline from" in text and all(str(f.date()) in text for f in flips[:2]) and "could not be acted on in time" in text
+    assert _telegram_html(text)
     assert [r["late"] for r in entry["ledger"]] == [True, True] and len(entry["ledger"]) == 2
     gap = entry["gaps"][0]
     assert gap["from"] == (start + timedelta(days=1)).date().isoformat() and gap["to"] == (last - timedelta(days=1)).date().isoformat()
     assert [e["event"] for e in _events()].count("outage") == 1
     out = trend.paper_text("BTCUSDT")
-    assert "Equity, rule (every change filled)" in out and "Equity, as operated" in out and "offline, position held through them" in out
+    assert "Equity, rule</b> (every change filled)" in out and "Equity, as operated" in out and "offline, position held through them" in out
+    assert _telegram_html(out)
     frame_days, rule, operated = trend._book(entry)
     assert (operated == trend.HOLD).all() and (rule == trend.CASH).any()  # the operated book never left the market
     ideal, ops = trend.simulate(frame_days, rule), trend.simulate(frame_days, operated)
@@ -215,7 +237,7 @@ def test_book_starts_as_cash_with_the_configured_split_and_ignores_later_env_cha
     before = trend.paper_text("BTCUSDT")
     monkeypatch.setenv("TREND_CORE_WEIGHT", "0.9")
     assert trend.paper_text("BTCUSDT") == before and "core 50% fixed at the start" in before
-    assert "Starting split: 50% core BTC" in sent[0][1]
+    assert "Split: 50% core BTC" in sent[0][1]
 
 
 # --- finding 4: data continuity, source and revisions --------------------------------------------
@@ -378,9 +400,9 @@ def test_report_evaluates_from_the_requested_start_and_flags_one_without_warm_up
 def test_alert_does_not_promise_the_open_price_and_warns_about_whipsaw():
     info = {"symbol": "BTCUSDT", "state": trend.HOLD, "date": "2026-10-21", "close": 84093.4, "sma": 72774.0, "since": "2026-10-21"}
     text = trend.alert_text(info, "2026-10-22T00:06:11+00:00", 0.5)
-    assert "84,093 vs SMA200 72,774 (+15.6%)" in text and "Detected 00:06 UTC" in text
-    assert "no order was placed" in text and "you cannot get that price" in text
-    assert "29 of 44 closed trades lost money" in text and "Starting split: 50% core BTC (never sold), 50% follows" in text
+    assert "<pre>Close 2026-10-21  84,093\nSMA200            72,774\nGap               +15.6%</pre>" in text
+    assert "Detected 00:06 UTC" in text and "no order was placed" in text and "you cannot get that price" in text
+    assert "29 of 44 closed trades" in text and "Split: 50% core BTC (never sold) · 50% follows" in text and _telegram_html(text)
 
 
 @pytest.mark.unit
@@ -419,7 +441,7 @@ def test_status_text_only_serves_the_validated_symbol():
     assert "only validated on BTCUSDT" in trend.status_text("ETHUSDT")
     with mock.patch.object(trend, "bars", return_value=(_walk(), "binance")):
         out = trend.status_text("btcusdt")
-    assert out.startswith("BTCUSDT trend (paper): ") and "SMA200" in out
+    assert out.startswith("<b>BTCUSDT trend: ") and "SMA200" in out and "Whipsaw" in out and _telegram_html(out)
 
 
 @pytest.mark.unit
@@ -428,8 +450,8 @@ def test_paper_text_shows_one_equity_line_without_an_outage_and_the_ledger():
     flip = _flips(frame)[1][0]
     _replay(frame, [], flip - timedelta(days=10))
     out = trend.paper_text("BTCUSDT")
-    assert "paper book since" in out and "no real orders" in out and "Equity, rule (every change filled): mix" in out
-    assert "as operated" not in out and "Ledger" in out and "-> open" in out and "Reference only: Whipsaw warning" in out
+    assert "paper book</b>" in out and "no real orders" in out and "Equity, rule</b>" in out and "Mix (core + rule)" in out
+    assert "as operated" not in out and "Ledger" in out and "→ open" in out and "Whipsaw" not in out and _telegram_html(out)
     assert trend.paper_text("ETHUSDT") == "No paper book yet: the first daily check has not run."
 
 
@@ -458,7 +480,7 @@ def test_watch_retries_then_reports_a_check_that_never_succeeded(monkeypatch):
     with pytest.raises(SystemExit):
         trend.watch(lambda chat, text: sent.append((chat, text)), ["a", "b"])
     assert calls == ["BTCUSDT", "BTCUSDT"] and naps[:2] == [trend.RETRY_SECONDS] * 2
-    assert [c for c, _ in sent] == ["a", "b"] and "No signal was made today" in sent[0][1]
+    assert [c for c, _ in sent] == ["a", "b"] and "No signal was made today" in sent[0][1] and _telegram_html(sent[0][1])
     assert "check_failed" in [e["event"] for e in _events()]
 
 
@@ -548,7 +570,7 @@ def test_paper_text_reports_the_real_btc_weight_after_the_core_sleeve_drifted():
     expected, filled = _paper_expected(frame, start, last)
     out = trend.paper_text("BTCUSDT")
     assert not filled and expected < 0.45
-    assert f"{expected:.1%} of the book in BTC" in out and "Now: 50%" not in out and "Pending at the next open" not in out
+    assert _btc_line(out) == f"{expected:.1%}" and "Pending at the next open" not in out
 
 
 @pytest.mark.unit
@@ -559,12 +581,12 @@ def test_paper_text_keeps_a_pending_signal_apart_from_the_filled_position():
     _replay(frame[:flip], [], start)  # stop on the signal day itself: still in BTC, the sale waits for the next open
     out = trend.paper_text("BTCUSDT")
     expected, filled = _paper_expected(frame, start, flip)
-    assert filled and f"{expected:.1%} of the book in BTC" in out
+    assert filled and _btc_line(out) == f"{expected:.1%}"
     assert f"Pending at the next open: trend sleeve to CASH (signal of {flip.date()})" in out
     _check(frame, flip + timedelta(days=1), [])  # the next open has filled it
     out = trend.paper_text("BTCUSDT")
     expected, filled = _paper_expected(frame, start, flip + timedelta(days=1))
-    assert not filled and f"{expected:.1%} of the book in BTC" in out and "Pending at the next open" not in out
+    assert not filled and _btc_line(out) == f"{expected:.1%}" and "Pending at the next open" not in out
 
 
 # --- an undelivered alert stays queued when a newer one is made -------------------------------------
@@ -672,13 +694,15 @@ def test_health_shows_the_last_completed_run_and_flags_an_overdue_one():
     entry = trend._load()["BTCUSDT"]
     ran = datetime.fromisoformat(entry["last_run"]["at"])
     today = ran.replace(hour=12, minute=0)
-    assert trend.health_text("BTCUSDT", today).startswith("BTCUSDT job: OK")
     text = trend.health_text("BTCUSDT", today)
-    assert "Last completed run" in text and f"data through {frame.index[250].date()}" in text and "Undelivered alerts: 0" in text
+    assert text.startswith("✅ <b>BTCUSDT job: OK</b>") and _telegram_html(text)
+    assert "Last completed run" in text and f"Data through {frame.index[250].date()}" in text and "Undelivered alerts  0" in text
     tomorrow = today + timedelta(days=1)
     assert trend.overdue(entry, tomorrow.replace(hour=0, minute=29)) is False  # not yet due
     assert trend.overdue(entry, tomorrow.replace(hour=0, minute=31)) is True
     assert "OVERDUE" in trend.health_text("BTCUSDT", tomorrow.replace(hour=3))
+    trend._ops(symbol="BTCUSDT", ok=False, tries=12, errors=["HTTPError('<Response [451]> & more')"])
+    assert "&lt;Response [451]&gt; &amp; more" in (text := trend.health_text("BTCUSDT", today)) and _telegram_html(text)
 
 
 @pytest.mark.unit
@@ -691,7 +715,7 @@ def test_dead_man_alerts_once_a_day_and_only_when_no_run_completed():
     send = lambda chat, text: sent.append((chat, text))  # noqa: E731
     assert trend.alert_overdue("BTCUSDT", send, ["a", "b"], ran.replace(hour=0, minute=31)) is False  # a run completed today
     assert trend.alert_overdue("BTCUSDT", send, ["a", "b"], day2) is True
-    assert sorted(c for c, _ in sent) == ["a", "b"] and "no run has completed since" in sent[0][1]
+    assert sorted(c for c, _ in sent) == ["a", "b"] and "No run has completed since" in sent[0][1]
     assert trend.alert_overdue("BTCUSDT", send, ["a", "b"], day2.replace(minute=40)) is False and len(sent) == 2  # once a day
     assert trend.alert_overdue("BTCUSDT", send, ["a", "b"], day2 + timedelta(days=1)) is True  # and again tomorrow
     _check(frame, frame.index[251], [])  # the job completed a run: tomorrow-after-that stays quiet
@@ -726,7 +750,7 @@ def test_a_live_signal_records_the_price_at_send_next_to_the_open(monkeypatch):
     row = trend._load()["BTCUSDT"]["ledger"][0]
     assert row["quote"]["price"] == pytest.approx(open_ * 1.004) and row["quote"]["open"] == open_
     out = trend.paper_text("BTCUSDT")
-    assert "price at send" in out and "+0.40% vs open" in out
+    assert "price at send" in out and "+0.40% vs open" in out and _telegram_html(out)
 
 
 @pytest.mark.unit
@@ -764,7 +788,7 @@ class _FakeTelegram:
     """A local Telegram Bot API: records every sendMessage and can answer 500 for a chat."""
 
     def __init__(self):
-        self.log, self.down = [], set()
+        self.log, self.down, self.modes = [], set(), []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -775,6 +799,7 @@ class _FakeTelegram:
                     self.end_headers()
                     return
                 outer.log.append((str(body["chat_id"]), body["text"]))
+                outer.modes.append(body.get("parse_mode"))
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -821,11 +846,12 @@ def telegram(monkeypatch):
 @pytest.mark.unit
 def test_the_delivery_drill_passes_through_the_real_send_path(telegram):
     mod, fake = telegram
-    results = trend_drill.run(mod.say, ["111", "222"])
+    results = trend_drill.run(mod.say_html, ["111", "222"])
     assert all(ok for _, ok, _ in results), results
     for chat in ("111", "222"):  # the HTTP requests really arrived, in order, each exactly once
         texts = [t for c, t in fake.log if c == chat]
-        assert len(texts) == 2 and "turned UP" in texts[0] and "turned DOWN" in texts[1] and texts[0].startswith(trend_drill.PREFIX)
+        assert len(texts) == 2 and "trend UP" in texts[0] and "trend DOWN" in texts[1] and texts[0].startswith(trend_drill.PREFIX)
+    assert fake.modes and set(fake.modes) == {"HTML"}
     assert trend.DIR != "/tmp" and not any(x.endswith("state.json") for x in __import__("os").listdir(trend.DIR))  # the live book is untouched
 
 
