@@ -27,6 +27,8 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 API = f"https://api.telegram.org/bot{os.environ.get('TELEGRAM_BOT_TOKEN', '')}"
 ALLOWED = {c.strip() for c in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if c.strip()}
 REFERENCE = "ℹ️ <i>Báo cáo tham khảo, không phải tín hiệu giao dịch.</i>"
+COMMANDS = ("Commands:\n/analyze TICKER [YYYY-MM-DD]: full analysis report\n"
+            "/trend [SYMBOL]: SMA200 trend rule, current state (paper)\n/paper [SYMBOL]: paper book, equity and ledger")
 TICKER = re.compile(r"^[A-Za-z0-9.\-^=]{1,20}$")
 
 
@@ -279,8 +281,8 @@ def handle(msg):
     if command in ("/trend", "/paper"):
         report = trend.status_text if command == "/trend" else trend.paper_text
         return say(chat, report(parts[1] if len(parts) > 1 else "BTCUSDT"))
-    if not parts or parts[0].split("@")[0] != "/analyze":
-        return say(chat, "Usage: /analyze TICKER [YYYY-MM-DD]")
+    if command != "/analyze":  # anything else, /status or /help included, gets the list of commands
+        return say(chat, COMMANDS)
     ticker = parts[1] if len(parts) > 1 else ""
     date = parts[2] if len(parts) > 2 else datetime.date.today().isoformat()
     if not TICKER.match(ticker):
