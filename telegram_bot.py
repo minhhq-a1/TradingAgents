@@ -43,6 +43,10 @@ def say(chat, text, **kw):
     call("sendMessage", json={"chat_id": chat, "text": text[:4096], **kw})
 
 
+def say_html(chat, text):
+    say(chat, text, parse_mode="HTML")  # every trend message is Telegram HTML
+
+
 EMOJI = {"Buy": "🟢", "Overweight": "🟢", "Hold": "🟡", "Underweight": "🔴", "Sell": "🔴"}
 NUM = r"~?\$?\d+(?:,\d{3})*(?:\.\d+)?k?"
 TRIGGER = re.compile(rf"\bcloses?\b(?: a day| back| decisively)?\s+(above|below)\s+(?:about |roughly |~)?({NUM})(?![\d.,]*%)", re.I)  # a % is a yield, not a price
@@ -98,8 +102,8 @@ def summarize(ticker, date, decision, trade_plan=""):
     rating, horizon = f["Rating"], given(f.get("Time Horizon"))
     if horizon:  # "2-6 weeks, reviewed on ..." -> the period itself
         horizon = horizon.split(",")[0]
-    out = [f"{EMOJI.get(rating, '⚪')} <b>{e(ticker)}</b> · {e(date)}",
-           f"<b>{e(rating)}</b>" + (f" · horizon {e(horizon)}" if horizon else "")]
+    out = [f"{EMOJI.get(rating, '⚪')} <b>{e(ticker)} · {e(rating)}</b>",
+           e(date) + (f" · horizon {e(horizon)}" if horizon else "")]
 
     t = dict(re.findall(r"\*\*(Entry Price|Stop Loss|Position Sizing)\*\*: (.+)", trade_plan))
     levels = {"Entry": t.get("Entry Price"), "Stop": t.get("Stop Loss"), "Target": f.get("Price Target"),
@@ -107,11 +111,11 @@ def summarize(ticker, date, decision, trade_plan=""):
     # A long sizing paragraph belongs in the report; the card shows only a short one.
     levels = [f"{k} <b>{e(v.strip())}</b>" for k, v in levels.items() if given(v) and len(v) <= 40]
     if levels:
-        out += ["", "📍 " + " · ".join(levels)]
+        out += ["", "📍 <b>Levels</b>", *levels]
 
     summary = sentences(f.get("Executive Summary", ""))
     # shortcut: a lone sentence over the limit is cut at a word (rare); fix if the PM starts writing run-ons
-    out += ["", e(fit(summary, 600) or summary[0][:600].rsplit(" ", 1)[0] + "…" if summary else "")]
+    out += ["", "📝 <b>Summary</b>", e(fit(summary, 600) or summary[0][:600].rsplit(" ", 1)[0] + "…" if summary else "")]
 
     # The thesis is bold-led blocks ("**Trend.** text", "**Evidence:**\n- item") or plain paragraphs
     # ("For the bull: text"). A block is (label, sentences).
@@ -140,7 +144,7 @@ def summarize(ticker, date, decision, trade_plan=""):
     ups = [f"close above <b>{e(n)}</b>" for d, n in triggers if d == "above"]
     downs = [f"close below <b>{e(n)}</b>" for d, n in triggers if d == "below"]
     if ups or downs:
-        out += ["", "🎯 " + " · ".join([f"▲ {x}" for x in ups[:2]] + [f"▼ {x}" for x in downs[:2]])]
+        out += ["", "🎯 <b>Triggers</b>", *[f"▲ {x}" for x in ups[:2]], *[f"▼ {x}" for x in downs[:2]]]
 
     # Up to three conclusions: per block, a whole sentence that is short enough and not already a trigger,
     # a gap or the summary; one that states a conclusion is preferred.
@@ -161,7 +165,7 @@ def summarize(ticker, date, decision, trade_plan=""):
             tag = f"<b>{e(label)}:</b> " if label and len(label) <= 40 and label.lower() != "rating" else ""
             bullets.append(f"• {tag}{e(pick)}")
     if bullets:
-        out += [""] + bullets
+        out += ["", "<b>Key points</b>", *bullets]
 
     # Gaps: a labelled block's items, else any sentence that says something was not provided.
     gap_text = ""
@@ -280,10 +284,10 @@ def handle(msg):
     parts = (msg.get("text") or "").split()
     command = parts[0].split("@")[0] if parts else ""
     if command in ("/status", "/health"):
-        return say(chat, trend.health_text(parts[1] if len(parts) > 1 else "BTCUSDT"))
+        return say_html(chat, trend.health_text(parts[1] if len(parts) > 1 else "BTCUSDT"))
     if command in ("/trend", "/paper"):
         report = trend.status_text if command == "/trend" else trend.paper_text
-        return say(chat, report(parts[1] if len(parts) > 1 else "BTCUSDT"))
+        return say_html(chat, report(parts[1] if len(parts) > 1 else "BTCUSDT"))
     if command != "/analyze":  # anything else, /status or /help included, gets the list of commands
         return say(chat, COMMANDS)
     ticker = parts[1] if len(parts) > 1 else ""
@@ -301,7 +305,7 @@ def main():
     assert ALLOWED, "set TELEGRAM_ALLOWED_CHAT_IDS"
     # Own thread: an analysis blocks this loop for minutes, which must not delay a trend alert.
     for job in (trend.watch, trend.deadman):  # the dead-man alert must not share a thread with the job it watches
-        threading.Thread(target=job, args=(say, sorted(ALLOWED)), daemon=True).start()
+        threading.Thread(target=job, args=(say_html, sorted(ALLOWED)), daemon=True).start()
     offset = None
     while True:
         try:

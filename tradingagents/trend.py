@@ -16,6 +16,8 @@ fills at the next open: 0.1% fee per side, ``TREND_CORE_WEIGHT`` (default 0.5) o
 a BTC sleeve that is never sold, the rest in a sleeve that follows the rule, no rebalancing.
 ``simulate`` is that one model, shared with ``tradingagents.trend_backtest``.
 
+Every message is Telegram HTML: bold heads, numbers in ``<pre>`` blocks, dynamic text escaped.
+
 State is saved before a message goes out and each chat's delivery is recorded on its own, so a
 restart can neither lose a flip nor repeat a delivered one, and one failing chat blocks no other.
 """
@@ -27,6 +29,7 @@ import logging
 import os
 import time
 from datetime import UTC, datetime, timedelta
+from html import escape as _html
 
 import numpy as np
 import pandas as pd
@@ -49,9 +52,8 @@ DIR = os.path.join(os.path.expanduser("~"), ".tradingagents", "trend")
 
 HOLD, CASH = "HOLD", "CASH"
 WHIPSAW = (
-    "Whipsaw warning: in the 2014-2026 Bitstamp validation, 29 of 44 closed trades lost money and "
-    "lasted 14 days or less. The rule helps by sitting out long bear markets (max drawdown -67% "
-    "against -83% for buy-and-hold), not by being right on each signal."
+    "<i>⚠️ Whipsaw: 29 of 44 closed trades (2014-2026) lost money and lasted 14 days or less. The edge is "
+    "sitting out bear markets (max drawdown -67% vs -83% buy-and-hold), not each signal.</i>"
 )
 
 
@@ -183,42 +185,57 @@ def _log(event: str, **fields) -> None:
         f.write(json.dumps({"event": event, "at": datetime.now(UTC).isoformat(timespec="seconds"), **fields}) + "\n")
 
 
-def _distance(info: dict) -> str:
-    return f"UTC close {info['date']}: {info['close']:,.0f} vs SMA200 {info['sma']:,.0f} ({info['close'] / info['sma'] - 1:+.1%})."
+def _esc(text: str) -> str:
+    return _html(text, quote=False)  # Telegram only needs & < > escaped
+
+
+def _pre(rows: list[tuple[str, str]]) -> str:
+    """Label/value rows as one monospace block, values right-aligned, for Telegram HTML."""
+    left, right = max(len(k) for k, _ in rows), max(len(v) for _, v in rows)
+    return "<pre>" + "\n".join(_esc(f"{k:<{left}}  {v:>{right}}") for k, v in rows) + "</pre>"
+
+
+def _levels(info: dict) -> str:
+    return _pre([(f"Close {info['date']}", f"{info['close']:,.0f}"), ("SMA200", f"{info['sma']:,.0f}"),
+                 ("Gap", f"{info['close'] / info['sma'] - 1:+.1%}")])
 
 
 def _split(weight: float) -> str:
-    return (f"Starting split: {weight:.0%} core BTC (never sold), {1 - weight:.0%} follows this rule; "
-            "the two parts are not rebalanced.")
+    return f"Split: {weight:.0%} core BTC (never sold) · {1 - weight:.0%} follows the rule, not rebalanced."
 
 
 def _head(state: str) -> str:
-    return f"{'🟢' if state == HOLD else '🔴'} BTCUSDT trend turned {'UP: rule says HOLD BTC' if state == HOLD else 'DOWN: rule says CASH'}"
+    return f"{'🟢' if state == HOLD else '🔴'} <b>BTCUSDT trend {'UP · HOLD BTC' if state == HOLD else 'DOWN · CASH'}</b>"
 
 
 def alert_text(info: dict, detected_at: str, weight: float | None = None) -> str:
     return "\n".join([
-        f"{_head(info['state'])}",
-        _distance(info),
-        "Rule: UTC close above SMA200 = hold BTC, otherwise cash. Paper signal only, no order was placed.",
+        _head(info["state"]),
+        "<i>Paper signal only, no order was placed.</i>",
+        _levels(info),
+        f"Detected {detected_at[11:16]} UTC. The backtest fills at the 00:00 UTC open; you cannot get that price, "
+        "so a real fill will differ.",
         _split(core_weight() if weight is None else weight),
-        f"Detected {detected_at[11:16]} UTC. The backtest fills at the 00:00 UTC open after this close; you cannot "
-        "get that price, so a real fill will differ.",
+        "",
         WHIPSAW,
     ])
 
 
 def late_text(flips: list[dict], info: dict, outage: dict, detected_at: str, weight: float) -> str:
     """One message for signal changes found after the bot was offline: nobody could act on them on time."""
-    changes = [f"  {f['signal_date']}: {f['state']} (close {f['signal_close']:,.0f})" for f in flips]
+    n = len(flips)
     return "\n".join([
-        f"⚠️ BTCUSDT trend check was offline from {outage['from']} to {outage['to']} ({_days(outage['days'])}); "
-        f"{len(flips)} signal change{'s' * (len(flips) != 1)} {'was' if len(flips) == 1 else 'were'} found late, at {detected_at[11:16]} UTC, and could not be acted on in time:",
-        *changes,
-        f"Now: {'HOLD BTC' if info['state'] == HOLD else 'CASH'}. {_distance(info)}",
-        "The paper book shows two lines: the rule (every change filled at its next open) and as operated "
-        "(position held through the outage, moved to the current state when the bot was back).",
+        "⚠️ <b>BTCUSDT signals found late</b>",
+        f"The check was offline from {outage['from']} to {outage['to']} ({_days(outage['days'])}). "
+        f"{n} signal change{'s' * (n != 1)} {'was' if n == 1 else 'were'} found late, at {detected_at[11:16]} UTC, "
+        "and could not be acted on in time:",
+        *[f"• {f['signal_date']} <b>{f['state']}</b> · close {f['signal_close']:,.0f}" for f in flips],
+        "",
+        f"Now: {'🟢 HOLD BTC' if info['state'] == HOLD else '🔴 CASH'}",
+        _levels(info),
+        "/paper shows the rule (every change filled) and as operated (position held through the outage).",
         _split(weight),
+        "",
         WHIPSAW,
     ])
 
@@ -230,13 +247,15 @@ def status_text(symbol: str = "BTCUSDT") -> str:
         info = latest(symbol.upper())
         weight = (_load().get(symbol.upper()) or {}).get("core", core_weight())
     except Exception as exc:  # report, keep serving
-        return f"Trend data unavailable: {exc}"
-    now = "HOLD BTC" if info["state"] == HOLD else "CASH"
+        return f"⚠️ Trend data unavailable: {_esc(str(exc))}"
+    now = "🟢 HOLD BTC" if info["state"] == HOLD else "🔴 CASH"
     return "\n".join([
-        f"{info['symbol']} trend (paper): {now} since {info['since']}",
-        _distance(info),
-        "Rule: UTC close above SMA200 = hold BTC, otherwise cash. Fixed, no parameters.",
+        f"<b>{info['symbol']} trend: {now}</b> (paper)",
+        f"Since {info['since']}",
+        _levels(info),
+        "Rule: UTC close &gt; SMA200 = hold BTC, otherwise cash. Fixed, no parameters.",
         _split(weight),
+        "",
         WHIPSAW,
     ])
 
@@ -258,9 +277,10 @@ def paper_text(symbol: str = "BTCUSDT") -> str:
         return "No paper book yet: the first daily check has not run."
     frame, rule, operated = _book(entry)
     weight = entry["core"]
+    notes = [f"⚠️ Data check: {_esc(event)}" for event in entry["data_events"][-2:]]
     if len(frame) < 2:
-        notes = "".join(f"\n⚠ Data check: {event}" for event in entry["data_events"][-2:])
-        return f"{symbol} paper book opened {entry['start']['date']} as cash; no day has closed since, so no equity yet.{notes}"
+        return "\n".join([f"📒 <b>{symbol} paper book</b>",
+                          f"Opened {entry['start']['date']} as cash; no day has closed since, so no equity yet.", *notes])
     ideal, ops = simulate(frame, rule, weight), simulate(frame, operated, weight)
 
     def pct(equity: pd.Series) -> str:
@@ -269,36 +289,37 @@ def paper_text(symbol: str = "BTCUSDT") -> str:
     in_btc = operated.shift(fill_value=CASH).iloc[-1] == HOLD  # filled: yesterday's signal, bought at today's open
     core, sleeve = weight * ops["hold"].iloc[-1], (1 - weight) * ops["trend"].iloc[-1] * in_btc
     total = ops["mix"].iloc[-1]
-    pending = ""
-    if operated.iloc[-1] != (HOLD if in_btc else CASH):
-        pending = f" Pending at the next open: trend sleeve to {operated.iloc[-1]} (signal of {frame.index[-1].date()})."
     lines = [
-        f"{symbol} paper book since {entry['start']['date']} ({_days(len(frame) - 1)}, no real orders), "
-        f"core {weight:.0%} fixed at the start",
-        f"Now, filled through {frame.index[-1].date()}: {(core + sleeve) / total:.1%} of the book in BTC "
-        f"(core {core / total:.1%} + trend sleeve {sleeve / total:.1%}), the rest cash.{pending} "
-        "Sleeves start as cash and fill at the next open, 0.1% fee per side, no rebalancing.",
-        f"Equity, rule (every change filled): mix {pct(ideal['mix'])} | 100% SMA200 {pct(ideal['trend'])} | buy-and-hold {pct(ideal['hold'])}",
+        f"📒 <b>{symbol} paper book</b>",
+        f"Since {entry['start']['date']} ({_days(len(frame) - 1)}, no real orders) · core {weight:.0%} fixed at the start",
+        "",
+        f"<b>Position</b> · filled through {frame.index[-1].date()}",
+        _pre([("BTC", f"{(core + sleeve) / total:.1%}"), ("  core", f"{core / total:.1%}"),
+              ("  trend sleeve", f"{sleeve / total:.1%}"), ("Cash", f"{1 - (core + sleeve) / total:.1%}")]),
     ]
+    if operated.iloc[-1] != (HOLD if in_btc else CASH):
+        lines.append(f"⏳ Pending at the next open: trend sleeve to {operated.iloc[-1]} (signal of {frame.index[-1].date()})")
+    lines += ["", "<b>Equity, rule</b> (every change filled)",
+              _pre([("Mix (core + rule)", pct(ideal["mix"])), ("100% SMA200", pct(ideal["trend"])), ("Buy-and-hold", pct(ideal["hold"]))])]
     if entry["gaps"]:
-        lines.append(f"Equity, as operated: mix {pct(ops['mix'])} | 100% SMA200 {pct(ops['trend'])} "
-                     f"(⚠ {_days(sum(g['days'] for g in entry['gaps']))} offline, position held through them)")
-    for event in entry["data_events"][-2:]:
-        lines.append(f"⚠ Data check: {event}")
-    lines.append("Ledger (signal close -> next open fill; detected / sent UTC):")
+        lines += [f"<b>Equity, as operated</b> (⚠️ {_days(sum(g['days'] for g in entry['gaps']))} offline, position held through them)",
+                  _pre([("Mix (core + rule)", pct(ops["mix"])), ("100% SMA200", pct(ops["trend"]))])]
+    if notes:
+        lines += ["", *notes]
+    lines += ["", "<b>Ledger</b> · signal close → next open fill (UTC)"]
     for row in entry["ledger"][-5:]:
         fill = "pending" if row["fill_open"] is None else f"{row['fill_open']:,.0f}"
         sent = min(row["sent"].values())[5:16].replace("T", " ") if row["sent"] else "not yet"
+        lines += [f"• <b>{row['signal_date']} {row['state']}</b>{' (late)' if row['late'] else ''} · "
+                  f"close {row['signal_close']:,.0f} → open {fill} ({row['fill_date'][5:]})",
+                  f"   detected {row['detected_at'][5:16].replace('T', ' ')} · sent {sent}"]
         seen = row.get("quote")
-        price = ""
         if seen:  # what the alert could really have traded at, against the open the backtest uses
             base = row["fill_open"] or seen["open"]
-            price = f"; price at send {seen['price']:,.0f} ({seen['price'] / base - 1:+.2%} vs open)"
-        lines.append(f"  {row['signal_date']} {row['state']}{' (late)' if row['late'] else ''}: close {row['signal_close']:,.0f} "
-                     f"-> open {fill} ({row['fill_date']}), detected {row['detected_at'][5:16].replace('T', ' ')}, sent {sent}{price}")
+            lines.append(f"   price at send {seen['price']:,.0f} ({seen['price'] / base - 1:+.2%} vs open)")
     if not entry["ledger"]:
-        lines.append("  no flips yet")
-    lines.append("Reference only: " + WHIPSAW)
+        lines.append("No flips yet.")
+    lines.append("<i>Sleeves start as cash, fill at the next open, 0.1% fee per side, no rebalancing.</i>")
     return "\n".join(lines)
 
 
@@ -355,29 +376,30 @@ def health_text(symbol: str = "BTCUSDT", now: datetime | None = None) -> str:
     now = now or datetime.now(UTC)
     entry = _load().get(symbol)
     if entry is None:
-        return f"{symbol} job: no run has completed yet."
+        return f"{_esc(symbol)} job: no run has completed yet."
     last = entry.get("last_run")
-    state = "OVERDUE" if overdue(entry, now) else "OK"
-    lines = [f"{symbol} job: {state} (checked {now.strftime('%Y-%m-%d %H:%M')} UTC)"]
+    head = "🚨 <b>{} job: OVERDUE</b>" if overdue(entry, now) else "✅ <b>{} job: OK</b>"
+    lines = [head.format(symbol) + f" · checked {now.strftime('%Y-%m-%d %H:%M')} UTC"]
     if last:
         age = int((now - datetime.fromisoformat(last["at"])).total_seconds() // 60)
-        lines.append(f"Last completed run {last['at'][:16].replace('T', ' ')} UTC ({age // 60}h {age % 60}m ago), data through "
-                     f"{last['data_date']}, source {last['source']}, state {last['state']}")
+        lines += [f"Last completed run {last['at'][:16].replace('T', ' ')} UTC ({age // 60}h {age % 60}m ago)",
+                  f"Data through {last['data_date']} · {last['source']} · {last['state']}"]
     else:
         lines.append(f"No run has completed; data processed through {entry['checked']}")
-    queued = len(entry["pending"])
-    lines.append(f"Undelivered alerts: {queued}. Outages: {len(entry['gaps'])}. Data events: {len(entry['data_events'])}. "
-                 f"Signals: {len(entry['ledger'])}.")
+    lines += ["", _pre([("Undelivered alerts", str(len(entry["pending"]))), ("Outages", str(len(entry["gaps"]))),
+                        ("Data events", str(len(entry["data_events"]))), ("Signals", str(len(entry["ledger"])))]),
+              "<b>Recent runs</b>"]
     rows = _ops_rows()
     for row in rows[-3:]:
         eq = row.get("equity")
-        stats = f" | mix {eq['mix']:+.1%} SMA200 {eq['trend']:+.1%} hold {eq['hold']:+.1%}" if eq else ""
-        lag = f" | alert lag {row['lag_s']:.0f}s" if row.get("lag_s") is not None else ""
-        errors = f" | {len(row['errors'])} error(s) first: {row['errors'][0][:80]}" if row.get("errors") else ""
-        lines.append(f"  {row['at'][5:16].replace('T', ' ')} {'ok' if row['ok'] else 'FAILED'}, "
-                     f"data {row.get('data_date', '-')}{stats}{lag}{errors}")
+        stats = f" · mix {eq['mix']:+.1%}" if eq else ""
+        lag = f" · alert lag {row['lag_s']:.0f}s" if row.get("lag_s") is not None else ""
+        lines.append(f"{'✅' if row['ok'] else '❌ FAILED'} {row['at'][5:16].replace('T', ' ')} · "
+                     f"data {row.get('data_date', '-')}{stats}{lag}")
+        if row.get("errors"):
+            lines.append(f"   {len(row['errors'])} error(s), first: <code>{_esc(row['errors'][0][:80])}</code>")
     if not rows:
-        lines.append("  no ops rows yet")
+        lines.append("No ops rows yet.")
     return "\n".join(lines)
 
 
@@ -563,8 +585,8 @@ def watch(send, chats) -> None:
             _log("check_failed", error=error)
             for chat in chats:
                 try:
-                    send(chat, f"⚠️ BTCUSDT trend check failed after {RETRIES} tries ({error}). No signal was made today; "
-                               "the next check is tomorrow.")
+                    send(chat, f"⚠️ <b>BTCUSDT trend check failed</b> after {RETRIES} tries. No signal was made today; "
+                               f"the next check is tomorrow.\n<code>{_esc(error[:300])}</code>")
                 except Exception as exc:
                     logger.warning("could not report the failed check to %s: %r", chat, exc)
         ok = len(errors) < RETRIES
@@ -598,7 +620,7 @@ def alert_overdue(symbol: str, send, chats, now: datetime) -> bool:
     if not overdue(entry, now) or told.get(symbol) == today:
         return False
     last = ((entry or {}).get("last_run") or {}).get("at", "never")
-    text = (f"🚨 {symbol} trend job: no run has completed since {last[:16].replace('T', ' ')} UTC, and it is "
+    text = (f"🚨 <b>{symbol} trend job is down</b>\nNo run has completed since {last[:16].replace('T', ' ')} UTC, and it is "
             f"{now.strftime('%H:%M')} UTC. Today's signal check did not happen. See /status.")
     for chat in chats:
         try:
