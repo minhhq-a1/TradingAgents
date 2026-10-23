@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, development, 'v[0-9]+.[0-9]+.[0-9]+']
   pull_request:
+  workflow_dispatch:  # run by hand (Actions tab > CI > Run workflow on development) when GitHub drops a push event
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -71,7 +72,7 @@ jobs:
   # tests pass, and only for development (the branch that gets deployed).
   publish-image:
     name: build and push image
-    if: github.event_name == 'push' && github.ref == 'refs/heads/development'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/development'
     needs: [test, smoke-install, lint]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -105,7 +106,7 @@ jobs:
   # on the VPS with a read:packages token.
   deploy:
     name: deploy telegram bot to VPS
-    if: github.event_name == 'push' && github.ref == 'refs/heads/development'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/development'
     needs: [publish-image]
     runs-on: ubuntu-latest
     timeout-minutes: 10
