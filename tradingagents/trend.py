@@ -30,8 +30,10 @@ from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import requests
 
-from tradingagents.dataflows.vendors.binance_klines import fetch_daily_klines
+from tradingagents.dataflows.symbols import crypto_base
+from tradingagents.dataflows.vendors.binance_klines import HOSTS, fetch_daily_klines
 from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ WINDOW = 200
 FEE = 0.001  # per side, as in the validation
 WATCH = ("BTCUSDT",)  # the only symbol the rule was validated on
 RUN_AT = (0, 5)  # UTC hour, minute: the daily bar is final a few minutes after midnight
+DEADMAN_AT = (0, 30)  # UTC: no completed run by now means the job is down, and a chat is told
 RETRY_SECONDS, RETRIES = 600, 12  # a late bar or a failed fetch is retried for about two hours
 REVISION = 0.005  # a stored close that a later fetch moves by more than this is a data event
 DIR = os.path.join(os.path.expanduser("~"), ".tradingagents", "trend")
@@ -66,6 +69,10 @@ class SourceUnverified(Exception):
 
 class SendFailed(Exception):
     """At least one chat did not get a message; the others did, and only this one is retried."""
+
+
+def _days(n: int) -> str:
+    return f"{n} day{'s' * (n != 1)}"
 
 
 def core_weight() -> float:
@@ -96,7 +103,7 @@ def require_continuous(frame: pd.DataFrame, extra: int = 0) -> None:
     expected = pd.date_range(end=last, periods=WINDOW + extra, freq="D")
     missing = expected.difference(frame.index)
     if len(missing):
-        raise DataGap(f"{len(missing)} day(s) missing from the last {len(expected)}, first {missing[0].date()}")
+        raise DataGap(f"{_days(len(missing))} missing from the last {len(expected)}, first {missing[0].date()}")
 
 
 def states(close: pd.Series) -> pd.Series:
@@ -205,8 +212,8 @@ def late_text(flips: list[dict], info: dict, outage: dict, detected_at: str, wei
     """One message for signal changes found after the bot was offline: nobody could act on them on time."""
     changes = [f"  {f['signal_date']}: {f['state']} (close {f['signal_close']:,.0f})" for f in flips]
     return "\n".join([
-        f"⚠️ BTCUSDT trend check was offline from {outage['from']} to {outage['to']} ({outage['days']} days); "
-        f"{len(flips)} signal change(s) were found late, at {detected_at[11:16]} UTC, and could not be acted on in time:",
+        f"⚠️ BTCUSDT trend check was offline from {outage['from']} to {outage['to']} ({_days(outage['days'])}); "
+        f"{len(flips)} signal change{'s' * (len(flips) != 1)} {'was' if len(flips) == 1 else 'were'} found late, at {detected_at[11:16]} UTC, and could not be acted on in time:",
         *changes,
         f"Now: {'HOLD BTC' if info['state'] == HOLD else 'CASH'}. {_distance(info)}",
         "The paper book shows two lines: the rule (every change filled at its next open) and as operated "
@@ -266,7 +273,7 @@ def paper_text(symbol: str = "BTCUSDT") -> str:
     if operated.iloc[-1] != (HOLD if in_btc else CASH):
         pending = f" Pending at the next open: trend sleeve to {operated.iloc[-1]} (signal of {frame.index[-1].date()})."
     lines = [
-        f"{symbol} paper book since {entry['start']['date']} ({len(frame) - 1} days, no real orders), "
+        f"{symbol} paper book since {entry['start']['date']} ({_days(len(frame) - 1)}, no real orders), "
         f"core {weight:.0%} fixed at the start",
         f"Now, filled through {frame.index[-1].date()}: {(core + sleeve) / total:.1%} of the book in BTC "
         f"(core {core / total:.1%} + trend sleeve {sleeve / total:.1%}), the rest cash.{pending} "
@@ -275,18 +282,102 @@ def paper_text(symbol: str = "BTCUSDT") -> str:
     ]
     if entry["gaps"]:
         lines.append(f"Equity, as operated: mix {pct(ops['mix'])} | 100% SMA200 {pct(ops['trend'])} "
-                     f"(⚠ {sum(g['days'] for g in entry['gaps'])} offline day(s), position held through them)")
+                     f"(⚠ {_days(sum(g['days'] for g in entry['gaps']))} offline, position held through them)")
     for event in entry["data_events"][-2:]:
         lines.append(f"⚠ Data check: {event}")
     lines.append("Ledger (signal close -> next open fill; detected / sent UTC):")
     for row in entry["ledger"][-5:]:
         fill = "pending" if row["fill_open"] is None else f"{row['fill_open']:,.0f}"
         sent = min(row["sent"].values())[5:16].replace("T", " ") if row["sent"] else "not yet"
+        seen = row.get("quote")
+        price = ""
+        if seen:  # what the alert could really have traded at, against the open the backtest uses
+            base = row["fill_open"] or seen["open"]
+            price = f"; price at send {seen['price']:,.0f} ({seen['price'] / base - 1:+.2%} vs open)"
         lines.append(f"  {row['signal_date']} {row['state']}{' (late)' if row['late'] else ''}: close {row['signal_close']:,.0f} "
-                     f"-> open {fill} ({row['fill_date']}), detected {row['detected_at'][5:16].replace('T', ' ')}, sent {sent}")
+                     f"-> open {fill} ({row['fill_date']}), detected {row['detected_at'][5:16].replace('T', ' ')}, sent {sent}{price}")
     if not entry["ledger"]:
         lines.append("  no flips yet")
     lines.append("Reference only: " + WHIPSAW)
+    return "\n".join(lines)
+
+
+def quote(symbol: str) -> dict | None:
+    """Price now and today's 00:00 UTC open from Binance, or None: it never blocks or fails a send."""
+    base = crypto_base(symbol)
+    for host in HOSTS if base else ():
+        try:
+            response = requests.get(f"{host}/api/v3/klines", params={"symbol": f"{base}USDT", "interval": "1d", "limit": 1},
+                                    timeout=5)
+            response.raise_for_status()
+            bar = response.json()[-1]
+            return {"price": float(bar[4]), "open": float(bar[1]), "at": datetime.now(UTC).isoformat(timespec="seconds")}
+        except (requests.RequestException, ValueError, IndexError, TypeError) as exc:
+            logger.warning("price quote failed via %s: %s", host, exc)
+    return None
+
+
+def _equity(entry: dict) -> dict | None:
+    """Total return of the rule book's three variants since the start, from the stored days."""
+    if len(entry["days"]) < 2:
+        return None
+    frame, rule, _ = _book(entry)
+    book = simulate(frame, rule, entry["core"]).iloc[-1] - 1
+    return {name: round(float(book[name]), 6) for name in ("hold", "trend", "mix")}
+
+
+def _ops(**fields) -> None:
+    """One row per completed daily run in ``ops.jsonl``, the record kept during the paper-trade period."""
+    os.makedirs(DIR, exist_ok=True)
+    with open(os.path.join(DIR, "ops.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"at": datetime.now(UTC).isoformat(timespec="seconds"), **fields}) + "\n")
+
+
+def _ops_rows() -> list[dict]:
+    try:
+        with open(os.path.join(DIR, "ops.jsonl"), encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def overdue(entry: dict | None, now: datetime) -> bool:
+    """After 00:30 UTC, no run has completed since today's midnight."""
+    if (now.hour, now.minute) < DEADMAN_AT:
+        return False
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    last = (entry or {}).get("last_run")
+    return last is None or datetime.fromisoformat(last["at"]) < midnight
+
+
+def health_text(symbol: str = "BTCUSDT", now: datetime | None = None) -> str:
+    """Is the daily job alive: last completed run, queued alerts, recent runs and errors."""
+    now = now or datetime.now(UTC)
+    entry = _load().get(symbol)
+    if entry is None:
+        return f"{symbol} job: no run has completed yet."
+    last = entry.get("last_run")
+    state = "OVERDUE" if overdue(entry, now) else "OK"
+    lines = [f"{symbol} job: {state} (checked {now.strftime('%Y-%m-%d %H:%M')} UTC)"]
+    if last:
+        age = int((now - datetime.fromisoformat(last["at"])).total_seconds() // 60)
+        lines.append(f"Last completed run {last['at'][:16].replace('T', ' ')} UTC ({age // 60}h {age % 60}m ago), data through "
+                     f"{last['data_date']}, source {last['source']}, state {last['state']}")
+    else:
+        lines.append(f"No run has completed; data processed through {entry['checked']}")
+    queued = len(entry["pending"])
+    lines.append(f"Undelivered alerts: {queued}. Outages: {len(entry['gaps'])}. Data events: {len(entry['data_events'])}. "
+                 f"Signals: {len(entry['ledger'])}.")
+    rows = _ops_rows()
+    for row in rows[-3:]:
+        eq = row.get("equity")
+        stats = f" | mix {eq['mix']:+.1%} SMA200 {eq['trend']:+.1%} hold {eq['hold']:+.1%}" if eq else ""
+        lag = f" | alert lag {row['lag_s']:.0f}s" if row.get("lag_s") is not None else ""
+        errors = f" | {len(row['errors'])} error(s) first: {row['errors'][0][:80]}" if row.get("errors") else ""
+        lines.append(f"  {row['at'][5:16].replace('T', ' ')} {'ok' if row['ok'] else 'FAILED'}, "
+                     f"data {row.get('data_date', '-')}{stats}{lag}{errors}")
+    if not rows:
+        lines.append("  no ops rows yet")
     return "\n".join(lines)
 
 
@@ -350,6 +441,8 @@ def check(symbol: str, send, chats, today: datetime | None = None) -> bool:
             "start": {"date": newest.date().isoformat(), "close": float(close[newest])},
             "days": [_day(newest, frame, state, sma, source, True)], "ledger": [], "gaps": [], "data_events": [],
             "revised": [], "pending": []}
+        entry["last_run"] = {"at": datetime.now(UTC).isoformat(timespec="seconds"), "data_date": entry["checked"], "source": source,
+                             "state": entry["state"], "equity": None, "flips": [], "send_s": 0.0, "lag_s": None}
         _save(data)
         _log("baseline", source=source, date=newest.date().isoformat())
         return False
@@ -396,16 +489,27 @@ def check(symbol: str, send, chats, today: datetime | None = None) -> bool:
         entry["pending"].append({"text": text, "rows": flips, "sent_to": []})  # an undelivered older alert stays queued
         _log("detected", detected_at=detected, flips=[r["signal_date"] for r in rows], late=bool(outage))
     _save(data)  # before sending: a crash now resends to the chats not yet reached, it cannot lose the flip
-    return _deliver(data, entry, send, chats)
+    stats = {"rows": []}
+    started = time.monotonic()
+    delivered = _deliver(data, entry, send, chats, symbol, stats)
+    lags = [(datetime.fromisoformat(entry["ledger"][i]["sent"][c]) - datetime.fromisoformat(entry["ledger"][i]["fill_date"]).replace(tzinfo=UTC)).total_seconds()
+            for i in stats["rows"] for c in entry["ledger"][i]["sent"]]
+    entry["last_run"] = {"at": datetime.now(UTC).isoformat(timespec="seconds"), "data_date": entry["checked"], "source": entry["source"],
+                         "state": entry["state"], "equity": _equity(entry), "flips": [entry["ledger"][i]["signal_date"] for i in stats["rows"]],
+                         "send_s": round(time.monotonic() - started, 2), "lag_s": max(lags) if lags else None}
+    _save(data)  # only a run that went through to the last chat counts as completed
+    return delivered
 
 
-def _deliver(data: dict, entry: dict, send, chats) -> bool:
+def _deliver(data: dict, entry: dict, send, chats, symbol: str = "BTCUSDT", stats: dict | None = None) -> bool:
     """Send every queued alert, oldest first, to each chat that has not had it; a chat that fails one waits
     with the rest of its queue, so it never gets a later alert before an earlier one."""
     if not entry["pending"]:
         return False
     failed = []
     for pending in entry["pending"]:
+        if "quote" not in pending:  # the price the alert could be acted on, at the first attempt, live signals only
+            pending["quote"] = None if any(entry["ledger"][i]["late"] for i in pending["rows"]) else quote(symbol)
         for chat in chats:
             if chat in pending["sent_to"] or chat in failed:
                 continue
@@ -419,6 +523,10 @@ def _deliver(data: dict, entry: dict, send, chats) -> bool:
             pending["sent_to"].append(chat)
             for i in pending["rows"]:
                 entry["ledger"][i]["sent"][chat] = stamp
+                if pending["quote"]:
+                    entry["ledger"][i].setdefault("quote", pending["quote"])
+                if stats is not None and i not in stats["rows"]:
+                    stats["rows"].append(i)
             _save(data)
             _log("sent", chat=chat, sent_at=stamp, rows=pending["rows"])
     entry["pending"] = [p for p in entry["pending"] if not set(chats) <= set(p["sent_to"])]
@@ -428,31 +536,78 @@ def _deliver(data: dict, entry: dict, send, chats) -> bool:
     return True
 
 
-def _seconds_to_run(now: datetime) -> float:
-    run = now.replace(hour=RUN_AT[0], minute=RUN_AT[1], second=0, microsecond=0)
+def _seconds_to_run(now: datetime, at: tuple[int, int] = RUN_AT) -> float:
+    run = now.replace(hour=at[0], minute=at[1], second=0, microsecond=0)
     return ((run if run > now else run + timedelta(days=1)) - now).total_seconds()
 
 
 def watch(send, chats) -> None:
-    """Check at start-up (catch-up), then every day just after 00:00 UTC. Never returns."""
+    """Check at start-up (catch-up), then every day just after 00:00 UTC. Never returns.
+
+    Each run, retries included, leaves one row in ``ops.jsonl``: outcome, tries, errors, and on success
+    the data date, the equity of the three variants and the alert latency.
+    """
     while True:
-        error = None
+        errors = []
         for _ in range(RETRIES):
             try:
                 for symbol in WATCH:
                     check(symbol, send, chats)
-                error = None
                 break
             except Exception as exc:  # a late bar, a data gap or a network error: try again shortly
-                error = exc
+                errors.append(repr(exc))
                 logger.warning("trend check failed: %r", exc)
                 time.sleep(RETRY_SECONDS)
-        if error is not None:  # silence would read as "no signal": say that today's check did not happen
-            _log("check_failed", error=repr(error))
+        else:
+            error = errors[-1]
+            _log("check_failed", error=error)
             for chat in chats:
                 try:
                     send(chat, f"⚠️ BTCUSDT trend check failed after {RETRIES} tries ({error}). No signal was made today; "
                                "the next check is tomorrow.")
                 except Exception as exc:
                     logger.warning("could not report the failed check to %s: %r", chat, exc)
+        ok = len(errors) < RETRIES
+        for symbol in WATCH:
+            run = (_load().get(symbol) or {}).get("last_run") or {}
+            _ops(symbol=symbol, ok=ok, tries=len(errors) + ok, errors=errors,
+                 **({k: run[k] for k in ("data_date", "source", "state", "equity", "flips", "send_s", "lag_s")} if ok and run else {}))
         time.sleep(_seconds_to_run(datetime.now(UTC)))
+
+
+def deadman(send, chats) -> None:
+    """A separate thread from ``watch``: if no run has completed by 00:30 UTC, tell the chats (once a day)."""
+    while True:
+        time.sleep(_seconds_to_run(datetime.now(UTC), DEADMAN_AT))
+        for symbol in WATCH:
+            try:
+                alert_overdue(symbol, send, chats, datetime.now(UTC))
+            except Exception as exc:  # this thread must outlive any one failure
+                logger.warning("dead-man check failed: %r", exc)
+
+
+def alert_overdue(symbol: str, send, chats, now: datetime) -> bool:
+    entry = _load().get(symbol)
+    path = os.path.join(DIR, "deadman.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            told = json.load(f)
+    except FileNotFoundError:
+        told = {}
+    today = now.date().isoformat()
+    if not overdue(entry, now) or told.get(symbol) == today:
+        return False
+    last = ((entry or {}).get("last_run") or {}).get("at", "never")
+    text = (f"🚨 {symbol} trend job: no run has completed since {last[:16].replace('T', ' ')} UTC, and it is "
+            f"{now.strftime('%H:%M')} UTC. Today's signal check did not happen. See /status.")
+    for chat in chats:
+        try:
+            send(chat, text)
+        except Exception as exc:
+            _log("send_failed", chat=chat, error=repr(exc))
+    told[symbol] = today
+    os.makedirs(DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(told, f)
+    _log("deadman", symbol=symbol, last=last)
+    return True
