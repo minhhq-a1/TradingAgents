@@ -127,5 +127,6 @@ jobs:
           install -m 600 /dev/null ~/key && printf '%s\n' "$SSH_KEY" > ~/key
           # Deploy exactly the commit CI tested and published, not whatever development is now.
           # The checkout only refreshes docker-compose.yml; the image itself comes from the registry.
+          # The sha image is also tagged development locally, so `docker compose run` (no TRADINGAGENTS_TAG) runs the deployed code.
           ssh -i ~/key -p "$PORT" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=4 "$USER@$HOST" \
-            "set -e; cd '$APP_DIR'; git fetch origin development; git checkout -q --detach '$SHA'; export TRADINGAGENTS_TAG='$SHA'; docker compose --profile telegram pull telegram-bot; docker compose --profile telegram up -d --no-build telegram-bot; docker image prune -f"
+            "set -e; cd '$APP_DIR'; git fetch origin development; git checkout -q --detach '$SHA'; export TRADINGAGENTS_TAG='$SHA'; docker compose --profile telegram pull telegram-bot; docker tag ghcr.io/minhhq-a1/tradingagents:'$SHA' ghcr.io/minhhq-a1/tradingagents:development; docker compose --profile telegram up -d --no-build telegram-bot; docker image prune -f"
