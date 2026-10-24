@@ -56,6 +56,10 @@ GAP_SENTENCE = re.compile(
     r"|\b(?:was|were) not provided\b|\bunavailable\b|\b(?:data|key|feeds?|series|figures?)\b[^.]{0,40}\bmissing\b"
     r"|\b(?:is|are)(?: also)? missing\b|^no\b[^.]{0,80}\b(?:news|fundamentals)\b"
     r"|\bholdings are unknown\b", re.I)
+DANGLING = re.compile(r"(?:[^:.\n]{3,60}:\s+)?(?:It|This|That|They|These|Those)\b")  # needs the sentence before it, which the card drops
+# "Why not Buy", "Why the call is not Sell"; not "Why Hold and not a tilt", which argues for the call
+REJECTION = re.compile(r"why\s+(?:not\b|(?:[\w']+\s+){1,3}(?:is|are)\s+not\b)", re.I)
+LEVELS_LABEL = re.compile(r"(?:\w+ )?(?:triggers?|levels?)\b|what would change|.{0,30}\bchanges? the (?:view|rating|call)", re.I)
 CONCLUSION = re.compile(r"\b(?:therefore|stands|intact|weak|not supported|too even|favou?rs?|wins?|decisive|balanced)\b", re.I)
 
 
@@ -122,13 +126,19 @@ def summarize(ticker, date, decision, trade_plan=""):
     thesis = f.get("Investment Thesis", "")
     raw = re.findall(r"\*\*([^*\n]+?)[.:]?\*\*[.:]?\s*(.*?)(?=\n\*\*|\Z)", thesis, re.DOTALL)
     if not raw:
+        heading = ""  # a label alone on its line ("Why not Buy:") heads the paragraphs under it
         for para in re.split(r"\n\s*\n", thesis):
             m = re.match(rf"((?:{GAPS_LABEL.pattern})[^.:\n]*|[^.:\n]{{3,60}})\s*[.:]\s*(.*)", para.strip(), re.DOTALL | re.I)
             ok = m and (GAPS_LABEL.match(m.group(1)) or para.strip()[len(m.group(1))] == ":")
-            raw.append(m.groups() if ok else ("", para.strip()))
+            heading = (m.group(1) if not m.group(2).strip() else "") if ok else heading
+            raw.append(m.groups() if ok else (heading, para.strip()))
     blocks = [(label, sentences(body)) for label, body in raw]
     prose = [x for label, ss in blocks if not GAPS_LABEL.match(label) for x in ss]
-    while sum(not GAPS_LABEL.match(label) for label, _ in blocks) < 3:  # few blocks: halve the longest
+    # A "Why not Buy" block argues the case the PM rejected, and a levels block's actions ("Add one tranche")
+    # lose their condition; alone on the card either reads as advice. The levels are in Triggers.
+    blocks = [(label, ss) for label, ss in blocks
+              if not REJECTION.match(label) and not LEVELS_LABEL.match(label) and not (ss and REJECTION.match(ss[0]))]
+    while blocks and sum(not GAPS_LABEL.match(label) for label, _ in blocks) < 3:  # few blocks: halve the longest
         i = max(range(len(blocks)), key=lambda j: len(blocks[j][1]) if not GAPS_LABEL.match(blocks[j][0]) else 0)
         label, ss = blocks[i]
         if GAPS_LABEL.match(label) or len(ss) < 2:
@@ -153,14 +163,15 @@ def summarize(ticker, date, decision, trade_plan=""):
         if GAPS_LABEL.match(label) or len(bullets) == 3:
             continue
         usable = [x for x in ss if 20 <= len(x) <= 170 and x[-1] != ":" and not TRIGGER.search(x)
-                  and not GAP_SENTENCE.search(x) and x not in summary]  # a trailing ":" is a lead-in
+                  and not GAP_SENTENCE.search(x) and not REJECTION.match(x) and not DANGLING.match(x)
+                  and x not in summary]  # a trailing ":" is a lead-in
         if usable:
-            label = label.split(",")[0].strip()  # "Why not Sell, and why not 75%" -> "Why not Sell"
+            label = re.split(r",(?![^(]*\))", label)[0].strip()  # "Trend, momentum and flows" -> "Trend"
             pick = next((x for x in usable if CONCLUSION.search(x)), usable[0])
             if len(pick) < 40:  # a bare "The trend is intact." says little: add the sentence after it
                 nxt = usable[usable.index(pick) + 1:][:1] or [x for x in usable if x != pick][:1]
                 pick = fit([pick] + nxt, 170)
-            if not label and (m := INLINE_LABEL.match(pick)):  # "Why not Sell: text" written inline
+            if not label and (m := INLINE_LABEL.match(pick)):  # "Trend: text" written inline
                 label, pick = m.groups()
             tag = f"<b>{e(label)}:</b> " if label and len(label) <= 40 and label.lower() != "rating" else ""
             bullets.append(f"• {tag}{e(pick)}")
