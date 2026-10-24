@@ -1,5 +1,9 @@
 """BTC trend rule, paper only: UTC close above its 200-day SMA means hold BTC, otherwise cash.
 
+A second, shadow book runs the same way next to it: UTC close above the Ichimoku cloud (9/26/52)
+means hold BTC. It has its own state file, alerts and ops rows, so it can never change the SMA200
+book; it is there to see more signals live (research of 2026-10-24), not to replace the rule.
+
 The rule is fixed, with nothing to tune. ``check`` reads the last *closed* UTC daily bars
 (Binance first, Yahoo as the fallback), turns each new bar into a state, and messages Telegram
 only when the state flips. The decision is made here from prices; any text written around it can
@@ -43,7 +47,8 @@ logger = logging.getLogger(__name__)
 
 WINDOW = 200
 FEE = 0.001  # per side, as in the validation
-WATCH = ("BTCUSDT",)  # the only symbol the rule was validated on
+SMA200, ICHIMOKU = "sma200", "ichimoku"
+BOOKS = {"BTCUSDT": SMA200, "BTCUSDT-ICHIMOKU": ICHIMOKU}  # book id -> rule; the validated SMA200 book first
 RUN_AT = (0, 5)  # UTC hour, minute: the daily bar is final a few minutes after midnight
 DEADMAN_AT = (0, 30)  # UTC: no completed run by now means the job is down, and a chat is told
 RETRY_SECONDS, RETRIES = 600, 12  # a late bar or a failed fetch is retried for about two hours
@@ -54,6 +59,10 @@ HOLD, CASH = "HOLD", "CASH"
 WHIPSAW = (
     "<i>⚠️ Whipsaw: 29 of 44 closed trades (2014-2026) lost money and lasted 14 days or less. The edge is "
     "sitting out bear markets (max drawdown -67% vs -83% buy-and-hold), not each signal.</i>"
+)
+WHIPSAW_ICHIMOKU = (
+    "<i>⚠️ Shadow book, not the rule: about 7 trades a year; 51 of 84 closed trades (2015-2026) lost money and lasted "
+    "14 days or less. Its edge was a smaller drawdown than SMA200 (-51% vs -69%); it lagged in strong bull years.</i>"
 )
 
 
@@ -77,6 +86,41 @@ def _days(n: int) -> str:
     return f"{n} day{'s' * (n != 1)}"
 
 
+def book(name: str) -> str:
+    """The book id a chat command names: ``ichimoku`` is the shadow BTC book, anything else a symbol."""
+    name = name.upper()
+    return "BTCUSDT-ICHIMOKU" if name in ("ICHIMOKU", "ICHI", "BTCUSDT-ICHIMOKU") else name
+
+
+def _pair(book_id: str) -> str:
+    return book_id.split("-")[0]
+
+
+def _rule(book_id: str) -> str:
+    return BOOKS.get(book_id, SMA200)
+
+
+def _title(book_id: str) -> str:
+    return f"{_pair(book_id)} {'Ichimoku (shadow)' if _rule(book_id) == ICHIMOKU else 'trend'}"
+
+
+def _name(book_id: str) -> str:
+    """How /paper and /status head a book: the SMA200 book keeps its plain symbol."""
+    return _title(book_id) if _rule(book_id) == ICHIMOKU else book_id
+
+
+def _short(book_id: str) -> str:
+    return "Ichimoku" if _rule(book_id) == ICHIMOKU else "SMA200"
+
+
+def _level_name(book_id: str) -> str:
+    return "Cloud top" if _rule(book_id) == ICHIMOKU else "SMA200"
+
+
+def _whipsaw(book_id: str) -> str:
+    return WHIPSAW_ICHIMOKU if _rule(book_id) == ICHIMOKU else WHIPSAW
+
+
 def core_weight() -> float:
     """Share of the book held in BTC permanently (env ``TREND_CORE_WEIGHT``, default 0.5)."""
     weight = float(os.environ.get("TREND_CORE_WEIGHT", "0.5"))
@@ -86,7 +130,7 @@ def core_weight() -> float:
 
 
 def bars(symbol: str, today: datetime | None = None) -> tuple[pd.DataFrame, str]:
-    """Open and Close of the completed UTC days, oldest first, indexed by date, and where they came from."""
+    """Open, High, Low and Close of the completed UTC days, oldest first, indexed by date, and where they came from."""
     today = (today or datetime.now(UTC)).date()
     frame = fetch_daily_klines(symbol, (today - timedelta(days=900)).isoformat(), today.isoformat())
     source = "binance"
@@ -94,7 +138,7 @@ def bars(symbol: str, today: datetime | None = None) -> tuple[pd.DataFrame, str]
         source = "yahoo"
         frame = load_ohlcv(symbol, (today - timedelta(days=1)).isoformat(), fill_gaps=False).set_index("Date")
         frame = frame[frame.index.normalize().date < today]
-    out = frame[["Open", "Close"]].astype(float)
+    out = frame[["Open", "High", "Low", "Close"]].astype(float)
     out.index = pd.DatetimeIndex(out.index).tz_localize(None).normalize()
     return out, source
 
@@ -112,6 +156,26 @@ def states(close: pd.Series) -> pd.Series:
     """HOLD or CASH for each day with a full SMA200; earlier days are left out."""
     sma = close.rolling(WINDOW).mean()
     return pd.Series(HOLD, index=close.index).where(close > sma, CASH)[sma.notna()]
+
+
+def cloud_top(frame: pd.DataFrame) -> pd.Series:
+    """Top of the Ichimoku cloud (9/26/52, TradingView defaults) under each day. The spans are drawn 26 bars
+    ahead, so a day's cloud is built from highs and lows of 25 days earlier and never repaints; the Chikou
+    line, which looks ahead, is not used."""
+    def mid(n):
+        return (frame["High"].rolling(n).max() + frame["Low"].rolling(n).min()) / 2
+    return pd.concat([((mid(9) + mid(26)) / 2).shift(25), mid(52).shift(25)], axis=1).max(axis=1, skipna=False)
+
+
+def level(frame: pd.DataFrame, rule: str = SMA200) -> pd.Series:
+    """The line the close is compared with: the SMA200, or the cloud top."""
+    return cloud_top(frame) if rule == ICHIMOKU else frame["Close"].rolling(WINDOW).mean()
+
+
+def rule_states(frame: pd.DataFrame, rule: str = SMA200) -> pd.Series:
+    """HOLD or CASH for each day the rule's line exists; for SMA200 this is ``states``."""
+    line = level(frame, rule)
+    return pd.Series(HOLD, index=frame.index).where(frame["Close"] > line, CASH)[line.notna()]
 
 
 def _sleeve(frame: pd.DataFrame, held: pd.Series, fee: float) -> pd.Series:
@@ -148,9 +212,9 @@ def metrics(equity: pd.Series) -> dict:
 
 
 def latest(symbol: str, today: datetime | None = None, frame: pd.DataFrame | None = None) -> dict:
-    frame = frame if frame is not None else bars(symbol, today)[0]
+    frame = frame if frame is not None else bars(_pair(symbol), today)[0]
     close = frame["Close"]
-    state = states(close)
+    state = rule_states(frame, _rule(symbol))
     if state.empty:
         raise StaleData(f"{symbol}: fewer than {WINDOW} closed daily bars")
     day = state.index[-1]
@@ -160,20 +224,25 @@ def latest(symbol: str, today: datetime | None = None, frame: pd.DataFrame | Non
     run = state[state != state.iloc[-1]]  # the streak began the day after the last opposite state
     since = state.index[state.index.get_loc(run.index[-1]) + 1] if len(run) else state.index[0]
     return {"symbol": symbol, "state": state.iloc[-1], "date": day.date().isoformat(), "close": float(close.iloc[-1]),
-            "sma": float(close.rolling(WINDOW).mean().iloc[-1]), "since": since.date().isoformat()}
+            "sma": float(level(frame, _rule(symbol)).iloc[-1]), "since": since.date().isoformat()}
 
 
-def _load() -> dict:
+def _state_path(book_id: str) -> str:
+    """Each book its own file: the shadow book can never rewrite the SMA200 book's state."""
+    return os.path.join(DIR, "state.json" if _rule(book_id) == SMA200 else f"state-{book_id.lower()}.json")
+
+
+def _load(book_id: str = "BTCUSDT") -> dict:
     try:
-        with open(os.path.join(DIR, "state.json"), encoding="utf-8") as f:
+        with open(_state_path(book_id), encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
 
 
-def _save(data: dict) -> None:
+def _save(data: dict, book_id: str = "BTCUSDT") -> None:
     os.makedirs(DIR, exist_ok=True)
-    path = os.path.join(DIR, "state.json")
+    path = _state_path(book_id)
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(data, f, indent=1)
     os.replace(path + ".tmp", path)  # a crash mid-write leaves the old state, not half a file
@@ -196,7 +265,7 @@ def _pre(rows: list[tuple[str, str]]) -> str:
 
 
 def _levels(info: dict) -> str:
-    return _pre([(f"Close {info['date']}", f"{info['close']:,.0f}"), ("SMA200", f"{info['sma']:,.0f}"),
+    return _pre([(f"Close {info['date']}", f"{info['close']:,.0f}"), (_level_name(info["symbol"]), f"{info['sma']:,.0f}"),
                  ("Gap", f"{info['close'] / info['sma'] - 1:+.1%}")])
 
 
@@ -204,20 +273,20 @@ def _split(weight: float) -> str:
     return f"Split: {weight:.0%} core BTC (never sold) · {1 - weight:.0%} follows the rule, not rebalanced."
 
 
-def _head(state: str) -> str:
-    return f"{'🟢' if state == HOLD else '🔴'} <b>BTCUSDT trend {'UP · HOLD BTC' if state == HOLD else 'DOWN · CASH'}</b>"
+def _head(state: str, book_id: str = "BTCUSDT") -> str:
+    return f"{'🟢' if state == HOLD else '🔴'} <b>{_title(book_id)} {'UP · HOLD BTC' if state == HOLD else 'DOWN · CASH'}</b>"
 
 
 def alert_text(info: dict, detected_at: str, weight: float | None = None) -> str:
     return "\n".join([
-        _head(info["state"]),
+        _head(info["state"], info["symbol"]),
         "<i>Paper signal only, no order was placed.</i>",
         _levels(info),
         f"Detected {detected_at[11:16]} UTC. The backtest fills at the 00:00 UTC open; you cannot get that price, "
         "so a real fill will differ.",
         _split(core_weight() if weight is None else weight),
         "",
-        WHIPSAW,
+        _whipsaw(info["symbol"]),
     ])
 
 
@@ -225,7 +294,7 @@ def late_text(flips: list[dict], info: dict, outage: dict, detected_at: str, wei
     """One message for signal changes found after the bot was offline: nobody could act on them on time."""
     n = len(flips)
     return "\n".join([
-        "⚠️ <b>BTCUSDT signals found late</b>",
+        f"⚠️ <b>{_title(info['symbol'])} signals found late</b>",
         f"The check was offline from {outage['from']} to {outage['to']} ({_days(outage['days'])}). "
         f"{n} signal change{'s' * (n != 1)} {'was' if n == 1 else 'were'} found late, at {detected_at[11:16]} UTC, "
         "and could not be acted on in time:",
@@ -236,27 +305,30 @@ def late_text(flips: list[dict], info: dict, outage: dict, detected_at: str, wei
         "/paper shows the rule (every change filled) and as operated (position held through the outage).",
         _split(weight),
         "",
-        WHIPSAW,
+        _whipsaw(info["symbol"]),
     ])
 
 
 def status_text(symbol: str = "BTCUSDT") -> str:
-    if symbol.upper() not in WATCH:
-        return f"The trend rule was only validated on {', '.join(WATCH)}."
+    symbol = book(symbol)
+    if symbol not in BOOKS:
+        return "The trend rule was only validated on BTCUSDT (/trend ichimoku is its shadow book)."
     try:
-        info = latest(symbol.upper())
-        weight = (_load().get(symbol.upper()) or {}).get("core", core_weight())
+        info = latest(symbol)
+        weight = (_load(symbol).get(symbol) or {}).get("core", core_weight())
     except Exception as exc:  # report, keep serving
         return f"⚠️ Trend data unavailable: {_esc(str(exc))}"
     now = "🟢 HOLD BTC" if info["state"] == HOLD else "🔴 CASH"
     return "\n".join([
-        f"<b>{info['symbol']} trend: {now}</b> (paper)",
+        f"<b>{_title(symbol)}: {now}</b> (paper)",
         f"Since {info['since']}",
         _levels(info),
-        "Rule: UTC close &gt; SMA200 = hold BTC, otherwise cash. Fixed, no parameters.",
+        "Rule: UTC close above the Ichimoku cloud (9/26/52) = hold BTC, otherwise cash. TradingView defaults, "
+        "not tuned; runs next to SMA200 and never changes it." if _rule(symbol) == ICHIMOKU
+        else "Rule: UTC close &gt; SMA200 = hold BTC, otherwise cash. Fixed, no parameters.",
         _split(weight),
         "",
-        WHIPSAW,
+        _whipsaw(symbol),
     ])
 
 
@@ -272,14 +344,15 @@ def _book(entry: dict) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
 
 def paper_text(symbol: str = "BTCUSDT") -> str:
     """The paper book since the first check, from the stored days: no fetch, no revision, no env."""
-    entry = _load().get(symbol)
+    symbol = book(symbol)
+    entry = _load(symbol).get(symbol)
     if entry is None:
         return "No paper book yet: the first daily check has not run."
     frame, rule, operated = _book(entry)
     weight = entry["core"]
     notes = [f"⚠️ Data check: {_esc(event)}" for event in entry["data_events"][-2:]]
     if len(frame) < 2:
-        return "\n".join([f"📒 <b>{symbol} paper book</b>",
+        return "\n".join([f"📒 <b>{_name(symbol)} paper book</b>",
                           f"Opened {entry['start']['date']} as cash; no day has closed since, so no equity yet.", *notes])
     ideal, ops = simulate(frame, rule, weight), simulate(frame, operated, weight)
 
@@ -290,7 +363,7 @@ def paper_text(symbol: str = "BTCUSDT") -> str:
     core, sleeve = weight * ops["hold"].iloc[-1], (1 - weight) * ops["trend"].iloc[-1] * in_btc
     total = ops["mix"].iloc[-1]
     lines = [
-        f"📒 <b>{symbol} paper book</b>",
+        f"📒 <b>{_name(symbol)} paper book</b>",
         f"Since {entry['start']['date']} ({_days(len(frame) - 1)}, no real orders) · core {weight:.0%} fixed at the start",
         "",
         f"<b>Position</b> · filled through {frame.index[-1].date()}",
@@ -300,10 +373,10 @@ def paper_text(symbol: str = "BTCUSDT") -> str:
     if operated.iloc[-1] != (HOLD if in_btc else CASH):
         lines.append(f"⏳ Pending at the next open: trend sleeve to {operated.iloc[-1]} (signal of {frame.index[-1].date()})")
     lines += ["", "<b>Equity, rule</b> (every change filled)",
-              _pre([("Mix (core + rule)", pct(ideal["mix"])), ("100% SMA200", pct(ideal["trend"])), ("Buy-and-hold", pct(ideal["hold"]))])]
+              _pre([("Mix (core + rule)", pct(ideal["mix"])), (f"100% {_short(symbol)}", pct(ideal["trend"])), ("Buy-and-hold", pct(ideal["hold"]))])]
     if entry["gaps"]:
         lines += [f"<b>Equity, as operated</b> (⚠️ {_days(sum(g['days'] for g in entry['gaps']))} offline, position held through them)",
-                  _pre([("Mix (core + rule)", pct(ops["mix"])), ("100% SMA200", pct(ops["trend"]))])]
+                  _pre([("Mix (core + rule)", pct(ops["mix"])), (f"100% {_short(symbol)}", pct(ops["trend"]))])]
     if notes:
         lines += ["", *notes]
     lines += ["", "<b>Ledger</b> · signal close → next open fill (UTC)"]
@@ -374,12 +447,13 @@ def overdue(entry: dict | None, now: datetime) -> bool:
 def health_text(symbol: str = "BTCUSDT", now: datetime | None = None) -> str:
     """Is the daily job alive: last completed run, queued alerts, recent runs and errors."""
     now = now or datetime.now(UTC)
-    entry = _load().get(symbol)
+    symbol = book(symbol)
+    entry = _load(symbol).get(symbol)
     if entry is None:
-        return f"{_esc(symbol)} job: no run has completed yet."
+        return f"{_esc(_name(symbol))} job: no run has completed yet."
     last = entry.get("last_run")
     head = "🚨 <b>{} job: OVERDUE</b>" if overdue(entry, now) else "✅ <b>{} job: OK</b>"
-    lines = [head.format(symbol) + f" · checked {now.strftime('%Y-%m-%d %H:%M')} UTC"]
+    lines = [head.format(_name(symbol)) + f" · checked {now.strftime('%Y-%m-%d %H:%M')} UTC"]
     if last:
         age = int((now - datetime.fromisoformat(last["at"])).total_seconds() // 60)
         lines += [f"Last completed run {last['at'][:16].replace('T', ' ')} UTC ({age // 60}h {age % 60}m ago)",
@@ -389,7 +463,7 @@ def health_text(symbol: str = "BTCUSDT", now: datetime | None = None) -> str:
     lines += ["", _pre([("Undelivered alerts", str(len(entry["pending"]))), ("Outages", str(len(entry["gaps"]))),
                         ("Data events", str(len(entry["data_events"]))), ("Signals", str(len(entry["ledger"])))]),
               "<b>Recent runs</b>"]
-    rows = _ops_rows()
+    rows = [row for row in _ops_rows() if row.get("symbol", "BTCUSDT") == symbol]
     for row in rows[-3:]:
         eq = row.get("equity")
         stats = f" · mix {eq['mix']:+.1%}" if eq else ""
@@ -421,7 +495,8 @@ def _data_events(entry: dict, frame: pd.DataFrame, source: str) -> None:
         _log("data_event", note=note, source=source)
 
 
-def _verify_source(entry: dict, frame: pd.DataFrame, source: str, state: pd.Series, sma: pd.Series, new) -> str:
+def _verify_source(entry: dict, frame: pd.DataFrame, source: str, state: pd.Series, sma: pd.Series, new,
+                   name: str = "SMA200") -> str:
     """Another source is used only if it reproduces the last stored day. Returns why not, or ''."""
     last = entry["days"][-1]
     stamp = pd.Timestamp(last["date"])
@@ -429,12 +504,12 @@ def _verify_source(entry: dict, frame: pd.DataFrame, source: str, state: pd.Seri
         return f"{last['date']} is not in the {source} bars"
     close, level = float(frame.loc[stamp, "Close"]), float(sma[stamp])
     if abs(close / last["Close"] - 1) > REVISION or abs(level / last["sma"] - 1) > REVISION or state[stamp] != last["state"]:
-        return (f"{source} has {last['date']} at close {close:,.1f}, SMA200 {level:,.1f}, {state[stamp]}; "
+        return (f"{source} has {last['date']} at close {close:,.1f}, {name} {level:,.1f}, {state[stamp]}; "
                 f"the book stored {last['Close']:,.1f}, {last['sma']:,.1f}, {last['state']}")
     current = entry["state"]
     for date in new:  # a flip inside the gap between the two sources' SMAs may exist in one of them only
         if state[date] != current and abs(frame.loc[date, "Close"] / sma[date] - 1) <= REVISION:
-            return f"{source} flips to {state[date]} on {date.date()} within {REVISION:.1%} of the SMA200"
+            return f"{source} flips to {state[date]} on {date.date()} within {REVISION:.1%} of the {name}"
         current = state[date]
     return ""
 
@@ -445,16 +520,16 @@ def check(symbol: str, send, chats, today: datetime | None = None) -> bool:
     ``send(chat, text)`` delivers to one chat. True when an alert was newly delivered to every chat.
     """
     now = today or datetime.now(UTC)
-    frame, source = bars(symbol, now)
+    frame, source = bars(_pair(symbol), now)
     close = frame["Close"]
-    state = states(close)
-    sma = close.rolling(WINDOW).mean()
+    state = rule_states(frame, _rule(symbol))
+    sma = level(frame, _rule(symbol))
     if state.empty:
         raise StaleData(f"{symbol}: fewer than {WINDOW} closed daily bars")
     newest = state.index[-1]
     if newest.date() < now.date() - timedelta(days=1):
         raise StaleData(f"{symbol}: newest closed bar is {newest.date()}")
-    data = _load()
+    data = _load(symbol)
     entry = data.get(symbol)
     if entry is None:  # first run: the book opens as cash at this close, and nothing is alerted
         require_continuous(frame)
@@ -465,20 +540,20 @@ def check(symbol: str, send, chats, today: datetime | None = None) -> bool:
             "revised": [], "pending": []}
         entry["last_run"] = {"at": datetime.now(UTC).isoformat(timespec="seconds"), "data_date": entry["checked"], "source": source,
                              "state": entry["state"], "equity": None, "flips": [], "send_s": 0.0, "lag_s": None}
-        _save(data)
-        _log("baseline", source=source, date=newest.date().isoformat())
+        _save(data, symbol)
+        _log("baseline", book=symbol, source=source, date=newest.date().isoformat())
         return False
 
     new = state.index[state.index > pd.Timestamp(entry["checked"])]
     require_continuous(frame, len(new))
     if source != entry["source"]:
-        why = _verify_source(entry, frame, source, state, sma, new)
+        why = _verify_source(entry, frame, source, state, sma, new, _level_name(symbol))
         note = f"source changed from {entry['source']} to {source}" + (f" and does not match: {why}" if why else " (verified)")
         if note not in entry["data_events"][-1:]:
             entry["data_events"].append(note)
             _log("data_event", note=note, source=source)
         if why:  # no signal from numbers the book cannot reproduce; the stored source returning ends this
-            _save(data)
+            _save(data, symbol)
             raise SourceUnverified(note)
         entry["source"] = source
     _data_events(entry, frame, source)
@@ -510,7 +585,7 @@ def check(symbol: str, send, chats, today: datetime | None = None) -> bool:
                 else alert_text(info, detected, entry["core"]))
         entry["pending"].append({"text": text, "rows": flips, "sent_to": []})  # an undelivered older alert stays queued
         _log("detected", detected_at=detected, flips=[r["signal_date"] for r in rows], late=bool(outage))
-    _save(data)  # before sending: a crash now resends to the chats not yet reached, it cannot lose the flip
+    _save(data, symbol)  # before sending: a crash now resends to the chats not yet reached, it cannot lose the flip
     stats = {"rows": []}
     started = time.monotonic()
     delivered = _deliver(data, entry, send, chats, symbol, stats)
@@ -519,7 +594,7 @@ def check(symbol: str, send, chats, today: datetime | None = None) -> bool:
     entry["last_run"] = {"at": datetime.now(UTC).isoformat(timespec="seconds"), "data_date": entry["checked"], "source": entry["source"],
                          "state": entry["state"], "equity": _equity(entry), "flips": [entry["ledger"][i]["signal_date"] for i in stats["rows"]],
                          "send_s": round(time.monotonic() - started, 2), "lag_s": max(lags) if lags else None}
-    _save(data)  # only a run that went through to the last chat counts as completed
+    _save(data, symbol)  # only a run that went through to the last chat counts as completed
     return delivered
 
 
@@ -531,7 +606,7 @@ def _deliver(data: dict, entry: dict, send, chats, symbol: str = "BTCUSDT", stat
     failed = []
     for pending in entry["pending"]:
         if "quote" not in pending:  # the price the alert could be acted on, at the first attempt, live signals only
-            pending["quote"] = None if any(entry["ledger"][i]["late"] for i in pending["rows"]) else quote(symbol)
+            pending["quote"] = None if any(entry["ledger"][i]["late"] for i in pending["rows"]) else quote(_pair(symbol))
         for chat in chats:
             if chat in pending["sent_to"] or chat in failed:
                 continue
@@ -549,10 +624,10 @@ def _deliver(data: dict, entry: dict, send, chats, symbol: str = "BTCUSDT", stat
                     entry["ledger"][i].setdefault("quote", pending["quote"])
                 if stats is not None and i not in stats["rows"]:
                     stats["rows"].append(i)
-            _save(data)
-            _log("sent", chat=chat, sent_at=stamp, rows=pending["rows"])
+            _save(data, symbol)
+            _log("sent", book=symbol, chat=chat, sent_at=stamp, rows=pending["rows"])
     entry["pending"] = [p for p in entry["pending"] if not set(chats) <= set(p["sent_to"])]
-    _save(data)
+    _save(data, symbol)
     if failed:
         raise SendFailed(f"not delivered to {', '.join(failed)}")
     return True
@@ -566,32 +641,32 @@ def _seconds_to_run(now: datetime, at: tuple[int, int] = RUN_AT) -> float:
 def watch(send, chats) -> None:
     """Check at start-up (catch-up), then every day just after 00:00 UTC. Never returns.
 
-    Each run, retries included, leaves one row in ``ops.jsonl``: outcome, tries, errors, and on success
-    the data date, the equity of the three variants and the alert latency.
+    Each book is checked on its own, the SMA200 book first, so a failing shadow book can neither delay
+    nor fail it. Each book's run, retries included, leaves one row in ``ops.jsonl``: outcome, tries,
+    errors, and on success the data date, the equity of the three variants and the alert latency.
     """
     while True:
-        errors = []
-        for _ in range(RETRIES):
-            try:
-                for symbol in WATCH:
-                    check(symbol, send, chats)
-                break
-            except Exception as exc:  # a late bar, a data gap or a network error: try again shortly
-                errors.append(repr(exc))
-                logger.warning("trend check failed: %r", exc)
-                time.sleep(RETRY_SECONDS)
-        else:
-            error = errors[-1]
-            _log("check_failed", error=error)
-            for chat in chats:
+        for symbol in BOOKS:
+            errors = []
+            for _ in range(RETRIES):
                 try:
-                    send(chat, f"⚠️ <b>BTCUSDT trend check failed</b> after {RETRIES} tries. No signal was made today; "
-                               f"the next check is tomorrow.\n<code>{_esc(error[:300])}</code>")
-                except Exception as exc:
-                    logger.warning("could not report the failed check to %s: %r", chat, exc)
-        ok = len(errors) < RETRIES
-        for symbol in WATCH:
-            run = (_load().get(symbol) or {}).get("last_run") or {}
+                    check(symbol, send, chats)
+                    break
+                except Exception as exc:  # a late bar, a data gap or a network error: try again shortly
+                    errors.append(repr(exc))
+                    logger.warning("trend check of %s failed: %r", symbol, exc)
+                    time.sleep(RETRY_SECONDS)
+            else:
+                error = errors[-1]
+                _log("check_failed", book=symbol, error=error)
+                for chat in chats:
+                    try:
+                        send(chat, f"⚠️ <b>{_title(symbol)} check failed</b> after {RETRIES} tries. No signal was made today; "
+                                   f"the next check is tomorrow.\n<code>{_esc(error[:300])}</code>")
+                    except Exception as exc:
+                        logger.warning("could not report the failed check to %s: %r", chat, exc)
+            ok = len(errors) < RETRIES
+            run = (_load(symbol).get(symbol) or {}).get("last_run") or {}
             _ops(symbol=symbol, ok=ok, tries=len(errors) + ok, errors=errors,
                  **({k: run[k] for k in ("data_date", "source", "state", "equity", "flips", "send_s", "lag_s")} if ok and run else {}))
         time.sleep(_seconds_to_run(datetime.now(UTC)))
@@ -601,7 +676,7 @@ def deadman(send, chats) -> None:
     """A separate thread from ``watch``: if no run has completed by 00:30 UTC, tell the chats (once a day)."""
     while True:
         time.sleep(_seconds_to_run(datetime.now(UTC), DEADMAN_AT))
-        for symbol in WATCH:
+        for symbol in BOOKS:
             try:
                 alert_overdue(symbol, send, chats, datetime.now(UTC))
             except Exception as exc:  # this thread must outlive any one failure
@@ -609,7 +684,7 @@ def deadman(send, chats) -> None:
 
 
 def alert_overdue(symbol: str, send, chats, now: datetime) -> bool:
-    entry = _load().get(symbol)
+    entry = _load(symbol).get(symbol)
     path = os.path.join(DIR, "deadman.json")
     try:
         with open(path, encoding="utf-8") as f:
@@ -620,7 +695,7 @@ def alert_overdue(symbol: str, send, chats, now: datetime) -> bool:
     if not overdue(entry, now) or told.get(symbol) == today:
         return False
     last = ((entry or {}).get("last_run") or {}).get("at", "never")
-    text = (f"🚨 <b>{symbol} trend job is down</b>\nNo run has completed since {last[:16].replace('T', ' ')} UTC, and it is "
+    text = (f"🚨 <b>{_title(symbol)} job is down</b>\nNo run has completed since {last[:16].replace('T', ' ')} UTC, and it is "
             f"{now.strftime('%H:%M')} UTC. Today's signal check did not happen. See /status.")
     for chat in chats:
         try:

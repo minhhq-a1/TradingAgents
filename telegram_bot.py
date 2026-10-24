@@ -29,6 +29,7 @@ ALLOWED = {c.strip() for c in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").sp
 REFERENCE = "ℹ️ <i>Báo cáo tham khảo, không phải tín hiệu giao dịch.</i>"
 COMMANDS = ("Commands:\n/analyze TICKER [YYYY-MM-DD]: full analysis report\n"
             "/trend [SYMBOL]: SMA200 trend rule, current state (paper)\n/paper [SYMBOL]: paper book, equity and ledger\n"
+            "/trend ichimoku, /paper ichimoku: the Ichimoku shadow book next to it\n"
             "/status: is the daily trend job alive (also /health)")
 TICKER = re.compile(r"^[A-Za-z0-9.\-^=]{1,20}$")
 
@@ -295,7 +296,8 @@ def handle(msg):
     parts = (msg.get("text") or "").split()
     command = parts[0].split("@")[0] if parts else ""
     if command in ("/status", "/health"):
-        return say_html(chat, trend.health_text(parts[1] if len(parts) > 1 else "BTCUSDT"))
+        books = parts[1:2] or list(trend.BOOKS)  # no argument: every book the daily job runs
+        return say_html(chat, "\n\n".join(trend.health_text(name) for name in books))
     if command in ("/trend", "/paper"):
         report = trend.status_text if command == "/trend" else trend.paper_text
         return say_html(chat, report(parts[1] if len(parts) > 1 else "BTCUSDT"))
