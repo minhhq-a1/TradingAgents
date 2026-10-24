@@ -164,7 +164,7 @@ def test_summary_always_has_a_gaps_line(bot):
 
 def test_summary_live_run_shapes(bot):
     """Shapes from live runs: a yield % is not a price trigger, the gaps line keeps only the gap clause,
-    the horizon is the period, and a long label is cut at its comma."""
+    the horizon is the period, and "Why ... not" blocks give no key point."""
     mod, _ = bot
     out = mod.summarize("ETHUSDT", "d", (
         "**Rating**: Underweight\n\n**Executive Summary**: Trim. Add back on a daily close above 2,552.\n\n"
@@ -176,8 +176,33 @@ def test_summary_live_run_shapes(bot):
         "**Price Target**: 2296.0\n\n**Time Horizon**: 2-6 weeks, reviewed on daily closes against 1.29 and 1.41"), "")
     assert "<b>ETHUSDT · Underweight</b>\nd · horizon 2-6 weeks\n" in out
     assert "▲ close above <b>2,552</b>\n" in out and "5.31" not in out.split("🎯")[1].split("\n\n")[0]
-    assert "<b>Why the call is not Sell:</b> RSI never reached 30" in out
+    assert "Key points" in out and "RSI never reached 30" not in out and "Why not Sell" not in out
     assert "⚠️ <i>Gaps: The news feed is missing. CPI and core PCE are missing.</i>" in out
+
+
+def test_key_points_skip_rejected_case_and_levels(bot):
+    """2026-10-24 BTCUSDT Hold: the card quoted "It wants a tranche added now", the Aggressive case the PM
+    rejected under "Why not Buy", so it read as a buy call. Key points come from the PM's own reasoning."""
+    mod, _ = bot
+    thesis = (
+        "The evidence is balanced, and neither the Aggressive nor the Conservative case wins decisively.\n\n"
+        "Why not Buy or Overweight (the Aggressive case):\n- It wants a tranche added now with a stop near 76,904.\n"
+        "- The close was 81,189.43, below the level the bounce claim needs.\n\n"
+        "Why not Underweight or Sell (the Conservative case):\n- Price is still about 11.4% above a rising 200 SMA.\n\n"
+        "What favors caution:\n- The close is below the 50 SMA, the 10 EMA and the Bollinger middle.\n\n"
+        "Levels that change the rating:\n- Downgrade to Underweight on a daily close below 80,513.\n"
+        "- The lower Bollinger band at 79,810 would then be the next checkpoint.\n\n"
+        "Also avoid adding into weakness if open interest rises on down moves, because that signals new shorts.")
+    for shape in (thesis, thesis.replace(":\n- ", ":\n\n").replace("\n- ", "\n\n"),  # labels on their own line
+                  "\n".join(f"**{p.split(':')[0]}:**{p.split(':', 1)[1]}" if ":\n" in p else p
+                            for p in thesis.split("\n\n"))):  # bold labels
+        out = mod.summarize("BTCUSDT", "d", f"**Rating**: Hold\n\n**Executive Summary**: Hold.\n\n"
+                                           f"**Investment Thesis**: {shape}\n\n**Price Target**: not provided", "")
+        bullets = out.split("<b>Key points</b>\n")[1].split("\n\n")[0]
+        assert "tranche" not in bullets and "81,189" not in bullets and "11.4%" not in bullets
+        assert "79,810" not in bullets and "▼ close below <b>80,513</b>" in out
+        assert "What favors caution:</b> The close is below the 50 SMA" in bullets
+        assert "Also avoid adding" in bullets or shape != thesis  # in the other shapes it sits under the levels label
 
 
 def test_analyze_sends_card_then_report(bot, monkeypatch):
