@@ -997,3 +997,138 @@ def test_the_dead_man_names_the_book_that_did_not_run(two_books):
 def test_book_names_from_chat_commands():
     assert trend.book("ichimoku") == trend.book("ICHI") == ICHI and trend.book("btcusdt") == "BTCUSDT"
     assert "only validated on BTCUSDT" in trend.status_text("ETHUSDT")
+
+
+# --- language: each chat reads every message in the language it chose with /lang -----------------------
+
+ENGLISH = re.compile(r"\b(?:Since|Close|Split|Gap|Ledger|Position|Equity|Pending|detected|sent|job|Recent runs|Data through|"
+                     r"Undelivered|Outages|Signals|Rule|Now|offline|found late|Paper signal|Detected|Whipsaw|check failed|"
+                     r"No run|not yet|pending|price at send|Cash|core|Buy-and-hold|Mix)\b")
+
+
+def _numbers(text: str) -> list[str]:
+    return sorted(re.findall(r"\d[\d,.:%]*", text))
+
+
+def _same_numbers_in_vietnamese(en: str, vi: str) -> str:
+    """A translation changes words, never a number; Vietnamese text is valid HTML with no English left."""
+    assert _numbers(en) == _numbers(vi), (en, vi)
+    assert _telegram_html(vi) and not ENGLISH.search(re.sub(r"<pre>.*?</pre>|<code>.*?</code>", "", vi, flags=re.S)), vi
+    return vi
+
+
+@pytest.mark.unit
+def test_a_chats_language_is_kept_per_chat_and_survives_a_restart():
+    assert trend.chat_lang("a") == "en"  # nobody chose yet
+    trend.set_chat_lang("a", "vi")
+    trend.set_chat_lang(482056476, "vi")
+    trend.set_chat_lang("482056476", "en")  # the bot passes the chat id as text
+    assert (trend.chat_lang("a"), trend.chat_lang("b"), trend.chat_lang(482056476)) == ("vi", "en", "en")
+    with pytest.raises(AssertionError):
+        trend.set_chat_lang("a", "fr")
+    with open(f"{trend.DIR}/lang.json", "w", encoding="utf-8") as f:
+        f.write("{half")  # a damaged file falls back to English instead of failing every reply
+    assert trend.chat_lang("a") == "en"
+
+
+@pytest.mark.unit
+def test_each_chat_gets_the_alert_in_its_own_language_once():
+    trend.set_chat_lang("b", "vi")
+    frame = _crafted()
+    state, flips = _flips(frame)
+    sent = []
+    _replay(frame, sent, flips[0] - timedelta(days=5), restart_every=2, chats=CHATS)
+    assert len(sent) == 3 * len(flips)  # still once per chat and flip
+    for chat, text in sent:
+        assert ("GIỮ BTC" in text or "TIỀN MẶT" in text) == (chat == "b") and _telegram_html(text)
+    en = [t for c, t in sent if c == "a"]
+    assert en == [t for c, t in sent if c == "c"]
+    for en_text, vi_text in zip(en, [t for c, t in sent if c == "b"], strict=True):
+        _same_numbers_in_vietnamese(en_text, vi_text)
+
+
+@pytest.mark.unit
+def test_an_alert_queued_before_the_language_setting_still_goes_out_in_english():
+    frame = _crafted()
+    flip = _flips(frame)[1][0]
+    _check(frame, flip - timedelta(days=1), [])
+    with pytest.raises(trend.SendFailed):
+        _check(frame, flip, [], fail=("a",))
+    data = trend._load()
+    del data["BTCUSDT"]["pending"][0]["texts"]  # the shape of a queue written by the previous version
+    trend._save(data)
+    trend.set_chat_lang("a", "vi")
+    sent = []
+    _check(frame, flip, sent)
+    assert len(sent) == 1 and re.search(r"HOLD BTC|CASH", sent[0][1]) and not re.search(r"GIỮ|TIỀN MẶT", sent[0][1])
+
+
+@pytest.mark.unit
+def test_every_trend_message_has_a_vietnamese_version_with_the_same_numbers(monkeypatch):
+    monkeypatch.setattr(trend, "BOOKS", {"BTCUSDT": trend.SMA200, "BTCUSDT-ICHIMOKU": trend.ICHIMOKU})
+    info = {"symbol": "BTCUSDT", "state": trend.HOLD, "date": "2026-10-21", "close": 84093.4, "sma": 72774.0, "since": "2026-10-21"}
+    for symbol in ("BTCUSDT", "BTCUSDT-ICHIMOKU"):
+        info = {**info, "symbol": symbol}
+        _same_numbers_in_vietnamese(trend.alert_text(info, "2026-10-22T00:06:11+00:00", 0.5),
+                                    trend.alert_text(info, "2026-10-22T00:06:11+00:00", 0.5, "vi"))
+        cash = {**info, "state": trend.CASH}
+        assert "GIẢM · TIỀN MẶT" in trend.alert_text(cash, "2026-10-22T00:06:11+00:00", 0.5, "vi")
+    flips = [{"signal_date": "2026-10-10", "state": trend.CASH, "signal_close": 70000.0},
+             {"signal_date": "2026-10-12", "state": trend.HOLD, "signal_close": 75000.0}]
+    outage = {"from": "2026-10-09", "to": "2026-10-20", "days": 12}
+    _same_numbers_in_vietnamese(trend.late_text(flips, info, outage, "2026-10-22T00:06:11+00:00", 0.5),
+                                trend.late_text(flips, info, outage, "2026-10-22T00:06:11+00:00", 0.5, "vi"))
+    assert trend.status_text("ETHUSDT", lang="vi").startswith("Quy tắc xu hướng chỉ")
+    walk = _walk()
+    walk = walk.assign(High=walk.max(axis=1) * 1.01, Low=walk.min(axis=1) * 0.99)  # the cloud needs highs and lows
+    with mock.patch.object(trend, "bars", return_value=(walk, "binance")):
+        for symbol in ("BTCUSDT", "ichimoku"):
+            _same_numbers_in_vietnamese(trend.status_text(symbol), trend.status_text(symbol, lang="vi"))
+        assert "Ichimoku (sổ phụ)" in trend.status_text("ichimoku", lang="vi")
+    with mock.patch.object(trend, "bars", side_effect=OSError("451 <geo>")):
+        assert trend.status_text(lang="vi") == "⚠️ Không lấy được dữ liệu xu hướng: 451 &lt;geo&gt;"
+
+    # a book with an outage, late and live flips, a price at send and a signal pending the next open
+    assert trend.paper_text("BTCUSDT", "vi").startswith("Chưa có sổ") and "chưa có lần chạy" in trend.health_text(lang="vi")
+    frame = _crafted()
+    state, flip_days = _flips(frame)
+    _check(frame, flip_days[0] - timedelta(days=20), [])
+    _check(frame, flip_days[1] - timedelta(days=1), [])  # back after an outage that hid the first flip
+    monkeypatch.setattr(trend, "quote", lambda symbol: {"price": 1.004 * frame.loc[flip_days[1], "Close"],
+                                                       "open": frame.loc[flip_days[1], "Close"], "at": "2026-10-22T00:05:07+00:00"})
+    _check(frame, flip_days[1], [])
+    data = trend._load()
+    data["BTCUSDT"]["data_events"].append("close of 2026-10-01 is now 70,100, stored 69,000 (kept)")
+    trend._save(data)
+    en, vi = trend.paper_text("BTCUSDT"), trend.paper_text("BTCUSDT", "vi")
+    assert "Chờ khớp" in vi and "(trễ)" in vi and "giá lúc gửi" in vi and "theo vận hành thực" in vi
+    # the stored data event is shown as stored, in English
+    _same_numbers_in_vietnamese(en, vi.replace("is now", "").replace("stored", "").replace("kept", ""))
+    entry = trend._load()["BTCUSDT"]
+    ran = datetime.fromisoformat(entry["last_run"]["at"])
+    trend._ops(symbol="BTCUSDT", ok=True, tries=1, errors=[], data_date="2026-10-21", equity={"mix": 0.012}, lag_s=7.0)
+    trend._ops(symbol="BTCUSDT", ok=False, tries=12, errors=["HTTPError('<Response [451]>')"])
+    for now in (ran.replace(hour=12), ran + timedelta(days=1, hours=3)):  # OK, then OVERDUE
+        _same_numbers_in_vietnamese(trend.health_text("BTCUSDT", now), trend.health_text("BTCUSDT", now, "vi"))
+    assert "QUÁ HẠN" in trend.health_text("BTCUSDT", ran + timedelta(days=1, hours=3), "vi")
+
+
+@pytest.mark.unit
+def test_the_failed_check_and_dead_man_alerts_follow_each_chats_language(monkeypatch):
+    trend.set_chat_lang("b", "vi")
+    sent = []
+    send = lambda chat, text: sent.append((chat, text))  # noqa: E731
+    assert trend.alert_overdue("BTCUSDT", send, ["a", "b"], datetime(2026, 10, 23, 1, 0, tzinfo=UTC)) is True
+    (_, en), (_, vi) = sent
+    assert "job is down" in en and "Tác vụ BTCUSDT xu hướng đã ngừng" in vi and "(chưa từng)" in vi
+    assert _telegram_html(vi) and not ENGLISH.search(vi)
+
+    sent.clear()
+    monkeypatch.setattr(trend, "RETRIES", 1)
+    monkeypatch.setattr(trend, "check", mock.Mock(side_effect=OSError("down & out")))
+    monkeypatch.setattr(trend.time, "sleep", mock.Mock(side_effect=[None, KeyboardInterrupt]))
+    with pytest.raises(KeyboardInterrupt):
+        trend.watch(send, ["a", "b"])
+    (_, en), (_, vi) = sent
+    assert "check failed" in en and "kiểm tra thất bại" in vi and "down &amp; out" in vi
+    _same_numbers_in_vietnamese(en, vi)

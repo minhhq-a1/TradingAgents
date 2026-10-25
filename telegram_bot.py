@@ -1,6 +1,7 @@
 """Telegram front-end: `/analyze BTCUSDT [YYYY-MM-DD]` -> decision + full report;
 `/trend [BTCUSDT]` -> paper trend state, plus an alert when it flips; `/paper` -> the paper book
 (tradingagents/trend.py). An /analyze report is reference material, not a trading signal.
+`/lang vi|en` sets the chat's language for every reply, alert and /analyze report (English by default).
 
 Long-polling, so it needs no public URL. Env: TELEGRAM_BOT_TOKEN and
 TELEGRAM_ALLOWED_CHAT_IDS (comma-separated; anyone else is ignored).
@@ -26,11 +27,16 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 API = f"https://api.telegram.org/bot{os.environ.get('TELEGRAM_BOT_TOKEN', '')}"
 ALLOWED = {c.strip() for c in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").split(",") if c.strip()}
-REFERENCE = "ℹ️ <i>Báo cáo tham khảo, không phải tín hiệu giao dịch.</i>"
+REFERENCE = {"en": "Reference report, not a trading signal.", "vi": "Báo cáo tham khảo, không phải tín hiệu giao dịch."}
 COMMANDS = ("Commands:\n/analyze TICKER [YYYY-MM-DD]: full analysis report\n"
             "/trend [SYMBOL]: SMA200 trend rule, current state (paper)\n/paper [SYMBOL]: paper book, equity and ledger\n"
             "/trend ichimoku, /paper ichimoku: the Ichimoku shadow book next to it\n"
-            "/status: is the daily trend job alive (also /health)")
+            "/status: is the daily trend job alive (also /health)\n/lang vi|en: reply language")
+COMMANDS_VI = ("Các lệnh:\n/analyze MÃ [YYYY-MM-DD]: báo cáo phân tích đầy đủ\n"
+               "/trend [MÃ]: quy tắc xu hướng SMA200, trạng thái hiện tại (giao dịch thử)\n"
+               "/paper [MÃ]: sổ giao dịch thử, lợi nhuận và sổ lệnh\n"
+               "/trend ichimoku, /paper ichimoku: sổ phụ Ichimoku chạy song song\n"
+               "/status: tác vụ xu hướng hằng ngày còn chạy không (hoặc /health)\n/lang vi|en: ngôn ngữ trả lời")
 TICKER = re.compile(r"^[A-Za-z0-9.\-^=]{1,20}$")
 
 
@@ -49,22 +55,31 @@ def say_html(chat, text):
 
 
 EMOJI = {"Buy": "🟢", "Overweight": "🟢", "Hold": "🟡", "Underweight": "🔴", "Sell": "🔴"}
+RATING_VI = {"Buy": "Mua", "Overweight": "Tăng tỷ trọng", "Hold": "Giữ", "Underweight": "Giảm tỷ trọng", "Sell": "Bán"}
+# A /lang vi chat gets its report written in Vietnamese (output_language), so the patterns below read both languages.
 NUM = r"~?\$?\d+(?:,\d{3})*(?:\.\d+)?k?"
-TRIGGER = re.compile(rf"\bcloses?\b(?: a day| back| decisively)?\s+(above|below)\s+(?:about |roughly |~)?({NUM})(?![\d.,]*%)", re.I)  # a % is a yield, not a price
-GAPS_LABEL = re.compile(r"data (?:conflict and )?gaps?|gaps?|missing\b", re.I)
+TRIGGER = re.compile(rf"(?:\bcloses?\b(?: a day| back| decisively)?|\bđóng cửa(?: ngày| lại| hẳn| dứt khoát)?(?: ở)?(?: vượt)?)"
+                     rf"\s+(above|below|trên|dưới)\s+(?:about |roughly |~|mức |khoảng |ngưỡng )?({NUM})(?![\d.,]*%)", re.I)  # a % is a yield, not a price
+UP = ("above", "trên")
+GAPS_LABEL = re.compile(r"data (?:conflict and )?gaps?|gaps?|missing\b|(?:khoảng trống|thiếu hụt|thiếu|hạn chế) dữ liệu|dữ liệu (?:còn )?thiếu|thiếu\b", re.I)
 GAP_SENTENCE = re.compile(
     r"^(?:missing|data gaps?|gaps?)\b|^no\b[^.]{0,80}\b(?:data|figures?|feeds?|series|inputs?|information)\b"
     r"|\b(?:was|were) not provided\b|\bunavailable\b|\b(?:data|key|feeds?|series|figures?)\b[^.]{0,40}\bmissing\b"
     r"|\b(?:is|are)(?: also)? missing\b|^no\b[^.]{0,80}\b(?:news|fundamentals)\b"
-    r"|\bholdings are unknown\b", re.I)
-DANGLING = re.compile(r"(?:[^:.\n]{3,60}:\s+)?(?:It|This|That|They|These|Those)\b")  # needs the sentence before it, which the card drops
+    r"|\bholdings are unknown\b"
+    r"|^thiếu (?:dữ liệu|số liệu|thông tin)\b(?!\s+là\b)|\bkhông có (?:sẵn )?(?:dữ liệu|số liệu|thông tin)\b|\bkhông được cung cấp\b|\bkhông khả dụng\b"
+    r"|\b(?:dữ liệu|số liệu)\b[^.]{0,40}\b(?:bị thiếu|còn thiếu|không có sẵn)\b", re.I)
+DANGLING = re.compile(r"(?:[^:.\n]{3,60}:\s+)?(?:It|This|That|They|These|Those|Điều này|Điều đó|Nó|Đây|Vì vậy|Vì thế|Do đó|(?:\w+ ){1,3}này)\b")  # needs the sentence before it, which the card drops
 # "Why not Buy", "Why the call is not Sell"; not "Why Hold and not a tilt", which argues for the call
-REJECTION = re.compile(r"why\s+(?:not\b|(?:[\w']+\s+){1,3}(?:is|are)\s+not\b)", re.I)
-LEVELS_LABEL = re.compile(r"(?:\w+ )?(?:triggers?|levels?)\b|what would change|.{0,30}\bchanges? the (?:view|rating|call)", re.I)
-CONCLUSION = re.compile(r"\b(?:therefore|stands|intact|weak|not supported|too even|favou?rs?|wins?|decisive|balanced)\b", re.I)
+REJECTION = re.compile(r"why\s+(?:not\b|(?:[\w']+\s+){1,3}(?:is|are)\s+not\b)|(?:tại sao|vì sao|lý do)\s+(?:không|chưa)\b", re.I)
+LEVELS_LABEL = re.compile(r"(?:\w+ )?(?:triggers?|levels?)\b|what would change|.{0,30}\bchanges? the (?:view|rating|call)"
+                          r"|(?:các )?(?:mức giá|ngưỡng|điểm kích hoạt)\b|điều gì (?:sẽ )?(?:làm )?thay đổi"
+                          r"|.{0,30}\bthay đổi (?:quan điểm|đánh giá|khuyến nghị|nhận định)", re.I)
+CONCLUSION = re.compile(r"\b(?:therefore|stands|intact|weak|not supported|too even|favou?rs?|wins?|decisive|balanced"
+                        r"|do đó|vì vậy|vẫn giữ|còn nguyên|yếu|không được ủng hộ|nghiêng về|chiếm ưu thế|cân bằng)\b", re.I)
 
 
-INLINE_LABEL = re.compile(r"([A-Z][^:.\d]{2,40}):\s+(\S.*)", re.S)
+INLINE_LABEL = re.compile(r"([A-ZÀ-Ỹ][^:.\d]{2,40}):\s+(\S.*)", re.S)
 
 
 def sentences(text):
@@ -72,7 +87,8 @@ def sentences(text):
     out = []
     for line in text.replace("**", "").splitlines():
         line = re.sub(r"^\s*(?:[-•]|\d+[.)])\s+", "", line).strip()
-        out += re.split(r"(?<=[.!?])\s+(?=[A-Z$\d(\"'])", line) if line else []
+        # À-Ỹ: Vietnamese capitals (Đ, Ư, Ở...); the range has lower-case letters too, which only an odd "x. đ" splits
+        out += re.split(r"(?<=[.!?])\s+(?=[A-ZÀ-Ỹ$\d(\"'])", line) if line else []
     return out
 
 
@@ -85,7 +101,7 @@ def fit(parts, limit, sep=" "):
     return sep.join(kept)
 
 
-def summarize(ticker, date, decision, trade_plan=""):
+def summarize(ticker, date, decision, trade_plan="", lang="en"):
     """Short HTML chat card from the Portfolio Manager's decision and the Trader's levels.
 
     Both are rendered with fixed `**Label**:` fields (render_pm_decision,
@@ -93,7 +109,10 @@ def summarize(ticker, date, decision, trade_plan=""):
     chosen by whole sentence, never cut; the full text goes in the attached report.
     """
     labels = "Rating|Executive Summary|Investment Thesis|Price Target|Time Horizon"
-    parts = re.split(rf"\*\*({labels})\*\*: ", decision)
+    # The PM's free-text fallback can head a field on its own line ("**Executive Summary**\n\n") and repeat the
+    # trader's last line; neither belongs on the card.
+    decision = re.sub(r"\s*FINAL TRANSACTION PROPOSAL:[^\n]*", "", decision)
+    parts = re.split(rf"\*\*({labels})\*\*:?[ \t]*\n*", decision)
     f = {k: v.strip() for k, v in zip(parts[1::2], parts[2::2], strict=True)}
     if "Rating" not in f:  # shortcut: unknown shape, send it raw; fix if render_pm_decision changes
         return html.escape(decision[:3500], quote=False)
@@ -102,25 +121,30 @@ def summarize(ticker, date, decision, trade_plan=""):
         return html.escape(x, quote=False)  # Telegram only needs & < > escaped
 
     def given(value):
-        return value if value and value.strip().lower() != "not provided" else None
+        return value if value and value.strip().lower() not in ("not provided", "không có", "không được cung cấp") else None
+
+    def tr(en, vi):
+        return trend._t(lang, en, vi)
 
     rating, horizon = f["Rating"], given(f.get("Time Horizon"))
     if horizon:  # "2-6 weeks, reviewed on ..." -> the period itself
         horizon = horizon.split(",")[0]
-    out = [f"{EMOJI.get(rating, '⚪')} <b>{e(ticker)} · {e(rating)}</b>",
-           e(date) + (f" · horizon {e(horizon)}" if horizon else "")]
+    shown = RATING_VI.get(rating, rating) if lang == "vi" else rating
+    out = [f"{EMOJI.get(rating, '⚪')} <b>{e(ticker)} · {e(shown)}</b>",
+           e(date) + (f" · {tr('horizon', 'kỳ hạn')} {e(horizon)}" if horizon else "")]
 
     t = dict(re.findall(r"\*\*(Entry Price|Stop Loss|Position Sizing)\*\*: (.+)", trade_plan))
-    levels = {"Entry": t.get("Entry Price"), "Stop": t.get("Stop Loss"), "Target": f.get("Price Target"),
-              "Size": t.get("Position Sizing")}
+    levels = {tr("Entry", "Vào lệnh"): t.get("Entry Price"), tr("Stop", "Cắt lỗ"): t.get("Stop Loss"),
+              tr("Target", "Mục tiêu"): f.get("Price Target"), tr("Size", "Khối lượng"): t.get("Position Sizing")}
     # A long sizing paragraph belongs in the report; the card shows only a short one.
     levels = [f"{k} <b>{e(v.strip())}</b>" for k, v in levels.items() if given(v) and len(v) <= 40]
     if levels:
-        out += ["", "📍 <b>Levels</b>", *levels]
+        out += ["", tr("📍 <b>Levels</b>", "📍 <b>Mức giá</b>"), *levels]
 
     summary = sentences(f.get("Executive Summary", ""))
     # shortcut: a lone sentence over the limit is cut at a word (rare); fix if the PM starts writing run-ons
-    out += ["", "📝 <b>Summary</b>", e(fit(summary, 600) or summary[0][:600].rsplit(" ", 1)[0] + "…" if summary else "")]
+    out += ["", tr("📝 <b>Summary</b>", "📝 <b>Tóm tắt</b>"),
+            e(fit(summary, 600) or summary[0][:600].rsplit(" ", 1)[0] + "…" if summary else "")]
 
     # The thesis is bold-led blocks ("**Trend.** text", "**Evidence:**\n- item") or plain paragraphs
     # ("For the bull: text"). A block is (label, sentences).
@@ -151,11 +175,11 @@ def summarize(ticker, date, decision, trade_plan=""):
     for sentence in summary + prose:
         for direction, number in TRIGGER.findall(sentence):
             if len(re.sub(r"\D", "", number)) >= 3 or number.lower().endswith("k"):
-                triggers.setdefault((direction.lower(), number.lstrip("~")), None)
-    ups = [f"close above <b>{e(n)}</b>" for d, n in triggers if d == "above"]
-    downs = [f"close below <b>{e(n)}</b>" for d, n in triggers if d == "below"]
+                triggers.setdefault((direction.lower() in UP, number.lstrip("~")), None)
+    ups = [tr(f"close above <b>{e(n)}</b>", f"đóng cửa trên <b>{e(n)}</b>") for up, n in triggers if up]
+    downs = [tr(f"close below <b>{e(n)}</b>", f"đóng cửa dưới <b>{e(n)}</b>") for up, n in triggers if not up]
     if ups or downs:
-        out += ["", "🎯 <b>Triggers</b>", *[f"▲ {x}" for x in ups[:2]], *[f"▼ {x}" for x in downs[:2]]]
+        out += ["", tr("🎯 <b>Triggers</b>", "🎯 <b>Ngưỡng kích hoạt</b>"), *[f"▲ {x}" for x in ups[:2]], *[f"▼ {x}" for x in downs[:2]]]
 
     # Up to three conclusions: per block, a whole sentence that is short enough and not already a trigger,
     # a gap or the summary; one that states a conclusion is preferred.
@@ -177,31 +201,35 @@ def summarize(ticker, date, decision, trade_plan=""):
             tag = f"<b>{e(label)}:</b> " if label and len(label) <= 40 and label.lower() != "rating" else ""
             bullets.append(f"• {tag}{e(pick)}")
     if bullets:
-        out += ["", "<b>Key points</b>", *bullets]
+        out += ["", tr("<b>Key points</b>", "<b>Ý chính</b>"), *bullets]
 
     # Gaps: a labelled block's items, else any sentence that says something was not provided.
     gap_text = ""
     for label, ss in blocks:
         if GAPS_LABEL.match(label) and (items := fit([x if x[-1] in ".!?" else x + "." for x in ss], 260)):
-            gap_text = ("Missing: " if label.lower().startswith("missing") else "Gaps: ") + items
+            gap_text = (tr("Missing: ", "Thiếu: ") if label.lower().startswith(("missing", "thiếu"))
+                        else tr("Gaps: ", "Thiếu dữ liệu: ")) + items
             break
     if not gap_text:  # only the clause that names the gap: "Why not Sell: price is up, and the feed is missing."
-        clauses = [re.sub(r"^(?:and|but|so|while)\s+", "", c).rstrip(".")
+        clauses = [re.sub(r"^(?:and|but|so|while|nhưng|và|còn)\s+", "", c).rstrip(".")
                    for x in prose for c in re.split(r"[,;:]\s+(?![^(]*\))", x)]
         found = [c[0].upper() + c[1:] + "." for c in clauses if GAP_SENTENCE.search(c)]
-        gap_text = "Gaps: " + fit(found, 254) if found else ""
-    out += ["", f"⚠️ <i>{e(gap_text) or 'Gaps: none stated in the decision.'}</i>"]
-    out += ["", "📎 Full report attached."]
+        gap_text = tr("Gaps: ", "Thiếu dữ liệu: ") + fit(found, 254) if found else ""
+    out += ["", f"⚠️ <i>{e(gap_text) or tr('Gaps: none stated in the decision.', 'Thiếu dữ liệu: quyết định không nêu.')}</i>"]
+    out += ["", tr("📎 Full report attached.", "📎 Báo cáo đầy đủ đính kèm.")]
     return "\n".join(out)
 
 
-def level(text):
-    """'$84,093.42' / '84.5k' / '2500.0' -> float; None for anything else."""
-    m = re.fullmatch(r"~?\$?(\d+(?:,\d{3})*(?:\.\d+)?)(k?)", text.strip())
+def level(text, lang="en"):
+    """'$84,093.42' / '84.5k' / '2500.0' -> float; None for anything else. Vietnamese writes 84.093,42."""
+    text = text.strip()
+    if lang == "vi" and re.fullmatch(r"~?\$?\d{1,3}(?:\.\d{3})*(?:,\d+)?k?", text):
+        text = text.replace(".", "").replace(",", ".")
+    m = re.fullmatch(r"~?\$?(\d+(?:,\d{3})*(?:\.\d+)?)(k?)", text)
     return m and float(m[1].replace(",", "")) * (1000 if m[2] else 1)
 
 
-def chart(ticker, date, card):
+def chart(ticker, date, card, lang="en"):
     """PNG of the last 90 daily bars with SMA 50/200, Bollinger 20/2 and the card's own levels.
 
     Prices come from load_ohlcv, which the analysis has just cached, so this makes no extra
@@ -213,9 +241,11 @@ def chart(ticker, date, card):
                    mid=close.rolling(20).mean(), sd=close.rolling(20).std())
     df = df.assign(up=df["mid"] + 2 * df["sd"], low=df["mid"] - 2 * df["sd"]).tail(90).reset_index(drop=True)
     last = float(df["Close"].iloc[-1])
-    lines = [("up" if d == "above" else "down", level(v), (22, 163, 74) if d == "above" else (220, 38, 38))
-             for d, v in re.findall(r"close (above|below) <b>([^<]+)</b>", card)]
-    lines += [(k, level(v), (100, 116, 139)) for k, v in re.findall(r"(Stop|Target) <b>([^<]+)</b>", card)]
+    lines = [("up" if d in UP else "down", level(v, lang), (22, 163, 74) if d in UP else (220, 38, 38))
+             for d, v in re.findall(r"(?:close|đóng cửa) (above|below|trên|dưới) <b>([^<]+)</b>", card)]
+    named = {"Cắt lỗ": "Stop", "Mục tiêu": "Target"}  # the chart's font has no Vietnamese accents
+    # Stop and Target are numbers the program wrote ("1.234" is 1.234); only the PM's prose writes Vietnamese thousands
+    lines += [(named.get(k, k), level(v), (100, 116, 139)) for k, v in re.findall(r"(Stop|Target|Cắt lỗ|Mục tiêu) <b>([^<]+)</b>", card)]
     lines = [x for x in lines if x[1] and last / 3 < x[1] < last * 3]  # a misread unit would flatten the chart
 
     W, H, L, R, T, B = 1000, 560, 10, 110, 40, 30
@@ -268,25 +298,28 @@ def chart(ticker, date, card):
     return out.getvalue()
 
 
-def analyze(chat, ticker, date):
+def analyze(chat, ticker, date, lang="en"):
     kind = detect_asset_type(ticker)
     analysts = [a.value for a in filter_analysts_for_asset_type(list(AnalystType), kind)]
-    graph = TradingAgentsGraph(selected_analysts=analysts, config=DEFAULT_CONFIG.copy())
+    config = DEFAULT_CONFIG.copy()
+    if lang == "vi":  # every agent writes in Vietnamese; the labelled lines the card reads stay in English
+        config["output_language"] = "Vietnamese"
+    graph = TradingAgentsGraph(selected_analysts=analysts, config=config)
     state, _ = graph.propagate(ticker, date, asset_type=kind.value)
-    card = summarize(ticker, date, state["final_trade_decision"], state.get("trader_investment_plan", ""))
+    card = summarize(ticker, date, state["final_trade_decision"], state.get("trader_investment_plan", ""), lang)
     try:
-        say(chat, f"{card}\n\n{REFERENCE}", parse_mode="HTML")
+        say(chat, f"{card}\n\nℹ️ <i>{REFERENCE[lang]}</i>", parse_mode="HTML")
     except requests.HTTPError:  # Telegram rejected the markup: still deliver the decision, as plain text
-        say(chat, f"{state['final_trade_decision']}\n\n{html.unescape(re.sub('<[^>]+>', '', REFERENCE))}")
+        say(chat, f"{state['final_trade_decision']}\n\n{REFERENCE[lang]}")
     try:  # the chart is extra: if it fails, the card and the report still go out
-        call("sendPhoto", data={"chat_id": chat}, files={"photo": ("chart.png", chart(ticker, date, card))})
+        call("sendPhoto", data={"chat_id": chat}, files={"photo": ("chart.png", chart(ticker, date, card, lang))})
     except Exception as exc:
         print(f"chart failed for {ticker} {date}: {exc!r}")
     # Telegram caps a message at 4096 chars, so the full report goes as a file.
     with tempfile.TemporaryDirectory() as tmp:
         report = graph.save_reports(state, ticker, tmp, html=False)
         with open(report, "rb") as f:
-            call("sendDocument", data={"chat_id": chat, "caption": "Báo cáo tham khảo, không phải tín hiệu giao dịch."}, files={"document": (f"{ticker}-{date}.md", f)})
+            call("sendDocument", data={"chat_id": chat, "caption": REFERENCE[lang]}, files={"document": (f"{ticker}-{date}.md", f)})
 
 
 def handle(msg):
@@ -295,23 +328,36 @@ def handle(msg):
         return
     parts = (msg.get("text") or "").split()
     command = parts[0].split("@")[0] if parts else ""
+    lang = trend.chat_lang(chat)
+
+    def tr(en, vi):
+        return trend._t(lang, en, vi)
+
+    if command == "/lang":
+        choice = parts[1].lower() if len(parts) > 1 else ""
+        if choice not in trend.LANGS:
+            return say(chat, tr("Language: English. Usage: /lang vi or /lang en",
+                                "Ngôn ngữ: tiếng Việt. Cách dùng: /lang vi hoặc /lang en"))
+        trend.set_chat_lang(chat, choice)
+        return say(chat, trend._t(choice, "✅ Language: English. Replies, alerts and /analyze reports are now in English.",
+                                  "✅ Ngôn ngữ: tiếng Việt. Câu trả lời, cảnh báo và báo cáo /analyze từ giờ bằng tiếng Việt."))
     if command in ("/status", "/health"):
         books = parts[1:2] or list(trend.BOOKS)  # no argument: every book the daily job runs
-        return say_html(chat, "\n\n".join(trend.health_text(name) for name in books))
+        return say_html(chat, "\n\n".join(trend.health_text(name, lang=lang) for name in books))
     if command in ("/trend", "/paper"):
         report = trend.status_text if command == "/trend" else trend.paper_text
-        return say_html(chat, report(parts[1] if len(parts) > 1 else "BTCUSDT"))
+        return say_html(chat, report(parts[1] if len(parts) > 1 else "BTCUSDT", lang=lang))
     if command != "/analyze":  # anything else, /status or /help included, gets the list of commands
-        return say(chat, COMMANDS)
+        return say(chat, tr(COMMANDS, COMMANDS_VI))
     ticker = parts[1] if len(parts) > 1 else ""
     date = parts[2] if len(parts) > 2 else datetime.date.today().isoformat()
     if not TICKER.match(ticker):
-        return say(chat, "Usage: /analyze TICKER [YYYY-MM-DD]")
-    say(chat, f"Analyzing {ticker} {date}, about 3 minutes...")
+        return say(chat, tr("Usage: /analyze TICKER [YYYY-MM-DD]", "Cách dùng: /analyze MÃ [YYYY-MM-DD]"))
+    say(chat, tr(f"Analyzing {ticker} {date}, about 3 minutes...", f"Đang phân tích {ticker} {date}, khoảng 3 phút..."))
     try:
-        analyze(chat, ticker, date)
+        analyze(chat, ticker, date, lang)
     except Exception as exc:  # report and keep serving
-        say(chat, f"Failed: {exc}")
+        say(chat, f"{tr('Failed', 'Lỗi')}: {exc}")
 
 
 def main():

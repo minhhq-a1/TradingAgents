@@ -21,6 +21,7 @@ a BTC sleeve that is never sold, the rest in a sleeve that follows the rule, no 
 ``simulate`` is that one model, shared with ``tradingagents.trend_backtest``.
 
 Every message is Telegram HTML: bold heads, numbers in ``<pre>`` blocks, dynamic text escaped.
+Each one is written in English and Vietnamese; a chat gets the language it chose with /lang.
 
 State is saved before a message goes out and each chat's delivery is recorded on its own, so a
 restart can neither lose a flip nor repeat a delivered one, and one failing chat blocks no other.
@@ -64,6 +65,15 @@ WHIPSAW_ICHIMOKU = (
     "<i>⚠️ Shadow book, not the rule: about 7 trades a year; 51 of 84 closed trades (2015-2026) lost money and lasted "
     "14 days or less. Its edge was a smaller drawdown than SMA200 (-51% vs -69%); it lagged in strong bull years.</i>"
 )
+WHIPSAW_VI = (
+    "<i>⚠️ Nhiễu (whipsaw): 29/44 lệnh đã đóng (2014-2026) bị lỗ và chỉ kéo dài tối đa 14 ngày. Lợi thế nằm ở việc "
+    "đứng ngoài thị trường giá xuống (sụt giảm tối đa -67% so với -83% nếu mua và giữ), không nằm ở từng tín hiệu.</i>"
+)
+WHIPSAW_ICHIMOKU_VI = (
+    "<i>⚠️ Sổ phụ, không phải quy tắc chính: khoảng 7 lệnh/năm; 51/84 lệnh đã đóng (2015-2026) bị lỗ và chỉ kéo dài "
+    "tối đa 14 ngày. Lợi thế là sụt giảm nhỏ hơn SMA200 (-51% so với -69%); kém hơn trong các năm tăng mạnh.</i>"
+)
+LANGS = ("en", "vi")
 
 
 class StaleData(Exception):
@@ -82,8 +92,41 @@ class SendFailed(Exception):
     """At least one chat did not get a message; the others did, and only this one is retried."""
 
 
-def _days(n: int) -> str:
-    return f"{n} day{'s' * (n != 1)}"
+def _t(lang: str, en: str, vi: str) -> str:
+    """The English or the Vietnamese text of a message."""
+    return vi if lang == "vi" else en
+
+
+def _days(n: int, lang: str = "en") -> str:
+    return _t(lang, f"{n} day{'s' * (n != 1)}", f"{n} ngày")
+
+
+def _state(state: str, lang: str = "en") -> str:
+    return state if lang != "vi" else ("GIỮ BTC" if state == HOLD else "TIỀN MẶT")
+
+
+def chat_lang(chat) -> str:
+    """The language a chat chose with /lang; English until it chooses."""
+    try:
+        with open(os.path.join(DIR, "lang.json"), encoding="utf-8") as f:
+            return json.load(f).get(str(chat), "en")
+    except (FileNotFoundError, ValueError):
+        return "en"
+
+
+def set_chat_lang(chat, lang: str) -> None:
+    assert lang in LANGS, lang
+    path = os.path.join(DIR, "lang.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            langs = json.load(f)
+    except (FileNotFoundError, ValueError):
+        langs = {}
+    langs[str(chat)] = lang
+    os.makedirs(DIR, exist_ok=True)
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(langs, f)
+    os.replace(path + ".tmp", path)
 
 
 def book(name: str) -> str:
@@ -100,25 +143,29 @@ def _rule(book_id: str) -> str:
     return BOOKS.get(book_id, SMA200)
 
 
-def _title(book_id: str) -> str:
-    return f"{_pair(book_id)} {'Ichimoku (shadow)' if _rule(book_id) == ICHIMOKU else 'trend'}"
+def _title(book_id: str, lang: str = "en") -> str:
+    if _rule(book_id) == ICHIMOKU:
+        return f"{_pair(book_id)} Ichimoku {_t(lang, '(shadow)', '(sổ phụ)')}"
+    return _t(lang, f"{_pair(book_id)} trend", f"{_pair(book_id)} xu hướng")
 
 
-def _name(book_id: str) -> str:
+def _name(book_id: str, lang: str = "en") -> str:
     """How /paper and /status head a book: the SMA200 book keeps its plain symbol."""
-    return _title(book_id) if _rule(book_id) == ICHIMOKU else book_id
+    return _title(book_id, lang) if _rule(book_id) == ICHIMOKU else book_id
 
 
 def _short(book_id: str) -> str:
     return "Ichimoku" if _rule(book_id) == ICHIMOKU else "SMA200"
 
 
-def _level_name(book_id: str) -> str:
-    return "Cloud top" if _rule(book_id) == ICHIMOKU else "SMA200"
+def _level_name(book_id: str, lang: str = "en") -> str:
+    return _t(lang, "Cloud top", "Đỉnh mây") if _rule(book_id) == ICHIMOKU else "SMA200"
 
 
-def _whipsaw(book_id: str) -> str:
-    return WHIPSAW_ICHIMOKU if _rule(book_id) == ICHIMOKU else WHIPSAW
+def _whipsaw(book_id: str, lang: str = "en") -> str:
+    if _rule(book_id) == ICHIMOKU:
+        return _t(lang, WHIPSAW_ICHIMOKU, WHIPSAW_ICHIMOKU_VI)
+    return _t(lang, WHIPSAW, WHIPSAW_VI)
 
 
 def core_weight() -> float:
@@ -264,71 +311,92 @@ def _pre(rows: list[tuple[str, str]]) -> str:
     return "<pre>" + "\n".join(_esc(f"{k:<{left}}  {v:>{right}}") for k, v in rows) + "</pre>"
 
 
-def _levels(info: dict) -> str:
-    return _pre([(f"Close {info['date']}", f"{info['close']:,.0f}"), (_level_name(info["symbol"]), f"{info['sma']:,.0f}"),
-                 ("Gap", f"{info['close'] / info['sma'] - 1:+.1%}")])
+def _levels(info: dict, lang: str = "en") -> str:
+    return _pre([(f"{_t(lang, 'Close', 'Đóng cửa')} {info['date']}", f"{info['close']:,.0f}"),
+                 (_level_name(info["symbol"], lang), f"{info['sma']:,.0f}"),
+                 (_t(lang, "Gap", "Chênh lệch"), f"{info['close'] / info['sma'] - 1:+.1%}")])
 
 
-def _split(weight: float) -> str:
-    return f"Split: {weight:.0%} core BTC (never sold) · {1 - weight:.0%} follows the rule, not rebalanced."
+def _split(weight: float, lang: str = "en") -> str:
+    return _t(lang, f"Split: {weight:.0%} core BTC (never sold) · {1 - weight:.0%} follows the rule, not rebalanced.",
+              f"Phân bổ: {weight:.0%} BTC lõi (không bao giờ bán) · {1 - weight:.0%} theo quy tắc, không tái cân bằng.")
 
 
-def _head(state: str, book_id: str = "BTCUSDT") -> str:
-    return f"{'🟢' if state == HOLD else '🔴'} <b>{_title(book_id)} {'UP · HOLD BTC' if state == HOLD else 'DOWN · CASH'}</b>"
+def _now(state: str, lang: str = "en") -> str:
+    return "🟢 " + _t(lang, "HOLD BTC", "GIỮ BTC") if state == HOLD else "🔴 " + _t(lang, "CASH", "TIỀN MẶT")
 
 
-def alert_text(info: dict, detected_at: str, weight: float | None = None) -> str:
+def _head(state: str, book_id: str = "BTCUSDT", lang: str = "en") -> str:
+    move = _t(lang, "UP · HOLD BTC", "TĂNG · GIỮ BTC") if state == HOLD else _t(lang, "DOWN · CASH", "GIẢM · TIỀN MẶT")
+    return f"{'🟢' if state == HOLD else '🔴'} <b>{_title(book_id, lang)} {move}</b>"
+
+
+def alert_text(info: dict, detected_at: str, weight: float | None = None, lang: str = "en") -> str:
     return "\n".join([
-        _head(info["state"], info["symbol"]),
-        "<i>Paper signal only, no order was placed.</i>",
-        _levels(info),
-        f"Detected {detected_at[11:16]} UTC. The backtest fills at the 00:00 UTC open; you cannot get that price, "
-        "so a real fill will differ.",
-        _split(core_weight() if weight is None else weight),
+        _head(info["state"], info["symbol"], lang),
+        _t(lang, "<i>Paper signal only, no order was placed.</i>",
+           "<i>Chỉ là tín hiệu giao dịch thử, không có lệnh nào được đặt.</i>"),
+        _levels(info, lang),
+        _t(lang, f"Detected {detected_at[11:16]} UTC. The backtest fills at the 00:00 UTC open; you cannot get that price, "
+                 "so a real fill will differ.",
+           f"Phát hiện lúc {detected_at[11:16]} UTC. Backtest khớp lệnh ở giá mở cửa 00:00 UTC; bạn không thể có giá đó, "
+           "nên giá khớp thực tế sẽ khác."),
+        _split(core_weight() if weight is None else weight, lang),
         "",
-        _whipsaw(info["symbol"]),
+        _whipsaw(info["symbol"], lang),
     ])
 
 
-def late_text(flips: list[dict], info: dict, outage: dict, detected_at: str, weight: float) -> str:
+def late_text(flips: list[dict], info: dict, outage: dict, detected_at: str, weight: float, lang: str = "en") -> str:
     """One message for signal changes found after the bot was offline: nobody could act on them on time."""
     n = len(flips)
     return "\n".join([
-        f"⚠️ <b>{_title(info['symbol'])} signals found late</b>",
-        f"The check was offline from {outage['from']} to {outage['to']} ({_days(outage['days'])}). "
-        f"{n} signal change{'s' * (n != 1)} {'was' if n == 1 else 'were'} found late, at {detected_at[11:16]} UTC, "
-        "and could not be acted on in time:",
-        *[f"• {f['signal_date']} <b>{f['state']}</b> · close {f['signal_close']:,.0f}" for f in flips],
+        _t(lang, f"⚠️ <b>{_title(info['symbol'])} signals found late</b>",
+           f"⚠️ <b>{_title(info['symbol'], lang)}: tín hiệu phát hiện trễ</b>"),
+        _t(lang, f"The check was offline from {outage['from']} to {outage['to']} ({_days(outage['days'])}). "
+                 f"{n} signal change{'s' * (n != 1)} {'was' if n == 1 else 'were'} found late, at {detected_at[11:16]} UTC, "
+                 "and could not be acted on in time:",
+           f"Bot ngừng kiểm tra từ {outage['from']} đến {outage['to']} ({_days(outage['days'], lang)}). "
+           f"{n} lần đổi tín hiệu được phát hiện trễ, lúc {detected_at[11:16]} UTC, và không thể hành động kịp:"),
+        *[f"• {f['signal_date']} <b>{_state(f['state'], lang)}</b> · {_t(lang, 'close', 'đóng cửa')} {f['signal_close']:,.0f}"
+          for f in flips],
         "",
-        f"Now: {'🟢 HOLD BTC' if info['state'] == HOLD else '🔴 CASH'}",
-        _levels(info),
-        "/paper shows the rule (every change filled) and as operated (position held through the outage).",
-        _split(weight),
+        f"{_t(lang, 'Now', 'Hiện tại')}: {_now(info['state'], lang)}",
+        _levels(info, lang),
+        _t(lang, "/paper shows the rule (every change filled) and as operated (position held through the outage).",
+           "/paper hiển thị theo quy tắc (khớp mọi lần đổi) và theo vận hành thực (giữ nguyên vị thế trong lúc bot ngừng)."),
+        _split(weight, lang),
         "",
-        _whipsaw(info["symbol"]),
+        _whipsaw(info["symbol"], lang),
     ])
 
 
-def status_text(symbol: str = "BTCUSDT") -> str:
+def status_text(symbol: str = "BTCUSDT", lang: str = "en") -> str:
     symbol = book(symbol)
     if symbol not in BOOKS:
-        return "The trend rule was only validated on BTCUSDT (/trend ichimoku is its shadow book)."
+        return _t(lang, "The trend rule was only validated on BTCUSDT (/trend ichimoku is its shadow book).",
+                  "Quy tắc xu hướng chỉ được kiểm chứng trên BTCUSDT (/trend ichimoku là sổ phụ của nó).")
     try:
         info = latest(symbol)
         weight = (_load(symbol).get(symbol) or {}).get("core", core_weight())
     except Exception as exc:  # report, keep serving
-        return f"⚠️ Trend data unavailable: {_esc(str(exc))}"
-    now = "🟢 HOLD BTC" if info["state"] == HOLD else "🔴 CASH"
+        return _t(lang, "⚠️ Trend data unavailable: ", "⚠️ Không lấy được dữ liệu xu hướng: ") + _esc(str(exc))
+    if _rule(symbol) == ICHIMOKU:
+        rule = _t(lang, "Rule: UTC close above the Ichimoku cloud (9/26/52) = hold BTC, otherwise cash. TradingView defaults, "
+                        "not tuned; runs next to SMA200 and never changes it.",
+                  "Quy tắc: giá đóng cửa UTC trên mây Ichimoku (9/26/52) = giữ BTC, ngược lại giữ tiền mặt. Thông số mặc "
+                  "định TradingView, không tinh chỉnh; chạy song song với SMA200 và không bao giờ thay đổi nó.")
+    else:
+        rule = _t(lang, "Rule: UTC close &gt; SMA200 = hold BTC, otherwise cash. Fixed, no parameters.",
+                  "Quy tắc: giá đóng cửa UTC &gt; SMA200 = giữ BTC, ngược lại giữ tiền mặt. Cố định, không có tham số.")
     return "\n".join([
-        f"<b>{_title(symbol)}: {now}</b> (paper)",
-        f"Since {info['since']}",
-        _levels(info),
-        "Rule: UTC close above the Ichimoku cloud (9/26/52) = hold BTC, otherwise cash. TradingView defaults, "
-        "not tuned; runs next to SMA200 and never changes it." if _rule(symbol) == ICHIMOKU
-        else "Rule: UTC close &gt; SMA200 = hold BTC, otherwise cash. Fixed, no parameters.",
-        _split(weight),
+        f"<b>{_title(symbol, lang)}: {_now(info['state'], lang)}</b> {_t(lang, '(paper)', '(giao dịch thử)')}",
+        f"{_t(lang, 'Since', 'Từ')} {info['since']}",
+        _levels(info, lang),
+        rule,
+        _split(weight, lang),
         "",
-        _whipsaw(symbol),
+        _whipsaw(symbol, lang),
     ])
 
 
@@ -342,18 +410,22 @@ def _book(entry: dict) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     return days[["Open", "Close"]].astype(float), days["state"], pd.Series(held, index=days.index)
 
 
-def paper_text(symbol: str = "BTCUSDT") -> str:
+def paper_text(symbol: str = "BTCUSDT", lang: str = "en") -> str:
     """The paper book since the first check, from the stored days: no fetch, no revision, no env."""
     symbol = book(symbol)
     entry = _load(symbol).get(symbol)
     if entry is None:
-        return "No paper book yet: the first daily check has not run."
+        return _t(lang, "No paper book yet: the first daily check has not run.",
+                  "Chưa có sổ giao dịch thử: lần kiểm tra hằng ngày đầu tiên chưa chạy.")
     frame, rule, operated = _book(entry)
     weight = entry["core"]
-    notes = [f"⚠️ Data check: {_esc(event)}" for event in entry["data_events"][-2:]]
+    # shortcut: the event itself stays in English, as stored; translate at write time if Vietnamese chats need it
+    notes = [f"⚠️ {_t(lang, 'Data check', 'Kiểm tra dữ liệu')}: {_esc(event)}" for event in entry["data_events"][-2:]]
+    head = _t(lang, f"📒 <b>{_name(symbol)} paper book</b>", f"📒 <b>Sổ giao dịch thử {_name(symbol, lang)}</b>")
     if len(frame) < 2:
-        return "\n".join([f"📒 <b>{_name(symbol)} paper book</b>",
-                          f"Opened {entry['start']['date']} as cash; no day has closed since, so no equity yet.", *notes])
+        return "\n".join([head, _t(lang, f"Opened {entry['start']['date']} as cash; no day has closed since, so no equity yet.",
+                                   f"Mở ngày {entry['start']['date']} bằng tiền mặt; chưa có ngày nào đóng cửa kể từ đó "
+                                   "nên chưa có lợi nhuận."), *notes])
     ideal, ops = simulate(frame, rule, weight), simulate(frame, operated, weight)
 
     def pct(equity: pd.Series) -> str:
@@ -362,37 +434,50 @@ def paper_text(symbol: str = "BTCUSDT") -> str:
     in_btc = operated.shift(fill_value=CASH).iloc[-1] == HOLD  # filled: yesterday's signal, bought at today's open
     core, sleeve = weight * ops["hold"].iloc[-1], (1 - weight) * ops["trend"].iloc[-1] * in_btc
     total = ops["mix"].iloc[-1]
+    mix = _t(lang, "Mix (core + rule)", "Kết hợp (lõi + quy tắc)")
     lines = [
-        f"📒 <b>{_name(symbol)} paper book</b>",
-        f"Since {entry['start']['date']} ({_days(len(frame) - 1)}, no real orders) · core {weight:.0%} fixed at the start",
+        head,
+        _t(lang, f"Since {entry['start']['date']} ({_days(len(frame) - 1)}, no real orders) · core {weight:.0%} fixed at the start",
+           f"Từ {entry['start']['date']} ({_days(len(frame) - 1, lang)}, không có lệnh thật) · lõi {weight:.0%} cố định từ đầu"),
         "",
-        f"<b>Position</b> · filled through {frame.index[-1].date()}",
-        _pre([("BTC", f"{(core + sleeve) / total:.1%}"), ("  core", f"{core / total:.1%}"),
-              ("  trend sleeve", f"{sleeve / total:.1%}"), ("Cash", f"{1 - (core + sleeve) / total:.1%}")]),
+        _t(lang, f"<b>Position</b> · filled through {frame.index[-1].date()}", f"<b>Vị thế</b> · đã khớp đến {frame.index[-1].date()}"),
+        _pre([("BTC", f"{(core + sleeve) / total:.1%}"), (_t(lang, "  core", "  lõi"), f"{core / total:.1%}"),
+              (_t(lang, "  trend sleeve", "  phần theo xu hướng"), f"{sleeve / total:.1%}"),
+              (_t(lang, "Cash", "Tiền mặt"), f"{1 - (core + sleeve) / total:.1%}")]),
     ]
     if operated.iloc[-1] != (HOLD if in_btc else CASH):
-        lines.append(f"⏳ Pending at the next open: trend sleeve to {operated.iloc[-1]} (signal of {frame.index[-1].date()})")
-    lines += ["", "<b>Equity, rule</b> (every change filled)",
-              _pre([("Mix (core + rule)", pct(ideal["mix"])), (f"100% {_short(symbol)}", pct(ideal["trend"])), ("Buy-and-hold", pct(ideal["hold"]))])]
+        lines.append(_t(lang, f"⏳ Pending at the next open: trend sleeve to {operated.iloc[-1]} (signal of {frame.index[-1].date()})",
+                        f"⏳ Chờ khớp ở giá mở cửa kế tiếp: phần theo xu hướng chuyển sang {_state(operated.iloc[-1], lang)} "
+                        f"(tín hiệu ngày {frame.index[-1].date()})"))
+    lines += ["", _t(lang, "<b>Equity, rule</b> (every change filled)", "<b>Lợi nhuận, theo quy tắc</b> (khớp mọi lần đổi)"),
+              _pre([(mix, pct(ideal["mix"])), (f"100% {_short(symbol)}", pct(ideal["trend"])),
+                    (_t(lang, "Buy-and-hold", "Mua và giữ"), pct(ideal["hold"]))])]
     if entry["gaps"]:
-        lines += [f"<b>Equity, as operated</b> (⚠️ {_days(sum(g['days'] for g in entry['gaps']))} offline, position held through them)",
-                  _pre([("Mix (core + rule)", pct(ops["mix"])), (f"100% {_short(symbol)}", pct(ops["trend"]))])]
+        off = sum(g["days"] for g in entry["gaps"])
+        lines += [_t(lang, f"<b>Equity, as operated</b> (⚠️ {_days(off)} offline, position held through them)",
+                     f"<b>Lợi nhuận, theo vận hành thực</b> (⚠️ bot ngừng {_days(off, lang)}, giữ nguyên vị thế)"),
+                  _pre([(mix, pct(ops["mix"])), (f"100% {_short(symbol)}", pct(ops["trend"]))])]
     if notes:
         lines += ["", *notes]
-    lines += ["", "<b>Ledger</b> · signal close → next open fill (UTC)"]
+    lines += ["", _t(lang, "<b>Ledger</b> · signal close → next open fill (UTC)",
+                     "<b>Sổ lệnh</b> · đóng cửa có tín hiệu → khớp ở giá mở cửa kế tiếp (UTC)")]
     for row in entry["ledger"][-5:]:
-        fill = "pending" if row["fill_open"] is None else f"{row['fill_open']:,.0f}"
-        sent = min(row["sent"].values())[5:16].replace("T", " ") if row["sent"] else "not yet"
-        lines += [f"• <b>{row['signal_date']} {row['state']}</b>{' (late)' if row['late'] else ''} · "
-                  f"close {row['signal_close']:,.0f} → open {fill} ({row['fill_date'][5:]})",
-                  f"   detected {row['detected_at'][5:16].replace('T', ' ')} · sent {sent}"]
+        fill = _t(lang, "pending", "chờ") if row["fill_open"] is None else f"{row['fill_open']:,.0f}"
+        sent = min(row["sent"].values())[5:16].replace("T", " ") if row["sent"] else _t(lang, "not yet", "chưa")
+        lines += [f"• <b>{row['signal_date']} {_state(row['state'], lang)}</b>{_t(lang, ' (late)', ' (trễ)') if row['late'] else ''} · "
+                  + _t(lang, f"close {row['signal_close']:,.0f} → open {fill} ({row['fill_date'][5:]})",
+                       f"đóng {row['signal_close']:,.0f} → mở {fill} ({row['fill_date'][5:]})"),
+                  _t(lang, f"   detected {row['detected_at'][5:16].replace('T', ' ')} · sent {sent}",
+                     f"   phát hiện {row['detected_at'][5:16].replace('T', ' ')} · đã gửi {sent}")]
         seen = row.get("quote")
         if seen:  # what the alert could really have traded at, against the open the backtest uses
             base = row["fill_open"] or seen["open"]
-            lines.append(f"   price at send {seen['price']:,.0f} ({seen['price'] / base - 1:+.2%} vs open)")
+            lines.append(_t(lang, f"   price at send {seen['price']:,.0f} ({seen['price'] / base - 1:+.2%} vs open)",
+                            f"   giá lúc gửi {seen['price']:,.0f} ({seen['price'] / base - 1:+.2%} so với giá mở)"))
     if not entry["ledger"]:
-        lines.append("No flips yet.")
-    lines.append("<i>Sleeves start as cash, fill at the next open, 0.1% fee per side, no rebalancing.</i>")
+        lines.append(_t(lang, "No flips yet.", "Chưa có lần đổi tín hiệu nào."))
+    lines.append(_t(lang, "<i>Sleeves start as cash, fill at the next open, 0.1% fee per side, no rebalancing.</i>",
+                    "<i>Các phần bắt đầu bằng tiền mặt, khớp ở giá mở cửa kế tiếp, phí 0.1% mỗi chiều, không tái cân bằng.</i>"))
     return "\n".join(lines)
 
 
@@ -444,36 +529,46 @@ def overdue(entry: dict | None, now: datetime) -> bool:
     return last is None or datetime.fromisoformat(last["at"]) < midnight
 
 
-def health_text(symbol: str = "BTCUSDT", now: datetime | None = None) -> str:
+def health_text(symbol: str = "BTCUSDT", now: datetime | None = None, lang: str = "en") -> str:
     """Is the daily job alive: last completed run, queued alerts, recent runs and errors."""
     now = now or datetime.now(UTC)
     symbol = book(symbol)
     entry = _load(symbol).get(symbol)
+    name = _name(symbol, lang)
     if entry is None:
-        return f"{_esc(_name(symbol))} job: no run has completed yet."
+        return _t(lang, f"{_esc(name)} job: no run has completed yet.", f"Tác vụ {_esc(name)}: chưa có lần chạy nào hoàn tất.")
     last = entry.get("last_run")
-    head = "🚨 <b>{} job: OVERDUE</b>" if overdue(entry, now) else "✅ <b>{} job: OK</b>"
-    lines = [head.format(_name(symbol)) + f" · checked {now.strftime('%Y-%m-%d %H:%M')} UTC"]
+    if overdue(entry, now):
+        head = _t(lang, f"🚨 <b>{name} job: OVERDUE</b>", f"🚨 <b>Tác vụ {name}: QUÁ HẠN</b>")
+    else:
+        head = _t(lang, f"✅ <b>{name} job: OK</b>", f"✅ <b>Tác vụ {name}: OK</b>")
+    lines = [head + _t(lang, " · checked ", " · kiểm tra lúc ") + f"{now.strftime('%Y-%m-%d %H:%M')} UTC"]
     if last:
         age = int((now - datetime.fromisoformat(last["at"])).total_seconds() // 60)
-        lines += [f"Last completed run {last['at'][:16].replace('T', ' ')} UTC ({age // 60}h {age % 60}m ago)",
-                  f"Data through {last['data_date']} · {last['source']} · {last['state']}"]
+        at = last["at"][:16].replace("T", " ")
+        lines += [_t(lang, f"Last completed run {at} UTC ({age // 60}h {age % 60}m ago)",
+                     f"Lần chạy xong gần nhất {at} UTC ({age // 60} giờ {age % 60} phút trước)"),
+                  f"{_t(lang, 'Data through', 'Dữ liệu đến')} {last['data_date']} · {last['source']} · {_state(last['state'], lang)}"]
     else:
-        lines.append(f"No run has completed; data processed through {entry['checked']}")
-    lines += ["", _pre([("Undelivered alerts", str(len(entry["pending"]))), ("Outages", str(len(entry["gaps"]))),
-                        ("Data events", str(len(entry["data_events"]))), ("Signals", str(len(entry["ledger"])))]),
-              "<b>Recent runs</b>"]
+        lines.append(_t(lang, f"No run has completed; data processed through {entry['checked']}",
+                        f"Chưa có lần chạy nào hoàn tất; dữ liệu đã xử lý đến {entry['checked']}"))
+    lines += ["", _pre([(_t(lang, "Undelivered alerts", "Cảnh báo chưa gửi"), str(len(entry["pending"]))),
+                        (_t(lang, "Outages", "Lần bot ngừng"), str(len(entry["gaps"]))),
+                        (_t(lang, "Data events", "Sự kiện dữ liệu"), str(len(entry["data_events"]))),
+                        (_t(lang, "Signals", "Tín hiệu"), str(len(entry["ledger"])))]),
+              _t(lang, "<b>Recent runs</b>", "<b>Các lần chạy gần đây</b>")]
     rows = [row for row in _ops_rows() if row.get("symbol", "BTCUSDT") == symbol]
     for row in rows[-3:]:
         eq = row.get("equity")
-        stats = f" · mix {eq['mix']:+.1%}" if eq else ""
-        lag = f" · alert lag {row['lag_s']:.0f}s" if row.get("lag_s") is not None else ""
-        lines.append(f"{'✅' if row['ok'] else '❌ FAILED'} {row['at'][5:16].replace('T', ' ')} · "
-                     f"data {row.get('data_date', '-')}{stats}{lag}")
+        stats = f" · {_t(lang, 'mix', 'kết hợp')} {eq['mix']:+.1%}" if eq else ""
+        lag = f" · {_t(lang, 'alert lag', 'trễ cảnh báo')} {row['lag_s']:.0f}s" if row.get("lag_s") is not None else ""
+        lines.append(f"{'✅' if row['ok'] else _t(lang, '❌ FAILED', '❌ LỖI')} {row['at'][5:16].replace('T', ' ')} · "
+                     f"{_t(lang, 'data', 'dữ liệu')} {row.get('data_date', '-')}{stats}{lag}")
         if row.get("errors"):
-            lines.append(f"   {len(row['errors'])} error(s), first: <code>{_esc(row['errors'][0][:80])}</code>")
+            lines.append(f"   {len(row['errors'])} {_t(lang, 'error(s), first', 'lỗi, lỗi đầu')}: "
+                         f"<code>{_esc(row['errors'][0][:80])}</code>")
     if not rows:
-        lines.append("No ops rows yet.")
+        lines.append(_t(lang, "No ops rows yet.", "Chưa có bản ghi vận hành."))
     return "\n".join(lines)
 
 
@@ -581,9 +676,10 @@ def check(symbol: str, send, chats, today: datetime | None = None) -> bool:
         rows = [entry["ledger"][i] for i in flips]
         info = latest(symbol, now, frame)
         detected = now.isoformat(timespec="seconds")
-        text = (late_text(rows, info, outage, detected, entry["core"]) if outage
-                else alert_text(info, detected, entry["core"]))
-        entry["pending"].append({"text": text, "rows": flips, "sent_to": []})  # an undelivered older alert stays queued
+        texts = {lang: (late_text(rows, info, outage, detected, entry["core"], lang) if outage
+                        else alert_text(info, detected, entry["core"], lang)) for lang in LANGS}
+        # an undelivered older alert stays queued; each chat gets it in its own language
+        entry["pending"].append({"text": texts["en"], "texts": texts, "rows": flips, "sent_to": []})
         _log("detected", detected_at=detected, flips=[r["signal_date"] for r in rows], late=bool(outage))
     _save(data, symbol)  # before sending: a crash now resends to the chats not yet reached, it cannot lose the flip
     stats = {"rows": []}
@@ -611,7 +707,7 @@ def _deliver(data: dict, entry: dict, send, chats, symbol: str = "BTCUSDT", stat
             if chat in pending["sent_to"] or chat in failed:
                 continue
             try:
-                send(chat, pending["text"])
+                send(chat, pending.get("texts", {}).get(chat_lang(chat)) or pending["text"])  # alerts queued before /lang: English
             except Exception as exc:  # the other chats still get theirs; only this one is retried
                 failed.append(chat)
                 _log("send_failed", chat=chat, error=repr(exc))
@@ -660,9 +756,12 @@ def watch(send, chats) -> None:
                 error = errors[-1]
                 _log("check_failed", book=symbol, error=error)
                 for chat in chats:
+                    lang = chat_lang(chat)
                     try:
-                        send(chat, f"⚠️ <b>{_title(symbol)} check failed</b> after {RETRIES} tries. No signal was made today; "
-                                   f"the next check is tomorrow.\n<code>{_esc(error[:300])}</code>")
+                        send(chat, _t(lang, f"⚠️ <b>{_title(symbol)} check failed</b> after {RETRIES} tries. No signal was made "
+                                            "today; the next check is tomorrow.",
+                                      f"⚠️ <b>{_title(symbol, lang)}: kiểm tra thất bại</b> sau {RETRIES} lần thử. Hôm nay không "
+                                      "có tín hiệu; lần kiểm tra tiếp theo là ngày mai.") + f"\n<code>{_esc(error[:300])}</code>")
                     except Exception as exc:
                         logger.warning("could not report the failed check to %s: %r", chat, exc)
             ok = len(errors) < RETRIES
@@ -695,9 +794,14 @@ def alert_overdue(symbol: str, send, chats, now: datetime) -> bool:
     if not overdue(entry, now) or told.get(symbol) == today:
         return False
     last = ((entry or {}).get("last_run") or {}).get("at", "never")
-    text = (f"🚨 <b>{_title(symbol)} job is down</b>\nNo run has completed since {last[:16].replace('T', ' ')} UTC, and it is "
-            f"{now.strftime('%H:%M')} UTC. Today's signal check did not happen. See /status.")
+    since, clock = last[:16].replace("T", " "), now.strftime("%H:%M")
     for chat in chats:
+        lang = chat_lang(chat)
+        text = _t(lang, f"🚨 <b>{_title(symbol)} job is down</b>\nNo run has completed since {since} UTC, and it is "
+                        f"{clock} UTC. Today's signal check did not happen. See /status.",
+                  f"🚨 <b>Tác vụ {_title(symbol, lang)} đã ngừng</b>\nKhông có lần chạy nào hoàn tất kể từ "
+                  f"{'(chưa từng)' if last == 'never' else since + ' UTC'}, và bây giờ là {clock} UTC. "
+                  "Hôm nay chưa kiểm tra tín hiệu. Xem /status.")
         try:
             send(chat, text)
         except Exception as exc:
