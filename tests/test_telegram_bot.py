@@ -5,14 +5,15 @@ import pytest
 
 
 @pytest.fixture
-def bot(monkeypatch):
+def bot(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
     monkeypatch.setenv("TELEGRAM_ALLOWED_CHAT_IDS", "1")
     import telegram_bot
     mod = importlib.reload(telegram_bot)
     sent = []
     monkeypatch.setattr(mod, "say", lambda chat, text, **kw: sent.append(text))
-    monkeypatch.setattr(mod, "analyze", lambda chat, t, d: sent.append(f"ran {t} {d}"))
+    monkeypatch.setattr(mod, "analyze", lambda chat, t, d, lang="en": sent.append(f"ran {t} {d}" + (f" {lang}" if lang != "en" else "")))
+    monkeypatch.setattr(mod.trend, "DIR", str(tmp_path))  # the chats' /lang choices
     return mod, sent
 
 
@@ -43,7 +44,7 @@ def test_unknown_message_lists_the_commands(bot, text):
 
 def test_status_and_health_report_whether_the_job_is_alive(bot, monkeypatch):
     mod, sent = bot
-    monkeypatch.setattr(mod.trend, "health_text", lambda symbol: f"health of {symbol}")
+    monkeypatch.setattr(mod.trend, "health_text", lambda symbol, lang="en": f"health of {symbol}")
     mod.handle({"chat": {"id": 1}, "text": "/status"})
     mod.handle({"chat": {"id": 1}, "text": "/health@MyBot ETHUSDT"})
     mod.handle({"chat": {"id": 2}, "text": "/status"})  # unlisted chat: ignored
@@ -292,7 +293,7 @@ def test_analyze_falls_back_to_plain_text_when_html_rejected(bot, monkeypatch):
 
 def test_trend_command_replies_with_the_trend_state(bot, monkeypatch):
     mod, sent = bot
-    monkeypatch.setattr(mod.trend, "status_text", lambda symbol: f"state of {symbol}")
+    monkeypatch.setattr(mod.trend, "status_text", lambda symbol, lang="en": f"state of {symbol}")
     mod.handle({"chat": {"id": 1}, "text": "/trend"})
     mod.handle({"chat": {"id": 1}, "text": "/trend@MyBot ETHUSDT"})
     mod.handle({"chat": {"id": 2}, "text": "/trend"})  # unlisted chat: ignored
@@ -301,7 +302,64 @@ def test_trend_command_replies_with_the_trend_state(bot, monkeypatch):
 
 def test_paper_command_and_analysis_label(bot, monkeypatch):
     mod, sent = bot
-    monkeypatch.setattr(mod.trend, "paper_text", lambda symbol: f"book of {symbol}")
+    monkeypatch.setattr(mod.trend, "paper_text", lambda symbol, lang="en": f"book of {symbol}")
     mod.handle({"chat": {"id": 1}, "text": "/paper"})
     assert sent == ["book of BTCUSDT"]
-    assert "không phải tín hiệu giao dịch" in mod.REFERENCE and "<i>" in mod.REFERENCE
+    assert "không phải tín hiệu giao dịch" in mod.REFERENCE["vi"] and "not a trading signal" in mod.REFERENCE["en"]
+
+
+def test_lang_sets_each_chats_language_and_every_command_follows_it(bot, monkeypatch):
+    mod, sent = bot
+    monkeypatch.setattr(mod, "ALLOWED", {"1", "3"})
+    seen = []
+    for name in ("status_text", "paper_text", "health_text"):
+        monkeypatch.setattr(mod.trend, name, lambda symbol, lang="en", name=name: seen.append((name, lang)) or f"{name} {lang}")
+    mod.handle({"chat": {"id": 1}, "text": "/lang"})
+    assert sent[-1].startswith("Language: English") and "/lang vi" in sent[-1]
+    mod.handle({"chat": {"id": 1}, "text": "/lang@MyBot VI"})
+    assert sent[-1].startswith("✅ Ngôn ngữ: tiếng Việt") and mod.trend.chat_lang("1") == "vi"
+    for text in ("/trend", "/paper", "/status", "/analyze BTCUSDT 2026-10-20", "/analyze $(x)", "/help"):
+        mod.handle({"chat": {"id": 1}, "text": text})
+    assert seen == [("status_text", "vi"), ("paper_text", "vi"), ("health_text", "vi"), ("health_text", "vi")]
+    assert sent[-4:] == ["Đang phân tích BTCUSDT 2026-10-20, khoảng 3 phút...", "ran BTCUSDT 2026-10-20 vi",
+                         "Cách dùng: /analyze MÃ [YYYY-MM-DD]", mod.COMMANDS_VI]
+    mod.handle({"chat": {"id": 3}, "text": "/trend"})  # another chat keeps English
+    assert seen[-1] == ("status_text", "en")
+    mod.handle({"chat": {"id": 1}, "text": "/lang fr"})
+    assert sent[-1].startswith("Ngôn ngữ: tiếng Việt. Cách dùng") and mod.trend.chat_lang("1") == "vi"
+    mod.handle({"chat": {"id": 1}, "text": "/lang en"})
+    assert sent[-1].startswith("✅ Language: English") and mod.trend.chat_lang("1") == "en"
+    mod.handle({"chat": {"id": 2}, "text": "/lang vi"})  # an unlisted chat cannot write the file
+    assert mod.trend.chat_lang("2") == "en"
+    assert [line.split(":")[0] for line in mod.COMMANDS.splitlines()[1:]] == [
+        line.split(":")[0].replace("MÃ", "TICKER" if "analyze" in line else "SYMBOL") for line in mod.COMMANDS_VI.splitlines()[1:]]
+
+
+def test_analyze_in_vietnamese_asks_the_agents_for_vietnamese_and_labels_everything_in_it(bot, monkeypatch):
+    mod, _ = bot
+    mod = importlib.reload(mod)
+    sent, configs = [], []
+    monkeypatch.setattr(mod, "call", lambda method, **kw: sent.append((method, kw)))
+
+    class Graph:
+        def __init__(self, config, **kw):
+            configs.append(config)
+
+        def propagate(self, ticker, date, asset_type):
+            return {"final_trade_decision": DECISION, "trader_investment_plan": PLAN}, "Hold"
+
+        def save_reports(self, state, ticker, path, html):
+            Path(f"{path}/r.md").write_text("x")
+            return f"{path}/r.md"
+
+    monkeypatch.setattr(mod, "TradingAgentsGraph", Graph)
+    monkeypatch.setattr(mod, "chart", lambda ticker, date, card: b"png")
+    mod.analyze("1", "BTCUSDT", "2026-10-22", "vi")
+    mod.analyze("1", "BTCUSDT", "2026-10-22")
+    assert configs[0]["output_language"] == "Vietnamese" and configs[1]["output_language"] == "English"
+    assert mod.DEFAULT_CONFIG["output_language"] == "English"  # a Vietnamese run never leaks into the next one
+    card_vi, card_en = sent[0][1]["json"]["text"], sent[3][1]["json"]["text"]
+    assert "<b>BTCUSDT · Giữ</b>" in card_vi and "Vào lệnh <b>81400.0</b>" in card_vi and "📍 <b>Mức giá</b>" in card_vi
+    assert "🎯 <b>Ngưỡng kích hoạt</b>" in card_vi and "▲ đóng cửa trên <b>84,300</b>" in card_vi
+    assert "Báo cáo tham khảo" in card_vi and sent[2][1]["data"]["caption"].startswith("Báo cáo tham khảo")
+    assert "<b>BTCUSDT · Hold</b>" in card_en and "Reference report" in card_en and sent[5][1]["data"]["caption"].startswith("Reference")
