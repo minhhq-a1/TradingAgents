@@ -1,4 +1,6 @@
 import importlib
+import json
+import re
 from pathlib import Path
 
 import pytest
@@ -227,7 +229,7 @@ def test_analyze_sends_card_then_report(bot, monkeypatch):
             return report
 
     monkeypatch.setattr(mod, "TradingAgentsGraph", Graph)
-    monkeypatch.setattr(mod, "chart", lambda ticker, date, card: b"png")
+    monkeypatch.setattr(mod, "chart", lambda ticker, date, card, lang="en": b"png")
     mod.analyze("1", "BTCUSDT", "2026-10-22")
     (m1, kw1), (m2, kw2), (m3, kw3) = sent
     assert m1 == "sendMessage" and kw1["json"]["parse_mode"] == "HTML" and "<b>BTCUSDT · Hold</b>" in kw1["json"]["text"]
@@ -257,6 +259,12 @@ def test_chart_draws_the_card_levels(bot, monkeypatch):
     assert png.size == (1000, 560)
     assert [mod.level(x) for x in ("$135", "84,093.42", "84.5k", "~2500.0", "1.39 (trim)")] == [
         135, 84093.42, 84500, 2500, None]
+    card_vi = "▲ đóng cửa trên <b>135,5</b>\n▼ đóng cửa dưới <b>1.200</b>\nCắt lỗ <b>118.5</b>\nMục tiêu <b>n/a</b>"
+    assert Image.open(io.BytesIO(mod.chart("NVDA", "2026-09-26", card_vi, "vi"))).size == (1000, 560)
+    # Vietnamese writes 82.626 and 80.888,16; a level the program wrote ("82626.0", "118.5") reads as it does in English
+    assert [mod.level(x, "vi") for x in ("82.626", "80.888,16", "$1.200", "82626.0", "118.5", "2,5")] == [
+        82626, 80888.16, 1200, 82626, 118.5, 2.5]
+    assert mod.level("82.626") == 82.626  # an English card is read as before
 
 
 def test_analyze_falls_back_to_plain_text_when_html_rejected(bot, monkeypatch):
@@ -285,7 +293,7 @@ def test_analyze_falls_back_to_plain_text_when_html_rejected(bot, monkeypatch):
             return f"{path}/r.md"
 
     monkeypatch.setattr(mod, "TradingAgentsGraph", Graph)
-    monkeypatch.setattr(mod, "chart", lambda ticker, date, card: b"png")
+    monkeypatch.setattr(mod, "chart", lambda ticker, date, card, lang="en": b"png")
     mod.analyze("1", "BTCUSDT", "2026-10-22")
     assert [m for m, _ in sent] == ["sendMessage", "sendMessage", "sendPhoto", "sendDocument"]
     assert sent[1][1]["json"]["text"].startswith("**Rating**: Hold")
@@ -353,7 +361,7 @@ def test_analyze_in_vietnamese_asks_the_agents_for_vietnamese_and_labels_everyth
             return f"{path}/r.md"
 
     monkeypatch.setattr(mod, "TradingAgentsGraph", Graph)
-    monkeypatch.setattr(mod, "chart", lambda ticker, date, card: b"png")
+    monkeypatch.setattr(mod, "chart", lambda ticker, date, card, lang="en": b"png")
     mod.analyze("1", "BTCUSDT", "2026-10-22", "vi")
     mod.analyze("1", "BTCUSDT", "2026-10-22")
     assert configs[0]["output_language"] == "Vietnamese" and configs[1]["output_language"] == "English"
@@ -363,3 +371,31 @@ def test_analyze_in_vietnamese_asks_the_agents_for_vietnamese_and_labels_everyth
     assert "🎯 <b>Ngưỡng kích hoạt</b>" in card_vi and "▲ đóng cửa trên <b>84,300</b>" in card_vi
     assert "Báo cáo tham khảo" in card_vi and sent[2][1]["data"]["caption"].startswith("Báo cáo tham khảo")
     assert "<b>BTCUSDT · Hold</b>" in card_en and "Reference report" in card_en and sent[5][1]["data"]["caption"].startswith("Reference")
+
+
+# Real /analyze runs with output_language Vietnamese (2026-10-24, vilao); XRPUSDT is the PM's free-text
+# fallback, which heads each field on its own line and repeats the trader's FINAL TRANSACTION PROPOSAL.
+VI_RUNS = json.loads((Path(__file__).parent / "data" / "telegram_vi_decisions.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("ticker", sorted(VI_RUNS))
+def test_vietnamese_reports_give_a_short_vietnamese_card_with_their_own_levels(bot, ticker):
+    from tests.test_trend import _telegram_html
+
+    mod, _ = bot
+    run = VI_RUNS[ticker]
+    card = mod.summarize(ticker, "2026-10-24", run["decision"], run["plan"], "vi")
+    head = card.splitlines()[0]
+    assert _telegram_html(card) and len(card) < 1500 and "FINAL TRANSACTION" not in card, card
+    assert head == f"🔴 <b>{ticker} · Giảm tỷ trọng</b>"  # every run was Underweight
+    for label in ("📍 <b>Mức giá</b>", "📝 <b>Tóm tắt</b>", "🎯 <b>Ngưỡng kích hoạt</b>", "<b>Ý chính</b>", "⚠️ <i>Thiếu",
+                  "📎 Báo cáo đầy đủ đính kèm."):
+        assert label in card, (label, card)
+    assert not re.search(r"\b(?:Summary|Levels|Triggers|Key points|Gaps|close above|close below|Entry|Stop|Target)\b", card)
+    # every trigger is a level the PM wrote, copied verbatim, and the chart reads it at the right size
+    triggers = re.findall(r"đóng cửa (?:trên|dưới) <b>([^<]+)</b>", card)
+    assert len(triggers) >= 2 and all(t in run["decision"] for t in triggers)
+    entry = mod.level(re.search(r"Vào lệnh <b>([^<]+)</b>", card)[1])
+    assert all(entry / 1.5 < mod.level(t, "vi") < entry * 1.5 for t in triggers), (entry, triggers)
+    bullets = [x for x in card.splitlines() if x.startswith("• ")]
+    assert 1 <= len(bullets) <= 3 and not any(re.match(r"• (?:<b>[^<]*</b> )?(?:Vì vậy|Do đó|Đây|Ba yếu tố này)", x) for x in bullets)

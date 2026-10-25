@@ -67,11 +67,11 @@ GAP_SENTENCE = re.compile(
     r"|\b(?:was|were) not provided\b|\bunavailable\b|\b(?:data|key|feeds?|series|figures?)\b[^.]{0,40}\bmissing\b"
     r"|\b(?:is|are)(?: also)? missing\b|^no\b[^.]{0,80}\b(?:news|fundamentals)\b"
     r"|\bholdings are unknown\b"
-    r"|^thiếu\b|\bkhông có (?:sẵn )?(?:dữ liệu|số liệu|thông tin)\b|\bkhông được cung cấp\b|\bkhông khả dụng\b"
+    r"|^thiếu (?:dữ liệu|số liệu|thông tin)\b(?!\s+là\b)|\bkhông có (?:sẵn )?(?:dữ liệu|số liệu|thông tin)\b|\bkhông được cung cấp\b|\bkhông khả dụng\b"
     r"|\b(?:dữ liệu|số liệu)\b[^.]{0,40}\b(?:bị thiếu|còn thiếu|không có sẵn)\b", re.I)
-DANGLING = re.compile(r"(?:[^:.\n]{3,60}:\s+)?(?:It|This|That|They|These|Those|Điều này|Điều đó|Nó|Những điều này)\b")  # needs the sentence before it, which the card drops
+DANGLING = re.compile(r"(?:[^:.\n]{3,60}:\s+)?(?:It|This|That|They|These|Those|Điều này|Điều đó|Nó|Đây|Vì vậy|Vì thế|Do đó|(?:\w+ ){1,3}này)\b")  # needs the sentence before it, which the card drops
 # "Why not Buy", "Why the call is not Sell"; not "Why Hold and not a tilt", which argues for the call
-REJECTION = re.compile(r"why\s+(?:not\b|(?:[\w']+\s+){1,3}(?:is|are)\s+not\b)|(?:tại sao|vì sao|lý do)\s+không\b", re.I)
+REJECTION = re.compile(r"why\s+(?:not\b|(?:[\w']+\s+){1,3}(?:is|are)\s+not\b)|(?:tại sao|vì sao|lý do)\s+(?:không|chưa)\b", re.I)
 LEVELS_LABEL = re.compile(r"(?:\w+ )?(?:triggers?|levels?)\b|what would change|.{0,30}\bchanges? the (?:view|rating|call)"
                           r"|(?:các )?(?:mức giá|ngưỡng|điểm kích hoạt)\b|điều gì (?:sẽ )?(?:làm )?thay đổi"
                           r"|.{0,30}\bthay đổi (?:quan điểm|đánh giá|khuyến nghị|nhận định)", re.I)
@@ -109,7 +109,10 @@ def summarize(ticker, date, decision, trade_plan="", lang="en"):
     chosen by whole sentence, never cut; the full text goes in the attached report.
     """
     labels = "Rating|Executive Summary|Investment Thesis|Price Target|Time Horizon"
-    parts = re.split(rf"\*\*({labels})\*\*: ", decision)
+    # The PM's free-text fallback can head a field on its own line ("**Executive Summary**\n\n") and repeat the
+    # trader's last line; neither belongs on the card.
+    decision = re.sub(r"\s*FINAL TRANSACTION PROPOSAL:[^\n]*", "", decision)
+    parts = re.split(rf"\*\*({labels})\*\*:?[ \t]*\n*", decision)
     f = {k: v.strip() for k, v in zip(parts[1::2], parts[2::2], strict=True)}
     if "Rating" not in f:  # shortcut: unknown shape, send it raw; fix if render_pm_decision changes
         return html.escape(decision[:3500], quote=False)
@@ -208,7 +211,7 @@ def summarize(ticker, date, decision, trade_plan="", lang="en"):
                         else tr("Gaps: ", "Thiếu dữ liệu: ")) + items
             break
     if not gap_text:  # only the clause that names the gap: "Why not Sell: price is up, and the feed is missing."
-        clauses = [re.sub(r"^(?:and|but|so|while)\s+", "", c).rstrip(".")
+        clauses = [re.sub(r"^(?:and|but|so|while|nhưng|và|còn)\s+", "", c).rstrip(".")
                    for x in prose for c in re.split(r"[,;:]\s+(?![^(]*\))", x)]
         found = [c[0].upper() + c[1:] + "." for c in clauses if GAP_SENTENCE.search(c)]
         gap_text = tr("Gaps: ", "Thiếu dữ liệu: ") + fit(found, 254) if found else ""
@@ -217,13 +220,16 @@ def summarize(ticker, date, decision, trade_plan="", lang="en"):
     return "\n".join(out)
 
 
-def level(text):
-    """'$84,093.42' / '84.5k' / '2500.0' -> float; None for anything else."""
-    m = re.fullmatch(r"~?\$?(\d+(?:,\d{3})*(?:\.\d+)?)(k?)", text.strip())
+def level(text, lang="en"):
+    """'$84,093.42' / '84.5k' / '2500.0' -> float; None for anything else. Vietnamese writes 84.093,42."""
+    text = text.strip()
+    if lang == "vi" and re.fullmatch(r"~?\$?\d{1,3}(?:\.\d{3})*(?:,\d+)?k?", text):
+        text = text.replace(".", "").replace(",", ".")
+    m = re.fullmatch(r"~?\$?(\d+(?:,\d{3})*(?:\.\d+)?)(k?)", text)
     return m and float(m[1].replace(",", "")) * (1000 if m[2] else 1)
 
 
-def chart(ticker, date, card):
+def chart(ticker, date, card, lang="en"):
     """PNG of the last 90 daily bars with SMA 50/200, Bollinger 20/2 and the card's own levels.
 
     Prices come from load_ohlcv, which the analysis has just cached, so this makes no extra
@@ -235,9 +241,10 @@ def chart(ticker, date, card):
                    mid=close.rolling(20).mean(), sd=close.rolling(20).std())
     df = df.assign(up=df["mid"] + 2 * df["sd"], low=df["mid"] - 2 * df["sd"]).tail(90).reset_index(drop=True)
     last = float(df["Close"].iloc[-1])
-    lines = [("up" if d in UP else "down", level(v), (22, 163, 74) if d in UP else (220, 38, 38))
+    lines = [("up" if d in UP else "down", level(v, lang), (22, 163, 74) if d in UP else (220, 38, 38))
              for d, v in re.findall(r"(?:close|đóng cửa) (above|below|trên|dưới) <b>([^<]+)</b>", card)]
     named = {"Cắt lỗ": "Stop", "Mục tiêu": "Target"}  # the chart's font has no Vietnamese accents
+    # Stop and Target are numbers the program wrote ("1.234" is 1.234); only the PM's prose writes Vietnamese thousands
     lines += [(named.get(k, k), level(v), (100, 116, 139)) for k, v in re.findall(r"(Stop|Target|Cắt lỗ|Mục tiêu) <b>([^<]+)</b>", card)]
     lines = [x for x in lines if x[1] and last / 3 < x[1] < last * 3]  # a misread unit would flatten the chart
 
@@ -305,7 +312,7 @@ def analyze(chat, ticker, date, lang="en"):
     except requests.HTTPError:  # Telegram rejected the markup: still deliver the decision, as plain text
         say(chat, f"{state['final_trade_decision']}\n\n{REFERENCE[lang]}")
     try:  # the chart is extra: if it fails, the card and the report still go out
-        call("sendPhoto", data={"chat_id": chat}, files={"photo": ("chart.png", chart(ticker, date, card))})
+        call("sendPhoto", data={"chat_id": chat}, files={"photo": ("chart.png", chart(ticker, date, card, lang))})
     except Exception as exc:
         print(f"chart failed for {ticker} {date}: {exc!r}")
     # Telegram caps a message at 4096 chars, so the full report goes as a file.
