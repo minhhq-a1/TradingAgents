@@ -1,0 +1,2218 @@
+//@version=6
+// ══════════════════════════════════════════════════════════
+// ICT STRUCTURE ENGINE [WillyAlgoTrader]
+// ══════════════════════════════════════════════════════════
+// Author:  Willy | WillyAlgoTrader
+// Version: 6.3.0
+
+indicator(
+     title            = "ICT Structure Engine [WillyAlgoTrader]",
+     shorttitle       = "ICT-SE",
+     overlay          = true,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     max_boxes_count  = 500,
+     max_bars_back    = 500)
+
+// ══════════════════════════════════════════════════════════
+// 2. CONSTANTS
+// ══════════════════════════════════════════════════════════
+const string INDICATOR_VERSION = "v6.3.0"
+const string SHORT_NAME        = "ICT-SE"
+const string BRAND             = "WillyAlgoTrader"
+
+const string GRP_STRUCT = "🧭 Market Structure"
+const string GRP_HTF    = "🕐 Higher Timeframe"
+const string GRP_OB     = "🧱 Order Blocks"
+const string GRP_FVG    = "⚡ Fair Value Gaps"
+const string GRP_LIQ    = "💧 Liquidity"
+const string GRP_RBPB   = "🧩 Rejection & Propulsion Blocks"
+const string GRP_KEYS   = "🗝️ Key Levels"
+const string GRP_BIAS   = "📅 Daily Bias & Judas Swing"
+const string GRP_SD     = "📐 Standard Deviations"
+const string GRP_TIME   = "🕒 Killzones"
+const string GRP_SETUP  = "🎯 Setup (Sweep → CHoCH)"
+const string GRP_PD     = "⚖️ Premium / Discount"
+const string GRP_VISUAL = "🎨 Visual Settings"
+const string GRP_RISK   = "🛡️ Risk Management"
+const string GRP_DASH   = "📊 Dashboard"
+const string GRP_ALERT  = "🔔 Alerts"
+const string GRP_COLORS = "🎨 Colors"
+const string GRP_ADV    = "🔧 Advanced"
+
+const string O_CLOSE = "Close"
+const string O_WICK  = "Wick"
+const string O_BODY  = "Body"
+const string O_HALF  = "50%"
+const string O_TOUCH = "Touch"
+const string O_FULL  = "Full"
+const string O_EXT   = "External"
+const string O_INT   = "Internal"
+const string SL_WICK = "Wick-Anchored"
+const string SL_ZONE = "Zone-Anchored"
+const string SL_ATR  = "ATR"
+const string SL_SWEEP = "Sweep-Anchored"
+const string TP_R     = "R-Multiples"
+const string TP_LIQ   = "Liquidity"
+const string TP_SD    = "Std Deviations"
+const string BF_OFF   = "Off"
+const string BF_STR   = "With bias only"
+const string BF_NA    = "Not against bias"
+const string EA_FVG1  = "FVG first"
+const string EA_OB1   = "OB first"
+const string EA_FVG0  = "FVG only"
+const string EA_OB0   = "OB only"
+const string F_OFF    = "Off"
+const string F_PD     = "Discount / Premium"
+const string F_OTE    = "OTE (≥ 62%)"
+const string T_OFF    = "Off"
+const string T_KZ     = "Killzones"
+const string T_SB     = "Silver Bullet"
+const string SB_1     = "0300-0400"
+const string SB_2     = "1000-1100"
+const string SB_3     = "1400-1500"
+
+const int   LINE_FORWARD_BARS = 20      // длина линий сделки при входе
+const int   LINE_UPDATE_BARS  = 5       // запас продления за текущий бар
+const int   LABEL_OFFSET_BARS = 1       // отступ меток от конца линий
+const int   BE_DIM_TRANSP     = 70      // затемнение SL при BE
+const int   FORM_LEN          = 10      // длина Form-строки
+const int   MS_DAY            = 86400000
+const int   STATS_MAX_TRADES  = 10000   // предел буфера сделок по количеству (кроме предела по времени)
+const int   STATS_PRUNE_DAYS  = 31      // горизонт rolling-буфера статистики
+const int   OB_SCAN_BARS      = 300     // глубина поиска экстремума импульса
+const int   HTF_SCAN_BARS     = 200     // то же на старшем ТФ
+const int   ATR_HIST_LEN      = 305     // глубина буфера ATR: покрывает поиск OB и displacement (до 300 баров)
+const int   OB_SRC_BARS       = 2       // насколько старше экстремума ищем противоположную свечу
+const int   X_BACK_LIMIT      = 9999    // рисунок по bar_index нельзя начинать дальше 10 000 баров назад
+const int   SWEEP_NEAR_BARS   = 2       // Sweep засчитывается в рейтинг в пределах ±N баров от экстремума
+const int   PD_FORWARD_BARS   = 10
+const int   SD_FORWARD_BARS   = 40      // длина линий стандартных отклонений
+const int   SD_MAX_LEVELS     = 8       // не больше 8 уровней SD
+const float SD_MAX_MULT       = 10.0    // и не дальше 10 длин ноги
+const int   KEY_LABEL_OFFSET  = 2       // подписи ключевых уровней — правее последнего бара
+const float JUDAS_LABEL_ATR   = 0.3     // метка Judas смещена от экстремума, чтобы не наложиться на Sweep
+const int   RSI_LEN           = 14
+const int   SCORE_MAX         = 4
+const float WICK_BUFFER_ATR   = 0.25    // буфер стопа за фитилём / зоной
+const float MIN_SL_ATR        = 0.5     // минимальная дистанция стопа
+const float THIN_ZONE_ATR     = 0.1     // тоньше — берём тень вместо тела
+const float OVERLAP_SHARE     = 0.5     // доля перекрытия, при которой новая зона не создаётся
+const float OTE_NEAR          = 0.618
+const float OTE_FAR           = 0.79
+
+// ══════════════════════════════════════════════════════════
+// 3. INPUTS
+// ══════════════════════════════════════════════════════════
+// ── Market Structure ──
+swingLenInput   = input.int(10, "External Swing Length", minval = 3, maxval = 50, group = GRP_STRUCT, tooltip = "Bars on each side required to confirm an external swing (main structure, CHoCH).\n• Higher = fewer, more significant swings\n• Lower = faster, noisier structure\n• Recommended: 8–20")
+intLenInput     = input.int(3, "Internal Swing Length", minval = 2, maxval = 10, group = GRP_STRUCT, tooltip = "Bars on each side for internal (minor) swings. Must be smaller than the external length.\n• Recommended: 2–5")
+breakByInput    = input.string(O_CLOSE, "Break Confirmation", options = [O_CLOSE, O_WICK], group = GRP_STRUCT, tooltip = "What counts as a structure break.\n• Close: the candle must close beyond the swing; a wick pierce is a liquidity sweep, not a break (recommended)\n• Wick: any pierce breaks. If one bar pierces both swings, the close decides; otherwise there is no event")
+showExtInput    = input.bool(true, "Show External BOS / CHoCH", group = GRP_STRUCT, tooltip = "Draw lines and labels for external structure breaks")
+showIntInput    = input.bool(false, "Show Internal BOS / CHoCH", group = GRP_STRUCT, tooltip = "Draw internal structure breaks (dashed). Off by default to reduce noise")
+showSwingsInput = input.bool(true, "Show HH / LH / HL / LL", group = GRP_STRUCT, tooltip = "Label confirmed external swings. A label appears N bars after its swing (confirmation lag)")
+
+// ── Higher Timeframe ──
+htfOnInput   = input.bool(true, "Use Higher Timeframe", group = GRP_HTF, tooltip = "Use the HTF trend and dealing range in the zone score.\nData comes from the last CLOSED HTF bar (no repaint)")
+htfInput     = input.timeframe("240", "Higher Timeframe", group = GRP_HTF, tooltip = "Must be greater than or equal to the chart timeframe (equal = HTF ignored).\n• 5–15M chart → 1H–4H\n• 1H chart → 4H–D")
+htfLenInput  = input.int(5, "HTF Swing Length", minval = 2, maxval = 30, group = GRP_HTF, tooltip = "Swing confirmation length on the HTF. HTF breaks are always close-confirmed; ATR length and max zone height are shared with the chart.\n• Recommended: 3–8")
+htfShowInput = input.bool(true, "Show HTF Order Blocks", group = GRP_HTF, tooltip = "Draw the latest live HTF order block of each side (dashed). Visual only — HTF data still feeds the score when hidden")
+
+// ── Order Blocks ──
+obOnInput       = input.bool(true, "Show Order Blocks", group = GRP_OB, tooltip = "Detect and draw order blocks. Turning this off also removes OBs from the setup engine (setups then use FVGs only)")
+obFromInput     = input.string(O_EXT, "Build From", options = [O_EXT, O_INT], group = GRP_OB, tooltip = "Which structure break creates an order block.\n• External: fewer, stronger zones (recommended)\n• Internal: more zones, more noise")
+obEdgeInput     = input.string(O_BODY, "Proximal Edge", options = [O_BODY, O_WICK], group = GRP_OB, tooltip = "The distal edge is always the impulse extreme. The proximal edge is the body or wick of the opposite candle at the extreme (up to 2 bars older). No opposite candle — no order block.\n• Body: tighter zone (recommended)\n• Wick: wider zone, earlier touches")
+obMaxAtrInput   = input.float(1.5, "Max Zone Height (×ATR)", minval = 0.0, maxval = 5.0, step = 0.1, group = GRP_OB, tooltip = "Wider zones are trimmed from the distal edge to this height. 0 = no limit.\nThis changes zone geometry (touches, midpoint), not only visuals.\n• Recommended: 1.0–2.0")
+obNeedImbInput  = input.bool(false, "Require FVG in Impulse", group = GRP_OB, tooltip = "Create an OB only if the impulse left a fair value gap (same rule and size as displayed FVGs).\nOff by default: an FVG already adds +1 to the score")
+obMinScoreInput = input.int(0, "Min Score to Show (★)", minval = 0, maxval = 4, group = GRP_OB, tooltip = "Zone score 0–4 is a sum of factors, not a probability:\n+1 FVG in the impulse\n+1 liquidity sweep at the impulse extreme (±2 bars)\n+1 aligned with the HTF trend\n+1 zone midpoint in Discount (demand) / Premium (supply)\nWithout HTF the maximum is ★★★. A zone needed by a setup is shown even below this threshold")
+obMitigInput    = input.string(O_CLOSE, "Invalidation", options = [O_CLOSE, O_WICK, O_HALF], group = GRP_OB, tooltip = "When an OB is considered broken.\n• Close: close beyond the distal edge (recommended)\n• Wick: any pierce of the distal edge\n• 50%: close beyond the zone midpoint\nA Breaker forms only on a close beyond the whole zone")
+obBreakerInput  = input.bool(true, "Convert to Breaker", group = GRP_OB, tooltip = "A broken OB flips polarity and lives on as a Breaker Block.\nThe breaker score is recalculated from 2 factors (HTF trend, range half), max ★★")
+obMaxInput      = input.int(4, "Max Active Zones per Side", minval = 1, maxval = 20, group = GRP_OB, tooltip = "Including breakers. The oldest zones are removed first.\n• Lower = cleaner chart\n• Recommended: 3–6")
+obKeepInput     = input.bool(false, "Keep Mitigated Zones", group = GRP_OB, tooltip = "Leave broken zones on the chart in gray as history (limited by History Size)")
+obMidInput      = input.bool(true, "Show 50% Line", group = GRP_OB, tooltip = "Dotted midline (mean threshold) inside each OB, Rejection Block and Propulsion Block")
+
+// ── Fair Value Gaps ──
+fvgOnInput     = input.bool(true, "Show Fair Value Gaps", group = GRP_FVG, tooltip = "Detect and draw FVGs. Turning this off also removes FVGs from the setup engine (setups then use OBs only)")
+fvgMinAtrInput = input.float(0.2, "Min Size (×ATR)", minval = 0.0, maxval = 2.0, step = 0.05, group = GRP_FVG, tooltip = "Ignore gaps smaller than this. The same threshold defines the FVG factor of the OB score.\n• Higher = only strong displacement\n• Recommended: 0.1–0.4")
+fvgFillInput   = input.string(O_FULL, "Filled When", options = [O_TOUCH, O_HALF, O_FULL], group = GRP_FVG, tooltip = "When an FVG is removed.\n• Touch: first contact\n• 50%: midpoint of the ORIGINAL gap\n• Full: price trades through the far edge (recommended)")
+fvgShrinkInput = input.bool(true, "Shrink as Filled", group = GRP_FVG, tooltip = "Show only the unfilled part of the gap")
+fvgMaxInput    = input.int(5, "Max Active FVGs per Side", minval = 1, maxval = 30, group = GRP_FVG, tooltip = "The oldest gaps are removed first.\n• Recommended: 3–8")
+
+// ── Liquidity ──
+liqOnInput     = input.bool(true, "Show Liquidity", group = GRP_LIQ, tooltip = "Draw equal highs/lows (EQH/EQL) and sweeps. Visual only — pools, sweeps, score and setups are always calculated")
+liqLenInput    = input.int(5, "Pool Swing Length", minval = 2, maxval = 30, group = GRP_LIQ, tooltip = "Swing length for liquidity pools.\n• Lower = more pools, more sweeps\n• Recommended: 3–8")
+eqTolInput     = input.float(0.1, "Equal Tolerance (×ATR)", minval = 0.01, maxval = 1.0, step = 0.01, group = GRP_LIQ, tooltip = "A new swing joins an untaken pool if the difference is below this share of ATR. A pierced pool is consumed (stops considered taken).\n• Recommended: 0.05–0.2")
+liqSingleInput = input.bool(false, "Single Swings: Draw & Alert", group = GRP_LIQ, tooltip = "By default only equal highs/lows are drawn and alerted.\nSweeps of single swings always count for the score and setups")
+liqMaxInput    = input.int(6, "Max Active Pools per Side", minval = 1, maxval = 30, group = GRP_LIQ, tooltip = "The oldest pools are removed first")
+
+// ── Rejection & Propulsion Blocks ──
+rbOnInput      = input.bool(true, "Show Rejection Blocks", group = GRP_RBPB, tooltip = "Rejection Block: the long wick of an external swing high/low (from the body to the wick extreme). Price often rejects again at the body edge or the 50% of the wick.\nSkipped where an order block already covers the same area")
+rbWickInput    = input.float(0.5, "  └ Min Wick Share", minval = 0.3, maxval = 0.9, step = 0.05, group = GRP_RBPB, tooltip = "Minimum wick length as a share of the swing candle range.\n• Higher = only pronounced rejections\n• Recommended: 0.4–0.6")
+rbMaxInput     = input.int(3, "  └ Max per Side", minval = 1, maxval = 10, group = GRP_RBPB, tooltip = "Active rejection blocks per side; the oldest are removed first")
+pbOnInput      = input.bool(true, "Show Propulsion Blocks", group = GRP_RBPB, tooltip = "Propulsion Block: an opposite-colored candle that taps an order block, after which price closes beyond that candle (propulsion). The candle range becomes a new, tighter zone")
+pbConfirmInput = input.int(3, "  └ Confirm Within (bars)", minval = 1, maxval = 10, group = GRP_RBPB, tooltip = "Price must close beyond the tapping candle within this many bars")
+pbMaxInput     = input.int(3, "  └ Max per Side", minval = 1, maxval = 10, group = GRP_RBPB, tooltip = "Active propulsion blocks per side; the oldest are removed first")
+
+// ── Key Levels ──
+keyDayInput  = input.bool(true, "Previous Day High / Low", group = GRP_KEYS, tooltip = "PDH / PDL as liquidity pools (intraday charts only). Their sweeps arm setups and count for the score; untaken levels serve as liquidity targets.\nDay boundary follows the exchange session of the symbol")
+keyWeekInput = input.bool(true, "Previous Week High / Low", group = GRP_KEYS, tooltip = "PWH / PWL as liquidity pools (charts below 1W)")
+sessLiqInput = input.bool(true, "Session Highs / Lows", group = GRP_KEYS, tooltip = "When a killzone session ends, its high and low become liquidity pools (e.g. Asian range high/low swept in London or New York)")
+keyMoInput   = input.bool(true, "Midnight Open", group = GRP_KEYS, tooltip = "Line at the 00:00 open in the killzone timezone. Reference level: in a bullish day ICT prefers buying below it, in a bearish day selling above it.\nShown only when a bar opens exactly at 00:00 (not on RTH-only charts or timeframes not aligned to midnight); without it the Judas Swing is not evaluated that day")
+
+// ── Killzones ──
+kzShowInput     = input.bool(true, "Show Killzones", group = GRP_TIME, tooltip = "Draw each enabled killzone as a box spanning its high and low. Works on intraday charts up to 1H")
+asiaOnInput     = input.bool(true, "Asian", inline = "kzA", group = GRP_TIME)
+asiaSessInput   = input.session("2000-0000", "", inline = "kzA", group = GRP_TIME, tooltip = "Asian killzone (default 20:00–00:00 New York)")
+lonOnInput      = input.bool(true, "London", inline = "kzL", group = GRP_TIME)
+lonSessInput    = input.session("0200-0500", "", inline = "kzL", group = GRP_TIME, tooltip = "London killzone (default 02:00–05:00 New York)")
+nyamOnInput     = input.bool(true, "NY AM", inline = "kzN", group = GRP_TIME)
+nyamSessInput   = input.session("0700-1000", "", inline = "kzN", group = GRP_TIME, tooltip = "New York AM killzone (default 07:00–10:00 New York)")
+nypmOnInput     = input.bool(true, "NY PM", inline = "kzP", group = GRP_TIME)
+nypmSessInput   = input.session("1330-1600", "", inline = "kzP", group = GRP_TIME, tooltip = "New York PM killzone (default 13:30–16:00 New York)")
+kzTzInput       = input.string("America/New_York", "Timezone", group = GRP_TIME, tooltip = "Timezone of the killzone times and Midnight Open. ICT uses New York time (America/New_York)")
+timeFilterInput = input.string(T_KZ, "Setup Time Filter", options = [T_OFF, T_KZ, T_SB], group = GRP_TIME, tooltip = "When a setup may be armed (CHoCH bar):\n• Killzones: inside any enabled killzone (recommended)\n• Silver Bullet: 03–04, 10–11, 14–15 New York only\n• Off: any time\nAutomatically off on timeframes above 1H")
+showSbInput     = input.bool(false, "Highlight Silver Bullet", group = GRP_TIME, tooltip = "Faint background during the Silver Bullet hours")
+
+// ── Daily Bias & Judas Swing ──
+biasOnInput     = input.bool(true, "Daily Bias", group = GRP_BIAS, tooltip = "Daily draw on liquidity from the previous day (intraday charts):\n• Closed above the prior day high → Bullish (draw on PDH)\n• Closed below the prior day low → Bearish (draw on PDL)\n• Swept the prior high but closed back inside → Bearish\n• Swept the prior low but closed back inside → Bullish\n• Swept both sides and closed inside (outside day) → Neutral\n• Otherwise (inside day) → Neutral\nShown in the dashboard and on the Midnight Open label")
+biasFilterInput = input.string(BF_OFF, "  └ Setup Filter", options = [BF_OFF, BF_STR, BF_NA], group = GRP_BIAS, tooltip = "Restrict setups by the daily bias.\n• Off: no restriction\n• With bias only: longs only on bullish days, shorts only on bearish days (neutral days: none)\n• Not against bias: neutral days allow both sides")
+judasOnInput    = input.bool(true, "Judas Swing", group = GRP_BIAS, tooltip = "False move against the daily bias inside the Judas window: price trades beyond the Midnight Open, then closes back across it. Marked once per day. Requires Daily Bias and an intraday chart up to 1H")
+judasSessInput  = input.session("0000-0500", "  └ Window", group = GRP_BIAS, tooltip = "Time window for the Judas Swing (killzone timezone). Default 00:00–05:00 New York (midnight to end of London)")
+judasSweepInput = input.bool(true, "  └ Require Asian Range Sweep", group = GRP_BIAS, tooltip = "The false move must also take the Asian session low (bullish day) or high (bearish day). Ignored when the Asian killzone is disabled. If no Asian range from the last 24 hours is available, the Judas Swing is not confirmed")
+
+// ── Standard Deviations ──
+sdShowInput   = input.bool(true, "Show SD Projections", group = GRP_SD, tooltip = "Project standard deviations of the setup leg (sweep extreme → CHoCH extreme) when a setup is armed: −1, −2, −2.5 … beyond the leg. ICT uses them as targets.\nFar levels widen the price scale — keep the list short")
+sdLevelsInput = input.string("1, 2, 2.5", "  └ Levels", group = GRP_SD, tooltip = "Comma-separated multiples of the leg, e.g. '1, 2, 2.5, 4' (up to 8 levels, each up to 10). Duplicates are ignored, invalid values stop the script with an error.\nThese are ICT leg projections, not statistical sigma. Also used by TP Mode 'Std Deviations'")
+
+// ── Setup ──
+setupOnInput  = input.bool(true, "Enable Setups", group = GRP_SETUP, tooltip = "Setup = liquidity sweep → CHoCH the other way → first retest of this impulse's OB/FVG.\nThe close of the retest bar is the BUY/SELL signal that opens a trade")
+setupWinInput = input.int(20, "Sweep → CHoCH Window (bars)", minval = 1, maxval = 100, group = GRP_SETUP, tooltip = "CHoCH must happen within this many bars after the sweep (same bar allowed).\n• Lower = stricter, fewer setups\n• Recommended: 10–30")
+setupTtlInput = input.int(30, "Wait for Retest (bars)", minval = 1, maxval = 300, group = GRP_SETUP, tooltip = "How long an armed setup waits for its first retest before it expires.\n• Recommended: 20–60")
+dispReqInput     = input.bool(true, "Require Displacement", group = GRP_SETUP, tooltip = "Arm a setup only if the Sweep → CHoCH leg left a fair value gap (same rule as displayed FVGs). ICT: a market structure shift counts only when made with displacement")
+entryArrayInput  = input.string(EA_FVG1, "Entry PD Array", options = [EA_FVG1, EA_OB1, EA_FVG0, EA_OB0], group = GRP_SETUP, tooltip = "Which zone of the impulse is used for the retest entry.\n• FVG first: the displacement FVG, else the OB (ICT 2022 model, recommended)\n• OB first: the order block, else the FVG\n• FVG only / OB only")
+entryFilterInput = input.string(F_PD, "Entry Location Filter", options = [F_OFF, F_PD, F_OTE], group = GRP_SETUP, tooltip = "Where the entry close must be, else the setup is skipped.\n• Discount / Premium: longs below, shorts above equilibrium of the dealing range (HTF range if HTF is on). Recommended\n• OTE: at least 62% retracement of the Sweep → CHoCH leg\n• Off: no location filter\nWhile the filter has no data yet (e.g. no HTF dealing range), entries are skipped with the reason in the info alert")
+
+// ── Premium / Discount ──
+pdOnInput  = input.bool(true, "Show Premium / Discount", group = GRP_PD, tooltip = "Shade the current dealing range (latest external swings): above equilibrium = Premium, below = Discount. Visual only")
+oteOnInput = input.bool(true, "Show OTE (62–79%)", group = GRP_PD, tooltip = "Optimal Trade Entry retracement band in the direction of the external trend. Shown together with Premium / Discount")
+
+// ── Visual ──
+themeInput          = input.string("Auto", "Theme", options = ["Auto", "Dark", "Light"], group = GRP_VISUAL, tooltip = "Chart color theme.\n• Auto: detects from chart background\n• Dark: optimized for dark backgrounds\n• Light: optimized for light/white backgrounds")
+showSignalsInput    = input.bool(true, "Show Buy/Sell Labels", group = GRP_VISUAL, tooltip = "Mark every trade entry with ▲ BUY / ▼ SELL (score, RSI, SL and TP1 in the tooltip)")
+showSetupLblInput   = input.bool(true, "Show Setup Labels", group = GRP_VISUAL, tooltip = "Mark the bar where a setup is armed (Sweep → CHoCH)")
+signalFontSizeInput = input.string("Small", "Signal Label Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = GRP_VISUAL, tooltip = "Font size for BUY/SELL and setup labels")
+labelFontSizeInput  = input.string("Small", "SL/TP Label Font Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = GRP_VISUAL, tooltip = "Font size for Entry / SL / TP labels")
+textFontSizeInput   = input.string("Small", "Structure & Zone Text Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = GRP_VISUAL, tooltip = "Font size for BOS/CHoCH, swing, sweep and zone texts. Internal structure renders one step smaller")
+showZoneTextInput   = input.bool(true, "Show Zone Labels", group = GRP_VISUAL, tooltip = "Text inside zones (Bull OB ★★, RB, PB, Breaker). Setup zones keep their SETUP label")
+showSweepLblInput   = input.bool(true, "Show Sweep Labels", group = GRP_VISUAL, tooltip = "Mark liquidity sweeps on the chart. Sweeps are still detected for setups and alerts when hidden")
+zoneTranspInput     = input.int(85, "Zone Transparency", minval = 70, maxval = 95, group = GRP_VISUAL, tooltip = "Fill transparency of OB/FVG zones.\n• 80–90 keeps candles readable (recommended)")
+showWatermarkInput  = input.bool(true, "Show Watermark", group = GRP_VISUAL, tooltip = "Display 'WillyAlgoTrader' watermark on chart")
+
+// ── Risk Management ──
+riskPresetInput      = input.string("Balanced", "Risk Preset", options = ["Conservative", "Balanced", "Aggressive", "Scalping", "Custom"], group = GRP_RISK, tooltip = "Quick risk presets (the SL part applies to ATR mode; Wick and Zone modes anchor the stop to structure):\n• Conservative: SL 2.5×ATR, TP 1R/2R/4R\n• Balanced: SL 1.5×ATR, TP 1R/2R/3R\n• Aggressive: SL 1.0×ATR, TP 1.5R/2.5R/4R\n• Scalping: SL 0.8×ATR, TP 0.8R/1.5R/2R\n• Custom: use the manual multipliers below")
+slModeInput          = input.string(SL_WICK, "SL Mode", options = [SL_WICK, SL_ZONE, SL_SWEEP, SL_ATR], group = GRP_RISK, tooltip = "How the stop-loss is placed at entry (all structure modes add 0.25×ATR buffer, min distance 0.5×ATR):\n• Wick-Anchored: beyond the signal bar's wick. Default\n• Zone-Anchored: beyond the setup zone's distal edge\n• Sweep-Anchored: beyond the extreme of the liquidity sweep (ICT placement, widest)\n• ATR: fixed SL Multiplier × ATR from entry")
+tpModeInput          = input.string(TP_R, "TP Mode", options = [TP_R, TP_LIQ, TP_SD], group = GRP_RISK, tooltip = "• R-Multiples: TP1–TP3 at the multipliers of the actual SL distance\n• Liquidity: TP1 stays at its R multiple; TP2 and TP3 go to the next untaken opposing liquidity (EQH/EQL, swings, PDH/PDL, PWH/PWL, session H/L) beyond the previous target\n• Std Deviations: TP1 stays at its R multiple; TP2 and TP3 go to the next SD projections of the setup leg\nMissing levels fall back to R-multiples")
+atrLenRiskInput      = input.int(14, "ATR Length (SL)", minval = 5, maxval = 50, group = GRP_RISK, tooltip = "ATR period for stop-loss calculation.\n• 14 = standard\n• Lower = tighter stops, more stops hit\n• Higher = wider stops, fewer stops hit")
+slMultInput          = input.float(1.5, "SL Multiplier (×ATR)", minval = 0.5, maxval = 5.0, step = 0.1, group = GRP_RISK, tooltip = "Custom preset: stop distance as a multiple of ATR (ATR mode).\n• Scalping: 0.8–1.2 | Swing: 1.5–2.5")
+tp1MultInput         = input.float(1.0, "TP1 Multiplier (×Risk)", minval = 0.5, maxval = 5.0, step = 0.1, group = GRP_RISK, tooltip = "Custom preset: take-profit 1 as a multiple of the actual SL distance.\n1.0 = 1:1 Risk:Reward")
+tp2MultInput         = input.float(2.0, "TP2 Multiplier (×Risk)", minval = 1.0, maxval = 10.0, step = 0.1, group = GRP_RISK, tooltip = "Custom preset: take-profit 2 as a multiple of risk.\n2.0 = 1:2 Risk:Reward")
+tp3MultInput         = input.float(3.0, "TP3 Multiplier (×Risk)", minval = 1.5, maxval = 15.0, step = 0.1, group = GRP_RISK, tooltip = "Custom preset: take-profit 3 as a multiple of risk. TP3 closes the trade.\n3.0 = 1:3 Risk:Reward")
+beInput              = input.bool(true, "Break-Even After TP1", group = GRP_RISK, tooltip = "Move stop-loss to entry price once TP1 is reached.\nPositions stopped at break-even after TP1 count as wins")
+beOffsetInput        = input.float(0.0, "BE Offset (×ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = GRP_RISK, tooltip = "Break-even stop offset beyond entry, in ATR at entry.\n0 = exactly at entry (recommended).\nThe offset is capped at half the actual distance from entry to TP1 and rounded to the tick toward entry.\nIf the TP1 bar already closes beyond the break-even level, the trade is closed at that close instead of placing a stop on the wrong side of price")
+showSlTpInput        = input.bool(true, "Show SL/TP Lines", group = GRP_RISK, tooltip = "Draw entry, stop-loss and take-profit lines. Lines stay on the chart after the trade closes and are replaced at the next entry")
+showSlTpLabelsInput  = input.bool(true, "Show SL/TP Labels", group = GRP_RISK, tooltip = "Price labels at the end of the SL/TP lines")
+showPctOnLabelsInput = input.bool(true, "Show % Distance on Labels", group = GRP_RISK, tooltip = "Append % distance from entry to SL/TP labels,\ne.g. 'SL 1.2300 (-0.36%)'")
+entryLineStyleInput  = input.string("Dotted", "Entry Line Style", options = ["Solid", "Dashed", "Dotted"], group = GRP_RISK, tooltip = "Entry is a reference, not an action level — keep it subtle")
+slLineStyleInput     = input.string("Solid", "SL Line Style", options = ["Solid", "Dashed", "Dotted"], group = GRP_RISK, tooltip = "Style of the stop-loss line (width 2)")
+tpLineStyleInput     = input.string("Dashed", "TP Line Style", options = ["Solid", "Dashed", "Dotted"], group = GRP_RISK, tooltip = "Style for TP1/TP2/TP3. On hit, a TP line turns solid teal")
+
+// ── Dashboard ──
+showDashInput      = input.bool(true, "Show Dashboard", group = GRP_DASH, tooltip = "Show the dashboard table")
+dashPosInput       = input.string("Top Right", "Dashboard Position", options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right", "Middle Right"], group = GRP_DASH, tooltip = "Chart corner for the dashboard")
+dashFontSizeInput  = input.string("Small", "Dashboard Font Size", options = ["Small", "Normal", "Large", "Huge"], group = GRP_DASH, tooltip = "Font size for the dashboard table. Section dividers and the version footer render one step smaller to preserve hierarchy")
+showMarketSecInput = input.bool(true, "  ├ Market section", group = GRP_DASH, tooltip = "Trend, trend age, HTF bias, range position, position state, last signal, timeframe")
+showIctSecInput    = input.bool(true, "  ├ ICT section", group = GRP_DASH, tooltip = "Active zones, FVGs, nearest demand/supply, setup status")
+showTradeSecInput  = input.bool(true, "  ├ Trade section", group = GRP_DASH, tooltip = "Entry, SL, TP1–3, R:R and SL distance of the open trade")
+showStatsSecInput  = input.bool(true, "  └ Stats section", group = GRP_DASH, tooltip = "Trades, wins, losses, win rate and form of closed trades. Session statistics — not a backtest")
+statsPeriodInput   = input.string("All-Time", "Win Rate Period", options = ["24 Hours", "30 Days", "All-Time"], group = GRP_DASH, tooltip = "Time window for the Stats section (Trades / Wins / Losses / Win rate):\n• 24 Hours: trades closed in the last 24h (relative to the latest bar)\n• 30 Days: trades closed in the last 30 days\n• All-Time: all trades on the loaded chart history\nForm strip always shows the last trades regardless of period.\nStats are recalculated from the loaded chart history on every reload; trade times are bar-close times")
+
+// ── Alerts ──
+webhookInput    = input.bool(false, "Webhook JSON Format", group = GRP_ALERT, tooltip = "Send alerts as JSON for webhook integrations.\nCreate the alert with condition 'Any alert() function call'")
+alSlRevInput    = input.bool(true, "Alert on SL Hit & Reversal", group = GRP_ALERT, tooltip = "SL hit, break-even stop-out and reversal alerts")
+alTpBeInput     = input.bool(true, "Alert on TP & Break-Even", group = GRP_ALERT, tooltip = "TP1 / TP2 / TP3 hits and the break-even move")
+alStructInput   = input.bool(true, "Alert on BOS / CHoCH", group = GRP_ALERT, tooltip = "Info alert on external structure breaks")
+alSetupInput    = input.bool(true, "Alert on Setup Armed / Cancelled", group = GRP_ALERT, tooltip = "Info alert when a Sweep → CHoCH setup is armed or cancelled (with reason). Entries always alert")
+alObInput       = input.bool(true, "Alert on First OB Touch", group = GRP_ALERT, tooltip = "Info alert on the first touch of an OB / Breaker that is not a setup zone")
+alMinScoreInput = input.int(2, "  └ Min Score (★)", minval = 0, maxval = 4, group = GRP_ALERT, tooltip = "Only zones with at least this score alert on touch. Breakers score at most ★★")
+alFvgInput      = input.bool(false, "Alert on New FVG", group = GRP_ALERT, tooltip = "Info alert on every new FVG (can be frequent)")
+alSweepInput    = input.bool(true, "Alert on Liquidity Sweep", group = GRP_ALERT, tooltip = "Info alert when equal highs/lows (or single swings, if enabled) are swept")
+alRbPbInput     = input.bool(false, "Alert on RB / PB", group = GRP_ALERT, tooltip = "Info alert on new propulsion blocks and on first touches of rejection / propulsion blocks")
+alJudasInput    = input.bool(true, "Alert on Judas Swing", group = GRP_ALERT, tooltip = "Info alert when a Judas Swing is confirmed")
+alBiasInput     = input.bool(false, "Alert on Daily Bias", group = GRP_ALERT, tooltip = "Info alert with the daily bias at the start of each trading day")
+
+// ── Colors ──
+bullColorInput    = input.color(#00E676, "Bull", inline = "clr", group = GRP_COLORS)
+bearColorInput    = input.color(#FF5252, "Bear", inline = "clr", group = GRP_COLORS, tooltip = "Signal colors: BUY/SELL label backgrounds and demand/supply zones")
+fvgBullColorInput = input.color(#2962FF, "FVG Bull", inline = "fvg", group = GRP_COLORS)
+fvgBearColorInput = input.color(#FF9800, "FVG Bear", inline = "fvg", group = GRP_COLORS, tooltip = "Fair value gap fills")
+oteColorInput     = input.color(#F9A825, "OTE", group = GRP_COLORS, tooltip = "Optimal Trade Entry band")
+rbBullColorInput  = input.color(#00BFA5, "RB Bull", inline = "rb", group = GRP_COLORS)
+rbBearColorInput  = input.color(#F06292, "RB Bear", inline = "rb", group = GRP_COLORS, tooltip = "Rejection Block fills. Propulsion Blocks use the OB colors with a dotted border")
+kzAsiaColorInput  = input.color(#9C27B0, "Asia", inline = "kzc", group = GRP_COLORS)
+kzLonColorInput   = input.color(#3F51B5, "London", inline = "kzc", group = GRP_COLORS)
+kzNyamColorInput  = input.color(#795548, "NY AM", inline = "kzc", group = GRP_COLORS)
+kzNypmColorInput  = input.color(#607D8B, "NY PM", inline = "kzc", group = GRP_COLORS, tooltip = "Killzone box colors. Defaults avoid the hues used by zones and signals")
+
+// ── Advanced ──
+atrLenInput  = input.int(50, "Zone ATR Length", minval = 5, maxval = 200, group = GRP_ADV, tooltip = "ATR period for all zone thresholds (FVG size, OB height, equal tolerance, HTF zones).\n• Higher = steadier thresholds")
+histMaxInput = input.int(150, "History Size", minval = 20, maxval = 300, group = GRP_ADV, tooltip = "How many historical labels and retired lines/zones are kept (BOS/CHoCH, swings, sweeps, signals). Older ones are deleted so TradingView never evicts active zones")
+
+// ── Risk presets ──
+[effSLMult, effTP1m, effTP2m, effTP3m] = switch riskPresetInput
+    "Conservative" => [2.5, 1.0, 2.0, 4.0]
+    "Aggressive"   => [1.0, 1.5, 2.5, 4.0]
+    "Scalping"     => [0.8, 0.8, 1.5, 2.0]
+    "Custom"       => [slMultInput, tp1MultInput, tp2MultInput, tp3MultInput]
+    =>                [1.5, 1.0, 2.0, 3.0]
+
+// ══════════════════════════════════════
+// INPUT VALIDATION
+// ══════════════════════════════════════
+if effTP1m >= effTP2m or effTP2m >= effTP3m
+    runtime.error("Invalid TP multipliers: required TP1 < TP2 < TP3")
+if effSLMult <= 0
+    runtime.error("SL Multiplier must be greater than 0")
+if htfOnInput and timeframe.in_seconds(htfInput) < timeframe.in_seconds()
+    runtime.error("Higher Timeframe must be greater than or equal to chart timeframe")
+if intLenInput >= swingLenInput
+    runtime.error("Internal Swing Length must be smaller than External Swing Length")
+
+// ══════════════════════════════════════════════════════════
+// 4. THEME DETECTION & COLORS
+// ══════════════════════════════════════════════════════════
+isDark = switch themeInput
+    "Dark"  => true
+    "Light" => false
+    =>         0.299 * color.r(chart.bg_color) + 0.587 * color.g(chart.bg_color) + 0.114 * color.b(chart.bg_color) < 128   // Auto: яркость фона, а не только красный канал
+
+// ── Тексты ──
+TEXT_COLOR      = isDark ? #E0E0E0 : #1A1A1A
+TEXT_MUTED      = isDark ? color.new(#9E9E9E, 0) : color.new(#666666, 0)   // v6.2.0: #757575 → #666666 (≥ 4.5:1 и на строке панели)
+// Отклонение от стандарта (v6.0.1): светлые значения затемнены до контраста ≥ 4.5:1 на белом и на строке панели.
+BULL_TEXT       = isDark ? #00E676 : #007E33
+BEAR_TEXT       = isDark ? #FF5252 : #D32F2F
+NEUTRAL_TEXT    = isDark ? #FFEB3B : #A15C00
+BULL_LABEL_TEXT = #004D25
+BEAR_LABEL_TEXT = #FFFFFF
+// Подложка медвежьих меток: на светлой теме дефолтный #FF5252 с белым текстом даёт 3.2:1 — берём #D32F2F (5.0:1).
+// Пользовательский цвет Bear не подменяется.
+SELL_LABEL_BG   = bearColorInput == #FF5252 ? #D32F2F : bearColorInput   // v6.2.0: на обеих темах (подложка своя, фон графика не влияет)
+
+// ── Dashboard / таблицы ──
+TABLE_BG       = isDark ? color.new(#131722, 5) : color.new(#FFFFFF, 5)
+TABLE_BORDER   = isDark ? color.new(#2A2E39, 0) : color.new(#D0D0D0, 0)
+TABLE_ROW_ALT  = isDark ? color.new(#1C2030, 0) : color.new(#F0F4F8, 0)
+HEADER_BG      = isDark ? color.new(#0D47A1, 0) : color.new(#1565C0, 0)
+HEADER_BG_BULL = color.new(#0F6E56, 0)
+HEADER_BG_BEAR = color.new(#A32D2D, 0)
+HEADER_TEXT    = #FFFFFF
+
+// ── Линии / вспомогательные ──
+LINE_SUBTLE = isDark ? color.new(#666666, 0) : color.new(#999999, 0)
+KEY_COLOR   = isDark ? color.new(#B0BEC5, 20) : color.new(#546E7A, 20)
+SD_COLOR    = isDark ? color.new(#CE93D8, 0) : color.new(#7B1FA2, 0)
+// Янтарный для текста без подложки: #F57F17 на белом даёт ~2.9:1, #BF360C — ~5.6:1 (WCAG AA)
+AMBER_TEXT  = isDark ? #FFD54F : #BF360C
+JUDAS_BG    = isDark ? #FFB300 : #FFA000
+JUDAS_TEXT  = #1A1A1A
+DONE_COLOR  = isDark ? color.new(#666666, 85) : color.new(#999999, 85)
+WM_COLOR    = isDark ? color.new(#FFFFFF, 80) : color.new(#000000, 80)
+TRANSPARENT = color.new(#000000, 100)
+
+// ── Risk-палитра (приглушённая, theme-aware) ──
+SL_COLOR       = isDark ? color.new(#E57373, 0) : color.new(#B71C1C, 0)
+TP1_COLOR      = isDark ? color.new(#66BB6A, 30) : color.new(#388E3C, 30)
+TP2_COLOR      = isDark ? color.new(#66BB6A, 40) : color.new(#388E3C, 40)
+TP3_COLOR      = isDark ? color.new(#66BB6A, 0) : color.new(#388E3C, 0)
+ENTRY_COLOR    = isDark ? color.new(#5C8AAE, 0) : color.new(#34495E, 0)
+TP_LABEL_COLOR = isDark ? color.new(#66BB6A, 0) : color.new(#2E7D32, 0)   // v6.2.0: белый текст на #388E3C давал 4.1:1
+TP_HIT_COLOR   = isDark ? color.new(#4DB6AC, 0) : color.new(#00695C, 0)
+BE_COLOR       = isDark ? color.new(#FFA726, 0) : color.new(#C43E00, 0)
+LABEL_TEXT     = isDark ? #1A1A1A : #FFFFFF
+
+// ══════════════════════════════════════════════════════════
+// 5. FUNCTIONS
+// ══════════════════════════════════════════════════════════
+// ── Утилиты ──
+sizeFromString(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Normal" ? size.normal : s == "Large" ? size.large : s == "Huge" ? size.huge : size.small
+
+sizeDownFromString(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.tiny : s == "Normal" ? size.small : s == "Large" ? size.normal : s == "Huge" ? size.large : size.tiny
+
+lineStyleFromString(string s) =>
+    s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+
+// Направленное округление к шагу цены (эпсилон гасит погрешность деления float).
+floorTick(float v) => math.floor(v / syminfo.mintick + 1e-9) * syminfo.mintick
+ceilTick(float v) => math.ceil(v / syminfo.mintick - 1e-9) * syminfo.mintick
+
+safeDiv(float num, float den, float fallback = 0.0) =>
+    den != 0 and not na(num) and not na(den) ? num / den : fallback
+
+fmtPrice(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+formatPctFromEntry(float level, float entry) =>
+    string res = ""
+    if showPctOnLabelsInput and not na(level) and not na(entry) and entry != 0
+        float  pct  = (level - entry) / entry * 100.0
+        string sign = pct >= 0 ? "+" : ""
+        res := " (" + sign + str.tostring(pct, "#.##") + "%)"
+    res
+
+buildGauge(float value, float maxVal, int width) =>
+    string result = ""
+    int filled = maxVal <= 0 ? 0 : math.round(math.min(width, math.max(0.0, value / maxVal * width)))
+    for i = 0 to width - 1
+        result += i < filled ? "▰" : "▱"
+    result
+
+periodStats(array<int> tms, array<bool> wns, int cutoff) =>
+    int w = 0
+    int l = 0
+    int n = array.size(tms)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(tms, i) >= cutoff
+                if array.get(wns, i)
+                    w += 1
+                else
+                    l += 1
+    [w, l]
+
+arrow(int dir) => dir > 0 ? "▲" : "▼"
+stars(int s) => str.repeat("★", s) + str.repeat("☆", SCORE_MAX - s)
+trendWord(int t) => t > 0 ? "Bullish" : t < 0 ? "Bearish" : "Neutral"
+trendTextColor(int t) => t > 0 ? BULL_TEXT : t < 0 ? BEAR_TEXT : TEXT_MUTED
+evText(int ev) => (math.abs(ev) == 2 ? "CHoCH " : "BOS ") + arrow(ev)
+clampX(int x) => math.max(x, bar_index - X_BACK_LIMIT)
+// Отсутствующая цена передаётся как null, а не 0: ноль — допустимая цена и не должен подменять «нет данных».
+jsonEvent(string ev, int dir, float price) => '{"event":"' + ev + '","ticker":"' + syminfo.tickerid + '","tf":"' + timeframe.period + '","dir":"' + (dir > 0 ? "long" : "short") + '","price":' + (na(price) ? "null" : str.tostring(price, format.mintick)) + '}'
+
+// Размеры шрифтов (из inputs)
+signalSize  = sizeFromString(signalFontSizeInput)
+labelSize   = sizeFromString(labelFontSizeInput)
+textSize    = sizeFromString(textFontSizeInput)
+textSizeSub = sizeDownFromString(textFontSizeInput)
+dashFont    = sizeFromString(dashFontSizeInput)
+dashFontSub = sizeDownFromString(dashFontSizeInput)
+
+// ── Очереди исторических рисунков: ограничены histMaxInput, активные зоны в них не попадают ──
+var array<line>  histLines  = array.new<line>()
+var array<label> histLabels = array.new<label>()
+var array<box>   histBoxes  = array.new<box>()
+
+keepLine(line l) =>
+    histLines.push(l)
+    if histLines.size() > histMaxInput
+        histLines.shift().delete()
+
+keepLabel(label l) =>
+    histLabels.push(l)
+    if histLabels.size() > histMaxInput
+        histLabels.shift().delete()
+
+keepBox(box b) =>
+    histBoxes.push(b)
+    if histBoxes.size() > histMaxInput
+        histBoxes.shift().delete()
+
+// ── Dashboard helpers (zebra по номеру строки) ──
+dashRow(table t, int row, string k, string v, color vc, string tip) =>
+    color bg = row % 2 == 0 ? TABLE_BG : TABLE_ROW_ALT
+    table.cell(t, 0, row, k, text_color = TEXT_MUTED, text_size = dashFont, bgcolor = bg, text_halign = text.align_left, tooltip = tip)
+    table.cell(t, 1, row, v, text_color = vc, text_size = dashFont, bgcolor = bg, text_halign = text.align_right)
+
+dashDivider(table t, int row, string txt) =>
+    table.cell(t, 0, row, txt, text_color = TEXT_MUTED, bgcolor = TABLE_ROW_ALT, text_size = dashFontSub, text_halign = text.align_center)
+    table.merge_cells(t, 0, row, 1, row)
+
+// ── Типы ──
+type Pivot
+    float price
+    int   idx
+    bool  taken = false
+
+type Structure
+    Pivot hi
+    Pivot lo
+    int   trend = 0
+
+type Zone
+    box   bx
+    line  mid
+    float top
+    float btm
+    float eq
+    int   dir
+    int   born
+    bool  fvg     = false
+    int   score   = 0
+    bool  breaker = false
+    bool  touched = false
+    bool  setup   = false
+    bool  entered = false
+    bool  alive   = true
+    int   kind    = 0       // 0 OB, 1 FVG, 2 Rejection Block, 3 Propulsion Block
+    int   pbBar             // кандидат Propulsion Block: бар касания OB
+    float pbTop
+    float pbBtm
+
+type Pool
+    line  ln
+    label lb
+    float price
+    int   side
+    int   hits = 1
+
+// Ключевой уровень ликвидности (PDH/PDL, PWH/PWL, хай/лой сессии)
+type KeyLvl
+    string name
+    float  price
+    int    side
+    int    start
+    bool   taken = false
+    line   ln
+    label  lb
+
+// Killzone: диапазон текущей или последней сессии
+type Sess
+    string name
+    box    bx
+    float  hi
+    float  lo
+    int    start
+    bool   active = false
+    int    startT           // время начала: по нему видно, к какой дате относится диапазон
+
+// Отслеживает сессию; возвращает [началась на этом баре, закончилась на этом баре].
+method track(Sess s, bool inS) =>
+    bool started = inS and not s.active
+    bool ended   = s.active and not inS
+    if started
+        s.start  := bar_index
+        s.startT := time
+        s.hi     := high
+        s.lo     := low
+    else if inS
+        s.hi := math.max(s.hi, high)
+        s.lo := math.min(s.lo, low)
+    s.active := inS
+    [started, ended]
+
+// ── Структура: обновляет свинги и возвращает событие ±1 BOS, ±2 CHoCH, 0 — ничего ──
+method step(Structure s, float ph, float pl, int len, bool labels, bool byClose) =>
+    if not na(ph)
+        if labels and not na(s.hi)
+            keepLabel(label.new(bar_index - len, ph, ph > s.hi.price ? "HH" : "LH", color = TRANSPARENT, textcolor = TEXT_MUTED, style = label.style_label_down, size = textSize))
+        s.hi := Pivot.new(ph, bar_index - len)
+    if not na(pl)
+        if labels and not na(s.lo)
+            keepLabel(label.new(bar_index - len, pl, pl < s.lo.price ? "LL" : "HL", color = TRANSPARENT, textcolor = TEXT_MUTED, style = label.style_label_up, size = textSize))
+        s.lo := Pivot.new(pl, bar_index - len)
+    bool upB = not na(s.hi) and not s.hi.taken and (byClose ? close : high) > s.hi.price
+    bool dnB = not na(s.lo) and not s.lo.taken and (byClose ? close : low) < s.lo.price
+    if upB and dnB
+        // Только в режиме «Wick»: порядок high/low внутри свечи неизвестен — решает закрытие.
+        Pivot h = s.hi
+        Pivot l = s.lo
+        h.taken := true
+        l.taken := true
+        upB := close > h.price
+        dnB := close < l.price
+    int ev = 0
+    if upB
+        Pivot h = s.hi
+        h.taken := true
+        ev      := s.trend < 0 ? 2 : 1
+        s.trend := 1
+    else if dnB
+        Pivot l = s.lo
+        l.taken := true
+        ev      := s.trend > 0 ? -2 : -1
+        s.trend := -1
+    ev
+
+drawBreak(Pivot p, int ev, bool major) =>
+    color c  = ev > 0 ? BULL_TEXT : BEAR_TEXT
+    int   x1 = clampX(p.idx)
+    keepLine(line.new(x1, p.price, bar_index, p.price, color = c, style = major ? line.style_solid : line.style_dashed, width = 1))
+    keepLabel(label.new(math.round((x1 + bar_index) / 2), p.price, math.abs(ev) == 2 ? "CHoCH" : "BOS", color = TRANSPARENT, textcolor = c, style = ev > 0 ? label.style_label_down : label.style_label_up, size = major ? textSize : textSizeSub))
+
+// ── Старший ТФ: считается внутри request.security ──
+// Возвращает значения закрытого бара старшего ТФ ([1]) — вместе с lookahead_on это убирает перерисовку.
+htfEngine(int len, int atrL, float maxAtr) =>
+    var float hP    = na
+    var int   hI    = na
+    var bool  hX    = false
+    var float lP    = na
+    var int   lI    = na
+    var bool  lX    = false
+    var int   trend = 0
+    var float bTop  = na
+    var float bBtm  = na
+    var int   bT    = na
+    var float sTop  = na
+    var float sBtm  = na
+    var int   sT    = na
+    float a  = nz(ta.atr(atrL), ta.tr(true))
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low, len, len)
+    if not na(ph)
+        hP := ph
+        hI := bar_index - len
+        hX := false
+    if not na(pl)
+        lP := pl
+        lI := bar_index - len
+        lX := false
+    if not na(hP) and not hX and close > hP
+        hX    := true
+        trend := 1
+        int n  = math.max(1, math.min(bar_index - hI, HTF_SCAN_BARS))
+        int xi = 1
+        for i = 1 to n
+            if low[i] < low[xi]
+                xi := i
+        float body = math.max(open[xi], close[xi])
+        float edge = body - low[xi] < THIN_ZONE_ATR * a ? high[xi] : body
+        bTop := maxAtr > 0 ? math.min(edge, low[xi] + maxAtr * a) : edge
+        bBtm := low[xi]
+        bT   := time[xi]
+    else if not na(lP) and not lX and close < lP
+        lX    := true
+        trend := -1
+        int n  = math.max(1, math.min(bar_index - lI, HTF_SCAN_BARS))
+        int xi = 1
+        for i = 1 to n
+            if high[i] > high[xi]
+                xi := i
+        float body = math.min(open[xi], close[xi])
+        float edge = high[xi] - body < THIN_ZONE_ATR * a ? low[xi] : body
+        sBtm := maxAtr > 0 ? math.max(edge, high[xi] - maxAtr * a) : edge
+        sTop := high[xi]
+        sT   := time[xi]
+    if not na(bBtm) and close < bBtm
+        bTop := na
+        bBtm := na
+        bT   := na
+    if not na(sTop) and close > sTop
+        sTop := na
+        sBtm := na
+        sT   := na
+    [trend[1], bTop[1], bBtm[1], bT[1], sTop[1], sBtm[1], sT[1], hP[1], lP[1]]
+
+// ══════════════════════════════════════════════════════════
+// 6. CALCULATIONS
+// ══════════════════════════════════════════════════════════
+float zoneAtr      = nz(ta.atr(atrLenInput), ta.tr(true))
+float riskAtr      = nz(ta.atr(atrLenRiskInput), 0.0)
+float rsiValue     = nz(ta.rsi(close, RSI_LEN), 50.0)
+bool  byCloseBreak = breakByInput == O_CLOSE
+bool  barConfirmed = barstate.isconfirmed
+int   barCloseT    = nz(time_close, time)     // время закрытия бара: события и статистика привязаны к закрытию, а не к открытию
+bool  htfActive    = htfOnInput and timeframe.in_seconds(htfInput) > timeframe.in_seconds()
+
+int  WARMUP_BARS = math.max(50, atrLenInput, swingLenInput * 2 + 1)
+bool isWarmedUp  = bar_index >= WARMUP_BARS
+
+// Pivots считаются на каждом баре (ta.* нельзя вызывать условно); обрабатываются только на закрытии.
+float extPH = ta.pivothigh(high, swingLenInput, swingLenInput)
+float extPL = ta.pivotlow(low, swingLenInput, swingLenInput)
+float intPH = ta.pivothigh(high, intLenInput, intLenInput)
+float intPL = ta.pivotlow(low, intLenInput, intLenInput)
+float liqPH = ta.pivothigh(high, liqLenInput, liqLenInput)
+float liqPL = ta.pivotlow(low, liqLenInput, liqLenInput)
+
+[hTrend, hbTop, hbBtm, hbT, hsTop, hsBtm, hsT, hHi, hLo] = request.security(syminfo.tickerid, htfInput, htfEngine(htfLenInput, atrLenInput, obMaxAtrInput), lookahead = barmerge.lookahead_on)
+
+// Хай/лой прошлого дня и недели — с закрытого бара ([1] + lookahead_on), без перерисовки.
+[pdh, pdl, pdc, ppdh, ppdl] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1], high[2], low[2]], lookahead = barmerge.lookahead_on)
+[pwh, pwl] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+int  dayKey    = time("D")       // идентификатор торгового дня / недели (время открытия D/W-бара)
+int  weekKey   = time("W")
+bool dayLvlOk  = keyDayInput and timeframe.isintraday
+bool weekLvlOk = keyWeekInput and timeframe.in_seconds() < timeframe.in_seconds("W")
+
+// ── Killzones (только внутридневные ТФ до 1H) ──
+bool kzActive  = timeframe.isintraday and timeframe.in_seconds() <= 3600
+bool inAsia    = kzActive and asiaOnInput and not na(time(timeframe.period, asiaSessInput, kzTzInput))
+bool inLon     = kzActive and lonOnInput and not na(time(timeframe.period, lonSessInput, kzTzInput))
+bool inNyam    = kzActive and nyamOnInput and not na(time(timeframe.period, nyamSessInput, kzTzInput))
+bool inNypm    = kzActive and nypmOnInput and not na(time(timeframe.period, nypmSessInput, kzTzInput))
+bool inSb      = kzActive and (not na(time(timeframe.period, SB_1, kzTzInput)) or not na(time(timeframe.period, SB_2, kzTzInput)) or not na(time(timeframe.period, SB_3, kzTzInput)))
+bool inAnyKz   = inAsia or inLon or inNyam or inNypm
+bool timeOk    = not kzActive or timeFilterInput == T_OFF or (timeFilterInput == T_KZ ? inAnyKz : inSb)
+// Полный идентификатор даты (год-месяц-день) в поясе killzones: номер дня месяца сам по себе неоднозначен при разрывах истории.
+int  nyDate    = year(time, kzTzInput) * 10000 + month(time, kzTzInput) * 100 + dayofmonth(time, kzTzInput)
+bool newNyDay  = nyDate != nz(nyDate[1], -1)
+// Midnight Open существует, только если первый бар даты открылся ровно в 00:00 (на графиках RTH / с разрывами его нет).
+bool moAtMidnight = hour(time, kzTzInput) == 0 and minute(time, kzTzInput) == 0 and second(time, kzTzInput) == 0
+string kzName  = inAsia ? "Asian" : inLon ? "London" : inNyam ? "NY AM" : inNypm ? "NY PM" : ""
+
+// ── Daily bias: куда вчерашний день «направил» цену (draw on liquidity) ──
+bool biasActive = biasOnInput and timeframe.isintraday
+// Outside day (снял и хай, и лой, закрылся внутри) — нейтральный: порядок снятия сторон по OHLC неизвестен.
+int  dailyBias  = not biasActive or na(pdc) or na(ppdh) ? 0 : pdc > ppdh ? 1 : pdc < ppdl ? -1 : pdh > ppdh and pdl < ppdl ? 0 : pdh > ppdh ? -1 : pdl < ppdl ? 1 : 0
+bool biasLongOk  = not biasActive or biasFilterInput == BF_OFF or (biasFilterInput == BF_STR ? dailyBias == 1 : dailyBias >= 0)
+bool biasShortOk = not biasActive or biasFilterInput == BF_OFF or (biasFilterInput == BF_STR ? dailyBias == -1 : dailyBias <= 0)
+bool inJudas     = kzActive and judasOnInput and biasActive and not na(time(timeframe.period, judasSessInput, kzTzInput))
+
+bgcolor(showSbInput and inSb ? color.new(NEUTRAL_TEXT, 94) : na, title = "Silver Bullet")
+
+// ── Состояние ICT-движка ──
+var Structure   sExt  = Structure.new()
+var Structure   sInt  = Structure.new()
+var array<Zone> obs   = array.new<Zone>()
+var array<Zone> fvgs  = array.new<Zone>()
+var array<Pool> pools = array.new<Pool>()
+
+// Текущий диапазон (dealing range): последние внешние свинги, расширяемые новыми экстремумами.
+var float rHi    = na
+var int   rHiIdx = na
+var float rLo    = na
+var int   rLoIdx = na
+var int   seenHi = na
+var int   seenLo = na
+
+var int  lastBuySweep  = na
+var int  lastSellSweep = na
+var int  usedBuySweep  = na
+var int  usedSellSweep = na
+var Zone setZone       = na
+var int  setExpire     = na
+var int  prevExtTrend  = 0
+var int  trendStartBar = na
+
+var array<KeyLvl> keys = array.new<KeyLvl>()
+var string lastBuySweepName  = ""
+var string lastSellSweepName = ""
+var float  setLegLo          = na
+var float  setLegHi          = na
+var string setSweepName      = ""
+
+var Sess sAsia = Sess.new("Asian")
+var Sess sLon  = Sess.new("London")
+var Sess sNyam = Sess.new("NY AM")
+var Sess sNypm = Sess.new("NY PM")
+
+var line  moLine  = na
+var label moLbl   = na
+var float moPrice = na
+
+var array<Zone> rbs = array.new<Zone>()
+var array<Zone> pbs = array.new<Zone>()
+
+var int   judasState  = 0       // 0 — нет, 1 — ложный ход идёт, 2 — подтверждён
+var float judasExt    = na
+var int   judasExtBar = na
+var int   judasDir    = 0       // направление кандидата Judas (bias на момент начала ложного хода)
+
+// Уровни стандартных отклонений из настроек (по возрастанию)
+var array<float> sdKs     = array.new<float>()
+var array<line>  sdLines  = array.new<line>()
+var array<label> sdLabels = array.new<label>()
+// Разбор строгий: неверное значение — ошибка, а не молчаливый пропуск; дубли убираются; число и величина уровней ограничены,
+// чтобы линии SD не съели бюджет рисунков (500) и не растянули шкалу.
+if barstate.isfirst
+    for s in str.split(sdLevelsInput, ",")
+        string tok = str.replace_all(s, " ", "")
+        if tok != ""
+            float v = str.tonumber(tok)
+            if na(v) or v <= 0 or v > SD_MAX_MULT
+                runtime.error("SD Levels: '" + tok + "' is not a number between 0 and " + str.tostring(SD_MAX_MULT) + ". Use e.g. 1, 2, 2.5")
+            if not sdKs.includes(v)
+                sdKs.push(v)
+    sdKs.sort(order.ascending)
+    if sdKs.size() > SD_MAX_LEVELS
+        runtime.error("SD Levels: at most " + str.tostring(SD_MAX_LEVELS) + " levels are allowed")
+    if sdKs.size() == 0 and (sdShowInput or tpModeInput == TP_SD)
+        runtime.error("SD Levels: enter positive numbers separated by commas, e.g. 1, 2, 2.5")
+
+// ══════════════════════════════════════════════════════════
+// 7. SIGNAL LOGIC — ICT ENGINE
+// ══════════════════════════════════════════════════════════
+// ── Зоны ──
+// Буфер ATR последних баров, новый элемент в начале (unshift/pop, обновляется на каждом баре): даёт ATR бара формирования без history-ссылки внутри функции.
+var array<float> atrHist = array.new<float>()
+atrHist.unshift(zoneAtr)
+if atrHist.size() > ATR_HIST_LEN
+    atrHist.pop()
+
+// Единое определение FVG: свеча k — третья в тройке. Используется и для гэпов, и для рейтинга OB.
+// Порог — по ATR бара формирования: тот же гэп не меняет статус при смене текущей волатильности.
+fvgAt(int dir, int k) =>
+    float minGap = fvgMinAtrInput * (k < atrHist.size() ? atrHist.get(k) : zoneAtr)
+    dir > 0 ? low[k] > high[k + 2] and close[k + 1] > high[k + 2] and low[k] - high[k + 2] >= minGap : high[k] < low[k + 2] and close[k + 1] < low[k + 2] and low[k + 2] - high[k] >= minGap
+
+// OB импульса, пробившего свинг с индексом fromIdx.
+// Возвращает [проксимальная, дистальная, смещение свечи OB, смещение экстремума, есть ли FVG, был ли возврат до пробоя,
+//             найдена ли противоположная свеча]. Без противоположной свечи у экстремума OB не строится.
+findOrderBlock(int dir, int fromIdx) =>
+    int n  = math.max(1, math.min(bar_index - fromIdx, OB_SCAN_BARS))
+    int xi = 1
+    for i = 1 to n
+        if dir > 0 ? low[i] < low[xi] : high[i] > high[xi]
+            xi := i
+    int  src   = xi
+    bool found = false
+    for i = xi to math.min(xi + OB_SRC_BARS, n)
+        if dir > 0 ? close[i] < open[i] : close[i] > open[i]
+            src   := i
+            found := true
+            break
+    float dist = dir > 0 ? low[xi] : high[xi]
+    float prox = dir > 0 ? (obEdgeInput == O_BODY ? math.max(open[src], close[src]) : high[src]) : (obEdgeInput == O_BODY ? math.min(open[src], close[src]) : low[src])
+    if math.abs(prox - dist) < THIN_ZONE_ATR * zoneAtr
+        prox := dir > 0 ? high[src] : low[src]
+    if obMaxAtrInput > 0 and math.abs(prox - dist) > obMaxAtrInput * zoneAtr
+        prox := dist + dir * obMaxAtrInput * zoneAtr
+    bool imb = false
+    for k = 0 to math.max(xi - 1, 0)
+        if fvgAt(dir, k)
+            imb := true
+            break
+    // Цена ушла от зоны, а потом вернулась в неё до подтверждения — зона уже не свежая.
+    // Проверяется и сама свеча пробоя (k = 0): её тень могла коснуться зоны до закрытия за свингом.
+    bool pre  = false
+    bool gone = false
+    for k = xi - 1 to 0
+        if gone and (dir > 0 ? low[k] <= prox : high[k] >= prox)
+            pre := true
+            break
+        gone := gone or (dir > 0 ? low[k] > prox : high[k] < prox)
+    [prox, dist, src, xi, imb, pre, found]
+
+baseColor(int dir, bool isFvg) => isFvg ? (dir > 0 ? fvgBullColorInput : fvgBearColorInput) : (dir > 0 ? bullColorInput : bearColorInput)
+
+// Признаки направления и места: тренд старшего ТФ и половина диапазона (старшего ТФ, если он включён).
+zoneScore(int dir, float top, float btm, bool imb, bool liq) =>
+    float rTop = htfActive ? hHi : rHi
+    float rBot = htfActive ? hLo : rLo
+    bool  half = not na(rTop) and not na(rBot) and rTop > rBot and (dir > 0 ? (top + btm) / 2 < (rTop + rBot) / 2 : (top + btm) / 2 > (rTop + rBot) / 2)
+    bool  algn = htfActive and hTrend == dir
+    (imb ? 1 : 0) + (liq ? 1 : 0) + (algn ? 1 : 0) + (half ? 1 : 0)
+
+zoneText(Zone z) =>
+    string side = z.dir > 0 ? "Bull " : "Bear "
+    z.setup ? "SETUP " + arrow(z.dir) + (z.fvg ? " FVG" : " " + stars(z.score)) : z.fvg ? "" : z.breaker ? side + "Breaker " + str.repeat("★", z.score) : side + "OB " + stars(z.score) + (z.touched ? " · tested" : "")
+
+// Подпись зоны с учётом переключателя «Show Zone Labels»; SETUP показывается всегда.
+zoneLabel(Zone z) => showZoneTextInput or z.setup ? zoneText(z) : ""
+
+zoneRange(Zone z) => na(z) ? "—" : fmtPrice(z.btm) + "–" + fmtPrice(z.top) + (close >= z.btm and close <= z.top ? " (inside)" : "")
+
+newZone(float top, float btm, int dir, int left, bool isFvg, int score, bool touched) =>
+    color base = baseColor(dir, isFvg)
+    box   b    = box.new(left, top, bar_index + 1, btm, border_color = color.new(base, 50), border_width = score >= 3 ? 2 : 1, border_style = touched ? line.style_dotted : line.style_solid, bgcolor = color.new(base, touched ? math.min(zoneTranspInput + 5, 100) : zoneTranspInput), text_size = textSize, text_color = TEXT_MUTED, text_halign = text.align_right, text_valign = text.align_center)
+    line  m    = not isFvg and obMidInput ? line.new(left, (top + btm) / 2, bar_index + 1, (top + btm) / 2, color = color.new(base, 50), style = line.style_dotted) : na
+    Zone  z    = Zone.new(b, m, top, btm, (top + btm) / 2, dir, bar_index, isFvg, score)
+    z.touched := touched
+    b.set_text(zoneLabel(z))
+    z
+
+setSetupLook(Zone z, bool on) =>
+    z.setup := on
+    if z.alive
+        color base = baseColor(z.dir, z.fvg)
+        z.bx.set_border_width(on or z.score >= 3 ? 2 : 1)
+        z.bx.set_border_color(on ? base : color.new(base, 50))
+        z.bx.set_text_color(on ? trendTextColor(z.dir) : TEXT_MUTED)
+        z.bx.set_text(zoneLabel(z))
+
+dropSetup(Zone z, string why) =>
+    setSetupLook(z, false)
+    alSetupInput ? "Setup " + arrow(z.dir) + " cancelled: " + why + "; " : ""
+
+// Самая свежая нетронутая зона направления dir, родившаяся не раньше бара since.
+claimSetup(array<Zone> arr, int dir, int since) =>
+    Zone found = na
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            Zone z = arr.get(i)
+            if z.dir == dir and not z.breaker and not z.touched and z.born >= since
+                found := z
+                break
+    found
+
+retire(Zone z, bool keep) =>
+    z.alive := false
+    if keep
+        z.bx.set_right(bar_index)
+        z.bx.set_bgcolor(DONE_COLOR)
+        z.bx.set_border_color(DONE_COLOR)
+        z.bx.set_text_color(color.new(TEXT_MUTED, 50))
+        keepBox(z.bx)
+        if not na(z.mid)
+            z.mid.set_x2(bar_index)
+            z.mid.set_color(DONE_COLOR)
+            keepLine(z.mid)
+    else
+        z.bx.delete()
+        if not na(z.mid)
+            z.mid.delete()
+
+trimZones(array<Zone> arr, int dir, int maxN) =>
+    int cnt = 0
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            Zone z = arr.get(i)
+            if z.dir == dir
+                cnt += 1
+                if cnt > maxN
+                    retire(z, false)
+                    arr.remove(i)
+
+// Новая зона не создаётся поверх свежей зоны того же направления. Протестированные и Breaker не мешают.
+overlaps(array<Zone> arr, int dir, float top, float btm) =>
+    bool hit = false
+    for z in arr
+        if z.dir == dir and not z.breaker and not z.touched
+            float ov = math.min(top, z.top) - math.max(btm, z.btm)
+            if ov > OVERLAP_SHARE * math.min(top - btm, z.top - z.btm)
+                hit := true
+                break
+    hit
+
+// Ведёт OB/Breaker: продлевает, ловит первое пересечение, слом и смену полярности. Возвращает текст info-алерта.
+// Пересечение зоны сетапа свечой, закрывшейся не за зоной, — вход (z.entered).
+updateOrderBlocks() =>
+    string msg = ""
+    if obs.size() > 0
+        for i = obs.size() - 1 to 0
+            Zone z = obs.get(i)
+            if bar_index > z.born
+                float dist   = z.dir > 0 ? z.btm : z.top
+                bool  beyond = z.dir > 0 ? close < dist : close > dist
+                bool  broken = z.breaker ? beyond : obMitigInput == O_HALF ? (z.dir > 0 ? close < z.eq : close > z.eq) : obMitigInput == O_WICK ? (z.dir > 0 ? low < dist : high > dist) : beyond
+                if broken
+                    if obBreakerInput and not z.breaker and beyond
+                        z.breaker := true
+                        z.setup   := false
+                        z.pbBar   := na        // кандидат PB относился к прежнему направлению — сбрасываем
+                        z.dir     := -z.dir
+                        z.touched := false
+                        z.born    := bar_index
+                        z.score   := zoneScore(z.dir, z.top, z.btm, false, false)
+                        z.bx.set_bgcolor(color.new(baseColor(z.dir, false), zoneTranspInput))
+                        z.bx.set_border_color(color.new(baseColor(z.dir, false), 40))
+                        z.bx.set_border_style(line.style_dashed)
+                        z.bx.set_border_width(1)
+                        z.bx.set_text(zoneLabel(z))
+                        z.bx.set_text_color(TEXT_MUTED)
+                        z.bx.set_right(bar_index + 1)
+                        if not na(z.mid)
+                            z.mid.set_color(color.new(baseColor(z.dir, false), 50))
+                            z.mid.set_x2(bar_index + 1)
+                    else
+                        obs.remove(i)
+                        retire(z, obKeepInput)
+                else
+                    if not z.touched and low <= z.top and high >= z.btm
+                        z.touched := true
+                        // Кандидат в Propulsion Block: противоположная свеча, коснувшаяся OB
+                        if pbOnInput and not z.breaker and (z.dir > 0 ? close < open : close > open)
+                            z.pbBar := bar_index
+                            z.pbTop := high
+                            z.pbBtm := low
+                        if z.setup
+                            z.setup   := false
+                            z.entered := true
+                            z.bx.set_text(zoneLabel(z))
+                            z.bx.set_text_color(TEXT_MUTED)
+                        else
+                            msg += alObInput and z.score >= alMinScoreInput ? (z.breaker ? "Breaker " : "OB ") + stars(z.score) + " " + arrow(z.dir) + " touch " + fmtPrice(z.btm) + "–" + fmtPrice(z.top) + "; " : ""
+                            z.bx.set_text(zoneLabel(z))
+                    z.bx.set_right(bar_index + 1)
+                    if not na(z.mid)
+                        z.mid.set_x2(bar_index + 1)
+    msg
+
+// ── Rejection / Propulsion Blocks ──
+// Зона RB/PB: свой цвет (RB) или цвет OB с точечной рамкой (PB); подпись слева, чтобы не накладываться на подпись OB справа.
+newAuxZone(float top, float btm, int dir, int left, int kind, bool touched) =>
+    color base = kind == 2 ? (dir > 0 ? rbBullColorInput : rbBearColorInput) : baseColor(dir, false)
+    string t   = showZoneTextInput ? (dir > 0 ? "Bull " : "Bear ") + (kind == 2 ? "RB" : "PB") : ""
+    box   b    = box.new(left, top, bar_index + 1, btm, border_color = color.new(base, 40), border_width = 1, border_style = kind == 3 or touched ? line.style_dotted : line.style_solid, bgcolor = color.new(base, math.min(zoneTranspInput + 3, 100)), text = t, text_size = textSize, text_color = TEXT_MUTED, text_halign = text.align_left, text_valign = text.align_center)
+    line  m    = obMidInput ? line.new(left, (top + btm) / 2, bar_index + 1, (top + btm) / 2, color = color.new(base, 50), style = line.style_dotted) : na
+    Zone  z    = Zone.new(b, m, top, btm, (top + btm) / 2, dir, bar_index)
+    z.kind    := kind
+    z.touched := touched
+    z
+
+// Ведёт RB/PB: продлевает, ловит первое касание, удаляет при закрытии за дистальной границей.
+updateAux(array<Zone> arr, string tag) =>
+    string msg = ""
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            Zone z = arr.get(i)
+            if bar_index > z.born
+                float dist = z.dir > 0 ? z.btm : z.top
+                if z.dir > 0 ? close < dist : close > dist
+                    arr.remove(i)
+                    retire(z, false)
+                else
+                    if not z.touched and low <= z.top and high >= z.btm
+                        z.touched := true
+                        z.bx.set_border_style(line.style_dotted)
+                        msg += alRbPbInput ? tag + " " + arrow(z.dir) + " touch " + fmtPrice(z.btm) + "–" + fmtPrice(z.top) + "; " : ""
+                    z.bx.set_right(bar_index + 1)
+                    if not na(z.mid)
+                        z.mid.set_x2(bar_index + 1)
+    msg
+
+// Подтверждение Propulsion Block: после касания OB цена закрылась за свечой касания.
+updatePbCandidates() =>
+    string msg = ""
+    for z in obs
+        if not na(z.pbBar) and not z.breaker and bar_index > z.pbBar
+            if bar_index - z.pbBar > pbConfirmInput
+                z.pbBar := na
+            else if z.dir > 0 ? close > z.pbTop : close < z.pbBtm
+                if z.pbTop - z.pbBtm >= syminfo.mintick
+                    pbs.push(newAuxZone(z.pbTop, z.pbBtm, z.dir, z.pbBar, 3, false))
+                    msg += alRbPbInput ? "PB " + arrow(z.dir) + " " + fmtPrice(z.pbBtm) + "–" + fmtPrice(z.pbTop) + "; " : ""
+                z.pbBar := na
+    msg
+
+// ── Стандартные отклонения ноги сетапа ──
+drawSd(int d, float lo, float hi) =>
+    for l in sdLines
+        l.delete()
+    for lb in sdLabels
+        lb.delete()
+    sdLines.clear()
+    sdLabels.clear()
+    float rng = hi - lo
+    if sdShowInput and rng > 0
+        for k in sdKs
+            float lvl = d > 0 ? hi + k * rng : lo - k * rng
+            sdLines.push(line.new(bar_index, lvl, bar_index + SD_FORWARD_BARS, lvl, color = SD_COLOR, style = line.style_dotted, width = 1))
+            sdLabels.push(label.new(bar_index, lvl, "-" + str.tostring(k) + " SD", color = TRANSPARENT, textcolor = SD_COLOR, style = label.style_label_right, size = textSizeSub))
+
+// Ближайшая проекция SD направления dir за ценой beyond: [цена, имя].
+nextSd(int dir, float beyond, float lo, float hi) =>
+    float  best = na
+    string name = ""
+    float  rng  = hi - lo
+    if rng > 0
+        for k in sdKs
+            float lvl = dir > 0 ? hi + k * rng : lo - k * rng
+            if na(best) and (dir > 0 ? lvl > beyond : lvl < beyond)
+                best := lvl
+                name := "-" + str.tostring(k) + " SD"
+    [best, name]
+
+// Ведёт FVG: первое пересечение, вход по сетапу, сужение, удаление закрытых.
+// Свеча, перепрыгнувшая гэп целиком, не пересекает его — входа нет, гэп считается закрытым.
+updateFvgs() =>
+    if fvgs.size() > 0
+        for i = fvgs.size() - 1 to 0
+            Zone z = fvgs.get(i)
+            if bar_index > z.born
+                if not z.touched and low <= z.top and high >= z.btm
+                    z.touched := true
+                    if z.setup
+                        if z.dir > 0 ? close >= z.btm : close <= z.top
+                            z.entered := true
+                        z.setup := false
+                        z.bx.set_text("")
+                bool filled = false
+                if z.dir > 0
+                    filled := low <= (fvgFillInput == O_TOUCH ? z.top : fvgFillInput == O_HALF ? z.eq : z.btm)
+                    if not filled and fvgShrinkInput and low < z.top
+                        z.top := low
+                        z.bx.set_top(low)
+                else
+                    filled := high >= (fvgFillInput == O_TOUCH ? z.btm : fvgFillInput == O_HALF ? z.eq : z.top)
+                    if not filled and fvgShrinkInput and high > z.btm
+                        z.btm := high
+                        z.bx.set_bottom(high)
+                if filled
+                    fvgs.remove(i)
+                    retire(z, false)
+                else
+                    z.bx.set_right(bar_index + 1)
+
+// ── Ликвидность ──
+trimPools(int side) =>
+    int cnt = 0
+    if pools.size() > 0
+        for i = pools.size() - 1 to 0
+            Pool p = pools.get(i)
+            if p.side == side
+                cnt += 1
+                if cnt > liqMaxInput
+                    p.ln.delete()
+                    if not na(p.lb)
+                        p.lb.delete()
+                    pools.remove(i)
+
+// Новый свинг либо сливается с равным нетронутым уровнем (EQH/EQL), либо открывает новый пул.
+addPool(float price, int side) =>
+    int  at     = bar_index - liqLenInput
+    bool merged = false
+    for p in pools
+        if p.side == side and math.abs(p.price - price) <= eqTolInput * zoneAtr
+            p.hits  += 1
+            p.price := side > 0 ? math.max(p.price, price) : math.min(p.price, price)
+            p.ln.set_y1(p.price)
+            p.ln.set_y2(p.price)
+            if liqOnInput
+                p.ln.set_color(LINE_SUBTLE)
+                p.ln.set_style(line.style_solid)
+                string t = (side > 0 ? "EQH" : "EQL") + (p.hits > 2 ? " ×" + str.tostring(p.hits) : "")
+                // Подпись EQH/EQL — у правого конца линии, чтобы не накладываться на метки HH/LL у свинга.
+                if na(p.lb)
+                    p.lb := label.new(bar_index + KEY_LABEL_OFFSET, p.price, t, color = TRANSPARENT, textcolor = TEXT_MUTED, style = label.style_label_left, size = textSizeSub)
+                else
+                    p.lb.set_xy(bar_index + KEY_LABEL_OFFSET, p.price)
+                    p.lb.set_text(t)
+            merged := true
+            break
+    if not merged
+        pools.push(Pool.new(line.new(at, price, bar_index, price, color = liqOnInput and liqSingleInput ? LINE_SUBTLE : TRANSPARENT, style = line.style_dotted), na, price, side))
+        trimPools(side)
+
+// Цена зашла за уровень: закрытие обратно — Sweep (снятие стопов), закрытие за ним — уровень просто взят.
+// Возвращает [текст info-алерта, снята ли buy-side, снята ли sell-side, имя снятой buy-side, имя снятой sell-side].
+// Сигналы не зависят от отрисовки.
+updatePools() =>
+    string msg      = ""
+    bool   buySw    = false
+    bool   sellSw   = false
+    string buyName  = ""
+    string sellName = ""
+    if pools.size() > 0
+        for i = pools.size() - 1 to 0
+            Pool p = pools.get(i)
+            if p.side > 0 ? high > p.price : low < p.price
+                bool swept   = p.side > 0 ? close < p.price : close > p.price
+                bool notable = p.hits > 1 or liqSingleInput
+                pools.remove(i)
+                if swept
+                    if p.side > 0
+                        buySw   := true
+                        buyName := p.hits > 1 ? "EQH" : "swing high"
+                    else
+                        sellSw   := true
+                        sellName := p.hits > 1 ? "EQL" : "swing low"
+                    if notable and alSweepInput
+                        msg += "Sweep " + (p.side > 0 ? (p.hits > 1 ? "EQH " : "high ") : (p.hits > 1 ? "EQL " : "low ")) + fmtPrice(p.price) + "; "
+                if liqOnInput and notable
+                    if swept and showSweepLblInput
+                        keepLabel(label.new(bar_index, p.price, "Sweep", color = TRANSPARENT, textcolor = p.side > 0 ? BEAR_TEXT : BULL_TEXT, style = p.side > 0 ? label.style_label_down : label.style_label_up, size = textSize))
+                    p.ln.set_x2(bar_index)
+                    p.ln.set_color(color.new(LINE_SUBTLE, 50))
+                    keepLine(p.ln)
+                    if not na(p.lb)
+                        p.lb.set_x(bar_index)
+                        keepLabel(p.lb)
+                else
+                    p.ln.delete()
+                    if not na(p.lb)
+                        p.lb.delete()
+            else
+                p.ln.set_x2(bar_index)
+                if not na(p.lb)
+                    p.lb.set_x(bar_index + KEY_LABEL_OFFSET)
+    [msg, buySw, sellSw, buyName, sellName]
+
+// ── Ключевые уровни ──
+// Ставит (или заменяет одноимённый) ключевой уровень ликвидности.
+setKey(string name, float price, int side, int start) =>
+    if keys.size() > 0
+        for i = keys.size() - 1 to 0
+            KeyLvl k = keys.get(i)
+            if k.name == name
+                if not na(k.ln)
+                    k.ln.delete()
+                if not na(k.lb)
+                    k.lb.delete()
+                keys.remove(i)
+    line  ln = line.new(clampX(start), price, bar_index, price, color = KEY_COLOR, style = line.style_solid, width = 1)
+    label lb = label.new(bar_index + KEY_LABEL_OFFSET, price, name, color = TRANSPARENT, textcolor = TEXT_MUTED, style = label.style_label_left, size = textSizeSub)
+    keys.push(KeyLvl.new(name, price, side, start, false, ln, lb))
+
+// Ведёт ключевые уровни: продлевает, ловит взятие и Sweep (прокол с закрытием обратно).
+updateKeys() =>
+    string msg      = ""
+    bool   buySw    = false
+    bool   sellSw   = false
+    string buyName  = ""
+    string sellName = ""
+    for k in keys
+        if not k.taken
+            k.ln.set_x2(bar_index)
+            k.lb.set_x(bar_index + KEY_LABEL_OFFSET)
+            if k.side > 0 ? high > k.price : low < k.price
+                k.taken := true
+                k.ln.set_style(line.style_dotted)
+                k.lb.set_textcolor(color.new(TEXT_MUTED, 50))
+                k.lb.set_x(bar_index)
+                if k.side > 0 ? close < k.price : close > k.price
+                    if k.side > 0
+                        buySw   := true
+                        buyName := k.name
+                    else
+                        sellSw   := true
+                        sellName := k.name
+                    if showSweepLblInput
+                        keepLabel(label.new(bar_index, k.price, k.name + " sweep", color = TRANSPARENT, textcolor = k.side > 0 ? BEAR_TEXT : BULL_TEXT, style = k.side > 0 ? label.style_label_down : label.style_label_up, size = textSize))
+                    msg += alSweepInput ? "Sweep " + k.name + " " + fmtPrice(k.price) + "; " : ""
+    [msg, buySw, sellSw, buyName, sellName]
+
+// Ближайшая нетронутая ликвидность направления dir (+1 выше, −1 ниже) за ценой beyond: [цена, имя].
+nextLiquidity(int dir, float beyond) =>
+    float  best = na
+    string name = ""
+    for p in pools
+        if p.side == dir and (dir > 0 ? p.price > beyond : p.price < beyond) and (na(best) or (dir > 0 ? p.price < best : p.price > best))
+            best := p.price
+            name := p.hits > 1 ? (dir > 0 ? "EQH" : "EQL") : (dir > 0 ? "Swing H" : "Swing L")
+    for k in keys
+        if k.side == dir and not k.taken and (dir > 0 ? k.price > beyond : k.price < beyond) and (na(best) or (dir > 0 ? k.price < best : k.price > best))
+            best := k.price
+            name := k.name
+    [best, name]
+
+// Цель TP2/TP3 по режиму TP Mode: ликвидность или проекция SD ноги сетапа. [цена, имя]
+nextTarget(int dir, float beyond, float lo, float hi) =>
+    float  p = na
+    string n = ""
+    if tpModeInput == TP_LIQ
+        [a, b] = nextLiquidity(dir, beyond)
+        p := a
+        n := b
+    else if tpModeInput == TP_SD
+        [a, b] = nextSd(dir, beyond, lo, hi)
+        p := a
+        n := b
+    [p, n]
+
+drawSess(Sess s, bool started, color c) =>
+    if kzShowInput and s.active
+        if started
+            s.bx := box.new(bar_index, s.hi, bar_index + 1, s.lo, border_color = color.new(c, 60), bgcolor = color.new(c, 92), text = s.name, text_size = textSizeSub, text_color = TEXT_MUTED, text_halign = text.align_left, text_valign = text.align_top)
+            s.bx.set_right(bar_index + 1)
+        else if not na(s.bx)
+            s.bx.set_top(s.hi)
+            s.bx.set_bottom(s.lo)
+            s.bx.set_right(bar_index + 1)
+
+// Завершённая сессия: коробка уходит в очередь истории (активная туда не попадает и не может быть удалена раньше времени).
+finishSess(Sess s) =>
+    if not na(s.bx)
+        keepBox(s.bx)
+        s.bx := na
+
+// ── Сетап ──
+// Displacement: оставила ли нога Sweep → CHoCH (span баров) FVG в направлении dir.
+legHasFvg(int dir, int span) =>
+    bool found = false
+    for k = 0 to math.max(span - 1, 0)
+        if fvgAt(dir, k)
+            found := true
+            break
+    found
+
+// Зона входа импульса по настройке Entry PD Array: FVG между Sweep и CHoCH или OB, созданный на CHoCH.
+pickSetupZone(int d, int since) =>
+    Zone z      = na
+    bool useFvg = fvgOnInput and entryArrayInput != EA_OB0
+    bool useOb  = obOnInput and entryArrayInput != EA_FVG0
+    if entryArrayInput == EA_FVG1 or entryArrayInput == EA_FVG0
+        if useFvg
+            z := claimSetup(fvgs, d, since)
+        if na(z) and useOb
+            z := claimSetup(obs, d, bar_index)
+    else
+        if useOb
+            z := claimSetup(obs, d, bar_index)
+        if na(z) and useFvg
+            z := claimSetup(fvgs, d, since)
+    z
+
+// Фильтр места входа: Discount/Premium диапазона (старшего ТФ, если включён) или OTE ноги сетапа.
+// Возвращает "" — вход разрешён, иначе причину пропуска. Без данных фильтр не пропускает вход («не готов»).
+entryCheck(int dir, float legLo, float legHi) =>
+    string why = ""
+    if entryFilterInput == F_PD
+        float rTop = htfActive ? hHi : rHi
+        float rBot = htfActive ? hLo : rLo
+        if na(rTop) or na(rBot) or rTop <= rBot
+            why := "PD filter not ready (no valid dealing range yet)"
+        else if dir > 0 ? close >= (rTop + rBot) / 2 : close <= (rTop + rBot) / 2
+            why := "entry outside " + (dir > 0 ? "discount" : "premium")
+    else if entryFilterInput == F_OTE
+        float rng = legHi - legLo
+        if na(rng) or rng <= 0
+            why := "OTE filter not ready (invalid setup leg)"
+        else if not (dir > 0 ? close <= legHi - OTE_NEAR * rng and close > legLo : close >= legLo + OTE_NEAR * rng and close < legHi)
+            why := "entry outside OTE"
+    why
+
+// ── Обработка бара: только на закрытии (realtime-тики не меняют сигналов, структуры и зон; панель и PD/OTE живые) ──
+string infoMsg   = ""
+int    evExt     = 0
+int    evInt     = 0
+int    sigDir    = 0
+float  sigDistal = na
+int    sigScore    = 0
+string sigKind     = ""
+float  sigSweepExt = na
+string sigSweep    = ""
+float  sigLegLo    = na
+float  sigLegHi    = na
+
+if barConfirmed
+    // 1. Сначала уровни, действующие на начало этого бара (новый день/неделя, только что закрытые сессии),
+    //    и только потом проверка свипов этим баром — иначе первый бар нового периода проверяется по старым уровням.
+    // Смена дня/недели — по времени открытия D/W-бара, а не по изменению цены (одинаковый хай двух дней не теряет PDL).
+    if dayLvlOk and not na(pdh) and dayKey != nz(dayKey[1], -1)
+        setKey("PDH", pdh, 1, bar_index)
+        setKey("PDL", pdl, -1, bar_index)
+    if weekLvlOk and not na(pwh) and weekKey != nz(weekKey[1], -1)
+        setKey("PWH", pwh, 1, bar_index)
+        setKey("PWL", pwl, -1, bar_index)
+
+    // Killzones: диапазоны сессий; по окончании хай/лой становятся ликвидностью, коробка уходит в историю.
+    [aSt, aEn] = sAsia.track(inAsia)
+    [lSt, lEn] = sLon.track(inLon)
+    [nSt, nEn] = sNyam.track(inNyam)
+    [pSt, pEn] = sNypm.track(inNypm)
+    drawSess(sAsia, aSt, kzAsiaColorInput)
+    drawSess(sLon, lSt, kzLonColorInput)
+    drawSess(sNyam, nSt, kzNyamColorInput)
+    drawSess(sNypm, pSt, kzNypmColorInput)
+    if aEn
+        finishSess(sAsia)
+    if lEn
+        finishSess(sLon)
+    if nEn
+        finishSess(sNyam)
+    if pEn
+        finishSess(sNypm)
+    if sessLiqInput
+        if aEn
+            setKey("Asia H", sAsia.hi, 1, sAsia.start)
+            setKey("Asia L", sAsia.lo, -1, sAsia.start)
+        if lEn
+            setKey("London H", sLon.hi, 1, sLon.start)
+            setKey("London L", sLon.lo, -1, sLon.start)
+        if nEn
+            setKey("NY AM H", sNyam.hi, 1, sNyam.start)
+            setKey("NY AM L", sNyam.lo, -1, sNyam.start)
+        if pEn
+            setKey("NY PM H", sNypm.hi, 1, sNypm.start)
+            setKey("NY PM L", sNypm.lo, -1, sNypm.start)
+
+    // 2. Ликвидность: рейтинг и сетап опираются на свипы этого же бара.
+    [liqMsg, buySw, sellSw, bName, sName] = updatePools()
+    [keyMsg, kBuySw, kSellSw, kbName, ksName] = updateKeys()
+    infoMsg += liqMsg + keyMsg
+    if buySw or kBuySw
+        lastBuySweep     := bar_index
+        lastBuySweepName := kBuySw ? kbName : bName
+    if sellSw or kSellSw
+        lastSellSweep     := bar_index
+        lastSellSweepName := kSellSw ? ksName : sName
+    if not na(liqPH)
+        addPool(liqPH, 1)
+    if not na(liqPL)
+        addPool(liqPL, -1)
+
+    // Midnight Open (00:00 в часовом поясе killzones)
+    // Midnight Open считается всегда (нужен Judas Swing); линия — по переключателю.
+    // Если бара 00:00 нет, Midnight Open в этот день недоступен (na) — его не подменяет первый бар сессии, Judas ждёт.
+    if kzActive and newNyDay
+        moPrice     := moAtMidnight ? open : na
+        judasState  := 0
+        judasExt    := na
+        judasExtBar := na
+        judasDir    := 0
+        if keyMoInput
+            // Вчерашняя линия уходит в историю только сейчас; активная в очередь не попадает и не удаляется раньше времени.
+            if not na(moLine)
+                moLbl.set_x(moLine.get_x2())
+                keepLine(moLine)
+                keepLabel(moLbl)
+                moLine := na
+                moLbl  := na
+            if moAtMidnight
+                string moTxt = "Midnight Open" + (biasActive ? " · Bias " + (dailyBias > 0 ? "▲" : dailyBias < 0 ? "▼" : "—") : "")
+                moLine := line.new(bar_index, open, bar_index + 1, open, color = AMBER_TEXT, style = line.style_dashed, width = 1)
+                moLbl  := label.new(bar_index + KEY_LABEL_OFFSET, open, moTxt, color = TRANSPARENT, textcolor = AMBER_TEXT, style = label.style_label_left, size = textSizeSub)
+                moLine.set_x2(bar_index + 1)
+    if keyMoInput and kzActive and not newNyDay and not na(moLine)
+        moLine.set_x2(bar_index + 1)
+        moLbl.set_x(bar_index + KEY_LABEL_OFFSET)
+
+    // Daily bias: info-алерт в начале торгового дня
+    if biasActive and alBiasInput and not na(pdh) and dayKey != nz(dayKey[1], -1)
+        infoMsg += "Daily bias " + (dailyBias > 0 ? "▲ bullish, draw on PDH " + fmtPrice(pdh) : dailyBias < 0 ? "▼ bearish, draw on PDL " + fmtPrice(pdl) : "neutral (inside or outside day)") + "; "
+
+    // Judas Swing: ложный ход против дневного направления за Midnight Open и возврат закрытием.
+    // Если bias сменился посреди окна, незавершённый кандидат сбрасывается: Judas относится к одному направлению.
+    if judasState == 1 and dailyBias != judasDir
+        judasState  := 0
+        judasExt    := na
+        judasExtBar := na
+        judasDir    := 0
+    if inJudas and judasState < 2 and not na(moPrice) and dailyBias != 0
+        bool bull = dailyBias > 0
+        if bull ? low < moPrice : high > moPrice
+            if na(judasExt) or (bull ? low < judasExt : high > judasExt)
+                judasExt    := bull ? low : high
+                judasExtBar := bar_index
+            judasState := 1
+            judasDir   := dailyBias
+        // Требование свипа Азии не обходится при отсутствии данных: нужен азиатский диапазон не старше суток.
+        bool asiaReady = not na(sAsia.lo) and not na(sAsia.startT) and time - sAsia.startT <= MS_DAY
+        bool swept     = not judasSweepInput or not asiaOnInput or (asiaReady and (bull ? judasExt < sAsia.lo : judasExt > sAsia.hi))
+        if judasState == 1 and swept and (bull ? close > moPrice : close < moPrice)
+            judasState := 2
+            float yJ = bull ? judasExt - JUDAS_LABEL_ATR * zoneAtr : judasExt + JUDAS_LABEL_ATR * zoneAtr
+            keepLabel(label.new(judasExtBar, yJ, "Judas " + (bull ? "▲" : "▼"), color = JUDAS_BG, textcolor = JUDAS_TEXT, style = bull ? label.style_label_up : label.style_label_down, size = textSize, tooltip = "Judas Swing: false move " + (bull ? "below" : "above") + " the Midnight Open " + fmtPrice(moPrice) + " against the " + (bull ? "bullish" : "bearish") + " daily bias, then a close back across it"))
+            if alJudasInput
+                infoMsg += "Judas Swing " + (bull ? "▲" : "▼") + " confirmed, extreme " + fmtPrice(judasExt) + "; "
+
+    // 2. Структура.
+    evExt := sExt.step(extPH, extPL, swingLenInput, showSwingsInput, byCloseBreak)
+    evInt := sInt.step(intPH, intPL, intLenInput, false, byCloseBreak)
+    if sExt.trend != prevExtTrend
+        prevExtTrend  := sExt.trend
+        trendStartBar := bar_index
+    if evExt != 0
+        if showExtInput
+            drawBreak(evExt > 0 ? sExt.hi : sExt.lo, evExt, true)
+        if alStructInput
+            infoMsg += evText(evExt) + "; "
+    if evInt != 0 and showIntInput and evInt * evExt <= 0
+        drawBreak(evInt > 0 ? sInt.hi : sInt.lo, evInt, false)
+
+    // 3. Диапазон.
+    if not na(sExt.hi) and sExt.hi.idx != nz(seenHi, -1)
+        seenHi := sExt.hi.idx
+        rHi    := sExt.hi.price
+        rHiIdx := sExt.hi.idx
+    if not na(sExt.lo) and sExt.lo.idx != nz(seenLo, -1)
+        seenLo := sExt.lo.idx
+        rLo    := sExt.lo.price
+        rLoIdx := sExt.lo.idx
+    if not na(rHi) and high > rHi
+        rHi    := high
+        rHiIdx := bar_index
+    if not na(rLo) and low < rLo
+        rLo    := low
+        rLoIdx := bar_index
+
+    // 4. Можно ли взвести сетап. CHoCH в обе стороны сразу (конфликт структур) — нельзя.
+    bool chUp  = evExt == 2 or evInt == 2
+    bool chDn  = evExt == -2 or evInt == -2
+    bool armUp = setupOnInput and isWarmedUp and timeOk and biasLongOk and chUp and not chDn and not na(lastSellSweep) and lastSellSweep != nz(usedSellSweep, -1) and bar_index - lastSellSweep <= setupWinInput
+    bool armDn = setupOnInput and isWarmedUp and timeOk and biasShortOk and chDn and not chUp and not na(lastBuySweep) and lastBuySweep != nz(usedBuySweep, -1) and bar_index - lastBuySweep <= setupWinInput
+
+    // 5. Order Blocks с рейтингом.
+    if obOnInput
+        infoMsg += updateOrderBlocks()
+        trimZones(obs, 1, obMaxInput)
+        trimZones(obs, -1, obMaxInput)
+        int ev = obFromInput == O_EXT ? evExt : evInt
+        if ev != 0
+            int   dir = ev > 0 ? 1 : -1
+            Pivot p   = obFromInput == O_EXT ? (dir > 0 ? sExt.hi : sExt.lo) : (dir > 0 ? sInt.hi : sInt.lo)
+            [prox, dist, off, xi, imb, pre, srcFound] = findOrderBlock(dir, p.idx)
+            float top   = math.max(prox, dist)
+            float btm   = math.min(prox, dist)
+            int   swp   = dir > 0 ? lastSellSweep : lastBuySweep
+            bool  liq   = not na(swp) and math.abs(swp - (bar_index - xi)) <= SWEEP_NEAR_BARS
+            int   score = zoneScore(dir, top, btm, imb, liq)
+            bool  pass  = srcFound and (imb or not obNeedImbInput) and (score >= obMinScoreInput or (dir > 0 ? armUp : armDn)) and top - btm >= syminfo.mintick
+            if pass and not overlaps(obs, dir, top, btm)
+                obs.push(newZone(top, btm, dir, bar_index - off, false, score, pre))
+                trimZones(obs, dir, obMaxInput)
+
+    // 6. FVG.
+    // Propulsion Blocks: ведение, затем подтверждение кандидатов от касаний OB.
+    if pbOnInput
+        infoMsg += updateAux(pbs, "PB")
+        if obOnInput
+            infoMsg += updatePbCandidates()
+            trimZones(pbs, 1, pbMaxInput)
+            trimZones(pbs, -1, pbMaxInput)
+
+    // Rejection Blocks: длинная тень подтверждённого внешнего свинга (без дублирования OB).
+    if rbOnInput
+        infoMsg += updateAux(rbs, "RB")
+        int o = swingLenInput
+        if not na(extPH)
+            float bTop = math.max(open[o], close[o])
+            float rngH = high[o] - low[o]
+            if rngH > 0 and high[o] - bTop >= rbWickInput * rngH and high[o] - bTop >= syminfo.mintick and not overlaps(obs, -1, high[o], bTop)
+                bool preH = false
+                for k = 0 to o - 1
+                    if high[k] >= bTop
+                        preH := true
+                        break
+                rbs.push(newAuxZone(high[o], bTop, -1, bar_index - o, 2, preH))
+                trimZones(rbs, -1, rbMaxInput)
+        if not na(extPL)
+            float bBot = math.min(open[o], close[o])
+            float rngL = high[o] - low[o]
+            if rngL > 0 and bBot - low[o] >= rbWickInput * rngL and bBot - low[o] >= syminfo.mintick and not overlaps(obs, 1, bBot, low[o])
+                bool preL = false
+                for k = 0 to o - 1
+                    if low[k] <= bBot
+                        preL := true
+                        break
+                rbs.push(newAuxZone(bBot, low[o], 1, bar_index - o, 2, preL))
+                trimZones(rbs, 1, rbMaxInput)
+
+    if fvgOnInput
+        updateFvgs()
+        if fvgAt(1, 0)
+            fvgs.push(newZone(low, high[2], 1, bar_index - 1, true, 0, false))
+            trimZones(fvgs, 1, fvgMaxInput)
+            if alFvgInput
+                infoMsg += "FVG ▲ " + fmtPrice(high[2]) + "–" + fmtPrice(low) + "; "
+        if fvgAt(-1, 0)
+            fvgs.push(newZone(low[2], high, -1, bar_index - 1, true, 0, false))
+            trimZones(fvgs, -1, fvgMaxInput)
+            if alFvgInput
+                infoMsg += "FVG ▼ " + fmtPrice(high) + "–" + fmtPrice(low[2]) + "; "
+
+    // 7. Сетап (один активный): сначала судьба текущего, потом взвод нового.
+    // Срок и противоположный CHoCH проверяются ДО входа: касание после дедлайна или на свече отмены входом не считается.
+    if not na(setZone)
+        bool setExpired  = bar_index > setExpire
+        bool setOpposite = setZone.dir > 0 ? chDn : chUp
+        if setExpired
+            infoMsg += dropSetup(setZone, "expired")
+            setZone := na
+        else if setOpposite
+            infoMsg += dropSetup(setZone, "opposite CHoCH")
+            setZone := na
+        else if setZone.entered
+            string skipWhy = entryCheck(setZone.dir, setLegLo, setLegHi)
+            if skipWhy == ""
+                sigDir      := setZone.dir
+                sigDistal   := setZone.dir > 0 ? setZone.btm : setZone.top
+                sigSweepExt := setZone.dir > 0 ? setLegLo : setLegHi
+                sigLegLo    := setLegLo
+                sigLegHi    := setLegHi
+                sigSweep    := setSweepName
+                sigScore    := setZone.score
+                sigKind     := setZone.fvg ? "FVG" : "OB"
+            else
+                infoMsg += alSetupInput ? "Setup " + arrow(setZone.dir) + " skipped: " + skipWhy + "; " : ""
+            setZone := na
+        else if not setZone.alive or not setZone.setup
+            infoMsg += dropSetup(setZone, "zone broken")
+            setZone := na
+
+    if armUp or armDn
+        int  d     = armUp ? 1 : -1
+        int  since = armUp ? lastSellSweep : lastBuySweep
+        int  span  = math.min(bar_index - since, OB_SCAN_BARS)
+        // Нога сетапа: от свипа до CHoCH. Её экстремумы — стоп за свипом и OTE.
+        float legLo = low
+        float legHi = high
+        for k = 0 to span
+            legLo := math.min(legLo, low[k])
+            legHi := math.max(legHi, high[k])
+        bool disp = not dispReqInput or legHasFvg(d, span)
+        if not disp and alSetupInput
+            infoMsg += "Setup " + arrow(d) + " rejected: no displacement; "
+        Zone z = disp ? pickSetupZone(d, since) : na
+        if not na(z)
+            if not na(setZone)
+                infoMsg += dropSetup(setZone, "replaced")
+            if z.fvg
+                z.score := zoneScore(d, z.top, z.btm, true, true)
+            setSetupLook(z, true)
+            setZone      := z
+            setExpire    := bar_index + setupTtlInput
+            setLegLo     := legLo
+            setLegHi     := legHi
+            setSweepName := d > 0 ? lastSellSweepName : lastBuySweepName
+            drawSd(d, legLo, legHi)
+            if armUp
+                usedSellSweep := lastSellSweep
+            else
+                usedBuySweep := lastBuySweep
+            if showSetupLblInput
+                keepLabel(label.new(bar_index, d > 0 ? low : high, "Setup " + arrow(d), color = d > 0 ? bullColorInput : SELL_LABEL_BG, textcolor = d > 0 ? BULL_LABEL_TEXT : BEAR_LABEL_TEXT, style = d > 0 ? label.style_label_up : label.style_label_down, size = signalSize, tooltip = "Setup armed: Sweep → CHoCH\nSwept: " + setSweepName + "\nDisplacement: " + (legHasFvg(d, span) ? "FVG ✓" : "—") + (kzName != "" ? "\nKillzone: " + kzName : "") + "\nZone: " + (z.fvg ? "FVG " : "OB ") + zoneRange(z) + "\nScore: " + str.tostring(z.score * 25) + "/100\nWaits " + str.tostring(setupTtlInput) + " bars for the first retest"))
+            if alSetupInput
+                infoMsg += "Setup " + arrow(d) + " armed: Sweep " + setSweepName + " → CHoCH, zone " + zoneRange(z) + "; "
+
+// Сигналы входа: подтверждены закрытием бара (вся обработка выше — только при barConfirmed) и прогревом.
+bool longEntrySignal  = sigDir == 1 and isWarmedUp
+bool shortEntrySignal = sigDir == -1 and isWarmedUp
+
+var int lastSigBar   = na
+var int lastSigDir   = 0
+var int lastSigScore = 0
+
+// ══════════════════════════════════════════════════════════
+// 8. RISK MANAGEMENT — TRADE ENGINE
+// ══════════════════════════════════════════════════════════
+float slDistance = riskAtr * effSLMult
+
+var float  activeEntry = na
+var float  activeSL    = na
+var float  activeTP1   = na
+var float  activeTP2   = na
+var float  activeTP3   = na
+var int    activeDir   = 0
+var int    entryBarIdx = na
+var float  entryAtr    = na
+var float  entryRisk   = na     // исходный риск сделки |entry − SL на входе|: база R:R, не меняется при BE
+var int    entryScore  = 0
+var string entryKind   = ""
+var string entrySweep  = ""
+var string tp2Tag      = ""
+var string tp3Tag      = ""
+var bool   tp1Reached  = false
+var bool   tp2Reached  = false
+var bool   tp3Reached  = false
+var bool   beActive    = false
+
+// Статистика (пересчитывается по истории графика при каждой перезагрузке)
+var int         winCount   = 0
+var int         lossCount  = 0
+var string      formStr    = ""
+var array<int>  tradeTimes = array.new<int>()
+var array<bool> tradeWins  = array.new<bool>()
+
+// ── Bar-start captures: BE, перенесённый в ЭТОМ баре, не стопит в этом баре ──
+bool  beActiveAtBarStart = beActive
+float effectiveSL        = activeSL
+
+// ── Hit detection: entry-bar guard + confirmed only ──
+bool canCheckHit = activeDir != 0 and not na(entryBarIdx) and bar_index > entryBarIdx and barConfirmed
+
+bool slHitRaw  = canCheckHit and (activeDir == 1 ? low <= effectiveSL : high >= effectiveSL)
+bool tp1HitRaw = canCheckHit and (activeDir == 1 ? high >= activeTP1 : low <= activeTP1)
+bool tp2HitRaw = canCheckHit and (activeDir == 1 ? high >= activeTP2 : low <= activeTP2)
+bool tp3HitRaw = canCheckHit and (activeDir == 1 ? high >= activeTP3 : low <= activeTP3)
+
+// TP-приоритет: касание TP регистрируется независимо от SL этого бара
+bool tp1FirstTouch = tp1HitRaw and not tp1Reached
+bool tp2FirstTouch = tp2HitRaw and not tp2Reached
+bool tp3FirstTouch = tp3HitRaw and not tp3Reached
+
+if tp1FirstTouch
+    tp1Reached := true
+if tp2FirstTouch
+    tp2Reached := true
+if tp3FirstTouch
+    tp3Reached := true
+
+// ── Break-even после TP1 ──
+bool  beJustActivated = false
+bool  beExitNow       = false   // цена на закрытии уже за уровнем BE — позиция закрывается по close
+float beLevel         = na      // снимок события BE: цена и направление на момент переноса (алерт не читает изменяемый activeSL)
+int   beDir           = 0
+if beInput and tp1FirstTouch and not beActive and activeDir != 0
+    // Смещение BE ограничено половиной фактического пути до TP1: при стопе Wick/Zone/Sweep риск не равен ATR-пресету.
+    float beOff   = math.min(beOffsetInput * nz(entryAtr, 0.0), 0.5 * math.abs(activeTP1 - activeEntry))
+    // Уровень BE на сетке тиков, консервативно к входу: long — вниз, short — вверх.
+    float bePrice = activeDir == 1 ? floorTick(activeEntry + beOff) : ceilTick(activeEntry - beOff)
+    beLevel := bePrice
+    beDir   := activeDir
+    // Стоп над рынком (long) / под рынком (short) защищать не может: такая позиция закрывается по цене закрытия.
+    if activeDir == 1 ? close < bePrice : close > bePrice
+        beExitNow := not tp3HitRaw
+    else
+        activeSL        := bePrice
+        beActive        := true
+        beJustActivated := true
+
+// ── Snapshots ДО сброса ──
+var float hitSL    = na
+var float hitEntry = na
+if slHitRaw
+    hitSL    := effectiveSL
+    hitEntry := activeEntry
+
+float exitEntry         = activeEntry
+int   exitDir           = activeDir
+float exitTP1           = activeTP1
+float exitTP2           = activeTP2
+float exitTP3           = activeTP3
+bool  exitBeActive      = beActiveAtBarStart
+bool  displayTp1Reached = tp1Reached
+bool  displayTp2Reached = tp2Reached
+bool  displayTp3Reached = tp3Reached
+
+// ── Закрытие: SL блокируется первым касанием TP этого бара (TP-приоритет) ──
+bool closeBySl  = slHitRaw and not tp1FirstTouch and not tp3FirstTouch
+bool evSlHit    = closeBySl and activeDir != 0
+bool evTp3Close = tp3HitRaw and activeDir != 0
+bool evBeExit   = beExitNow and activeDir != 0
+
+if (tp3HitRaw or closeBySl or evBeExit) and activeDir != 0
+    bool tradeWin = tp1Reached
+    if tradeWin
+        winCount += 1
+    else
+        lossCount += 1
+    formStr := formStr + (tradeWin ? "▰" : "▱")
+    if str.length(formStr) > FORM_LEN
+        formStr := str.substring(formStr, str.length(formStr) - FORM_LEN)
+    tradeTimes.push(barCloseT)
+    tradeWins.push(tradeWin)
+    while tradeTimes.size() > 0 and (tradeTimes.size() > STATS_MAX_TRADES or tradeTimes.get(0) < barCloseT - MS_DAY * STATS_PRUNE_DAYS)
+        tradeTimes.shift()
+        tradeWins.shift()
+    activeDir   := 0
+    activeEntry := na
+    activeSL    := na
+    activeTP1   := na
+    activeTP2   := na
+    activeTP3   := na
+    entryBarIdx := na
+    tp1Reached  := false
+    tp2Reached  := false
+    tp3Reached  := false
+    beActive    := false
+
+// ── План сделки: SL и цели рассчитываются и проверяются ДО любого изменения позиции ──
+// Уровни приводятся к шагу цены: стоп — дальше от входа, цели — ближе к входу.
+// Если TP1 не дальше входа или соседние цели слились после округления, сделка не открывается.
+buildPlan(int dir) =>
+    string why  = ""
+    float  sl   = na
+    float  risk = na
+    float  tp1  = na
+    float  tp2  = na
+    float  tp3  = na
+    string tag2 = ""
+    string tag3 = ""
+    if dir != 0
+        if slDistance <= 0
+            why := "ATR not ready"
+        else
+            float buf     = riskAtr * WICK_BUFFER_ATR
+            float minD    = riskAtr * MIN_SL_ATR
+            float slAtr   = close - dir * slDistance
+            float slWick  = dir > 0 ? math.min(low - buf, close - minD) : math.max(high + buf, close + minD)
+            float slZone  = dir > 0 ? math.min(nz(sigDistal, low) - buf, close - minD) : math.max(nz(sigDistal, high) + buf, close + minD)
+            float slSweep = dir > 0 ? math.min(nz(sigSweepExt, low) - buf, close - minD) : math.max(nz(sigSweepExt, high) + buf, close + minD)
+            float slRaw   = slModeInput == SL_ATR ? slAtr : slModeInput == SL_ZONE ? slZone : slModeInput == SL_SWEEP ? slSweep : slWick
+            sl   := dir > 0 ? floorTick(slRaw) : ceilTick(slRaw)
+            risk := dir * (close - sl)
+            if risk <= 0
+                why := "invalid risk (stop within one tick)"
+            else
+                // Цели: R-кратные; в режимах Liquidity / Std Deviations TP2/TP3 — следующий уровень за предыдущей целью.
+                tp1 := close + dir * risk * effTP1m
+                tp2 := close + dir * risk * effTP2m
+                tp3 := close + dir * risk * effTP3m
+                if tpModeInput != TP_R
+                    [l2, n2] = nextTarget(dir, tp1, sigLegLo, sigLegHi)
+                    if not na(l2)
+                        tag2 := n2
+                        tp2  := l2
+                    [l3, n3] = nextTarget(dir, tp2, sigLegLo, sigLegHi)
+                    if not na(l3)
+                        tag3 := n3
+                        tp3  := l3
+                    else
+                        tp3 := dir > 0 ? math.max(tp3, tp2 + risk) : math.min(tp3, tp2 - risk)
+                tp1 := dir > 0 ? floorTick(tp1) : ceilTick(tp1)
+                tp2 := dir > 0 ? floorTick(tp2) : ceilTick(tp2)
+                tp3 := dir > 0 ? floorTick(tp3) : ceilTick(tp3)
+                if dir * (tp1 - close) <= 0
+                    why := "TP1 within one tick of entry"
+                else if dir * (tp2 - tp1) <= 0 or dir * (tp3 - tp2) <= 0
+                    why := "targets collapse within one tick"
+    [dir != 0 and why == "", why, sl, risk, tp1, tp2, tp3, tag2, tag3]
+
+// ── Signal-Trade Parity ──
+int sigBarDir = longEntrySignal ? 1 : shortEntrySignal ? -1 : 0
+[planOk, planWhy, planSL, planRisk, planTP1, planTP2, planTP3, planTag2, planTag3] = buildPlan(sigBarDir)
+
+// Реверс ⇔ сигнал строго ПРОТИВОПОЛОЖЕН открытой позиции и план новой сделки валиден.
+// При невалидном плане старая позиция остаётся открытой, сигнал сообщается с причиной. Сигнал в ту же сторону сделку не трогает.
+bool reverseToShort = sigBarDir == -1 and activeDir == 1 and planOk
+bool reverseToLong  = sigBarDir == 1 and activeDir == -1 and planOk
+
+bool evReversal = false
+bool revWasWin  = false
+if reverseToShort or reverseToLong
+    evReversal := true
+    bool tradeWin = tp1Reached
+    revWasWin := tradeWin
+    if tradeWin
+        winCount += 1
+    else
+        lossCount += 1
+    formStr := formStr + (tradeWin ? "▰" : "▱")
+    if str.length(formStr) > FORM_LEN
+        formStr := str.substring(formStr, str.length(formStr) - FORM_LEN)
+    tradeTimes.push(barCloseT)
+    tradeWins.push(tradeWin)
+    while tradeTimes.size() > 0 and (tradeTimes.size() > STATS_MAX_TRADES or tradeTimes.get(0) < barCloseT - MS_DAY * STATS_PRUNE_DAYS)
+        tradeTimes.shift()
+        tradeWins.shift()
+    activeDir   := 0
+    activeEntry := na
+    activeSL    := na
+    activeTP1   := na
+    activeTP2   := na
+    activeTP3   := na
+    entryBarIdx := na
+    tp1Reached  := false
+    tp2Reached  := false
+    tp3Reached  := false
+    beActive    := false
+
+// ── Entry (движок здесь flat — изначально или освобождён закрытием/реверсом); план уже проверен ──
+bool evLongEntry  = false
+bool evShortEntry = false
+
+if planOk and activeDir == 0
+    activeEntry  := close
+    activeSL     := planSL
+    activeTP1    := planTP1
+    activeTP2    := planTP2
+    activeTP3    := planTP3
+    entryRisk    := planRisk
+    tp2Tag       := planTag2
+    tp3Tag       := planTag3
+    entrySweep   := sigSweep
+    activeDir    := sigBarDir
+    entryBarIdx  := bar_index
+    entryAtr     := riskAtr
+    entryScore   := sigScore
+    entryKind    := sigKind
+    tp1Reached   := false
+    tp2Reached   := false
+    tp3Reached   := false
+    beActive     := false
+    evLongEntry  := sigBarDir == 1
+    evShortEntry := sigBarDir == -1
+
+// «Last signal» — только исполненные входы; сигнал без сделки сообщается с причиной.
+if evLongEntry or evShortEntry
+    lastSigBar   := bar_index
+    lastSigDir   := evLongEntry ? 1 : -1
+    lastSigScore := sigScore
+if sigBarDir != 0 and not (evLongEntry or evShortEntry) and alSetupInput
+    infoMsg += "Signal " + arrow(sigBarDir) + " not executed: " + (activeDir == sigBarDir ? "position already open" : planWhy + (activeDir != 0 ? ", opposite position kept" : "")) + "; "
+
+// ══════════════════════════════════════════════════════════
+// 9. PLOTS & VISUALS
+// ══════════════════════════════════════════════════════════
+// ── OB старшего ТФ (рамки обновляются при любой смене границ) ──
+var box hBull = na
+var box hBear = na
+if htfActive and htfShowInput
+    if nz(hbT, -1) != nz(hbT[1], -1) or nz(hbTop) != nz(hbTop[1]) or nz(hbBtm) != nz(hbBtm[1])
+        if not na(hBull)
+            hBull.delete()
+        if na(hbT)
+            hBull := na
+        else
+            hBull := box.new(hbT, hbTop, time, hbBtm, xloc = xloc.bar_time, border_color = color.new(bullColorInput, 20), border_width = 2, border_style = line.style_dashed, bgcolor = color.new(bullColorInput, 92), text = "HTF " + htfInput + " OB", text_size = textSize, text_color = BULL_TEXT, text_halign = text.align_left, text_valign = text.align_top)
+    else if not na(hBull)
+        hBull.set_right(time)
+    if nz(hsT, -1) != nz(hsT[1], -1) or nz(hsTop) != nz(hsTop[1]) or nz(hsBtm) != nz(hsBtm[1])
+        if not na(hBear)
+            hBear.delete()
+        if na(hsT)
+            hBear := na
+        else
+            hBear := box.new(hsT, hsTop, time, hsBtm, xloc = xloc.bar_time, border_color = color.new(bearColorInput, 20), border_width = 2, border_style = line.style_dashed, bgcolor = color.new(bearColorInput, 92), text = "HTF " + htfInput + " OB", text_size = textSize, text_color = BEAR_TEXT, text_halign = text.align_left, text_valign = text.align_bottom)
+    else if not na(hBear)
+        hBear.set_right(time)
+
+// ── Premium / Discount / OTE: постоянные объекты, координаты обновляются setters ──
+var box  pdPrem = na
+var box  pdDisc = na
+var box  pdOte  = na
+var line pdEq   = na
+if barstate.islast
+    bool pdOk = pdOnInput and not na(rHi) and not na(rLo) and rHi > rLo
+    if pdOk
+        int   left = clampX(math.min(rHiIdx, rLoIdx))
+        int   rgt  = bar_index + PD_FORWARD_BARS
+        float eqP  = (rHi + rLo) / 2
+        float rng  = rHi - rLo
+        if na(pdPrem)
+            pdPrem := box.new(left, rHi, rgt, eqP, border_color = TRANSPARENT, bgcolor = color.new(bearColorInput, 94), text = "Premium", text_size = textSize, text_color = BEAR_TEXT, text_halign = text.align_right, text_valign = text.align_top)
+            pdDisc := box.new(left, eqP, rgt, rLo, border_color = TRANSPARENT, bgcolor = color.new(bullColorInput, 94), text = "Discount", text_size = textSize, text_color = BULL_TEXT, text_halign = text.align_right, text_valign = text.align_bottom)
+            pdEq   := line.new(left, eqP, rgt, eqP, color = LINE_SUBTLE, style = line.style_dashed, width = 1)
+        else
+            pdPrem.set_lefttop(left, rHi)
+            pdPrem.set_rightbottom(rgt, eqP)
+            pdDisc.set_lefttop(left, eqP)
+            pdDisc.set_rightbottom(rgt, rLo)
+            pdEq.set_xy1(left, eqP)
+            pdEq.set_xy2(rgt, eqP)
+        if oteOnInput and sExt.trend != 0
+            float oTop = sExt.trend > 0 ? rHi - OTE_NEAR * rng : rLo + OTE_FAR * rng
+            float oBot = sExt.trend > 0 ? rHi - OTE_FAR * rng : rLo + OTE_NEAR * rng
+            if na(pdOte)
+                pdOte := box.new(left, oTop, rgt, oBot, border_color = color.new(oteColorInput, 50), bgcolor = color.new(oteColorInput, 88), text = "OTE " + arrow(sExt.trend), text_size = textSize, text_color = AMBER_TEXT, text_halign = text.align_right)
+            else
+                pdOte.set_lefttop(left, oTop)
+                pdOte.set_rightbottom(rgt, oBot)
+                pdOte.set_text("OTE " + arrow(sExt.trend))
+        else if not na(pdOte)
+            pdOte.delete()
+            pdOte := na
+    else
+        box.delete(pdPrem)
+        box.delete(pdDisc)
+        box.delete(pdOte)
+        line.delete(pdEq)
+        pdPrem := na
+        pdDisc := na
+        pdOte  := na
+        pdEq   := na
+
+// ══════════════════════════════════════════════════════════
+// 10. LABELS & SHAPES
+// ══════════════════════════════════════════════════════════
+if showSignalsInput and evLongEntry
+    string buyTip = "Long entry · Sweep → CHoCH → " + entryKind + " retest\nSwept: " + entrySweep + "\nScore: " + str.tostring(entryScore * 25) + "/100\nRSI: " + str.tostring(rsiValue, "#.0") + "\nSL: " + fmtPrice(activeSL) + " | TP1: " + fmtPrice(activeTP1)
+    keepLabel(label.new(bar_index, low, "▲ BUY", color = bullColorInput, textcolor = BULL_LABEL_TEXT, style = label.style_label_up, size = signalSize, tooltip = buyTip))
+
+if showSignalsInput and evShortEntry
+    string sellTip = "Short entry · Sweep → CHoCH → " + entryKind + " retest\nSwept: " + entrySweep + "\nScore: " + str.tostring(entryScore * 25) + "/100\nRSI: " + str.tostring(rsiValue, "#.0") + "\nSL: " + fmtPrice(activeSL) + " | TP1: " + fmtPrice(activeTP1)
+    keepLabel(label.new(bar_index, high, "▼ SELL", color = SELL_LABEL_BG, textcolor = BEAR_LABEL_TEXT, style = label.style_label_down, size = signalSize, tooltip = sellTip))
+
+// ══════════════════════════════════════════════════════════
+// 11. SL/TP LINES & LABELS
+// ══════════════════════════════════════════════════════════
+var line  entryLine = na
+var line  slLine    = na
+var line  tp1Line   = na
+var line  tp2Line   = na
+var line  tp3Line   = na
+var label entryLbl  = na
+var label slLbl     = na
+var label tp1Lbl    = na
+var label tp2Lbl    = na
+var label tp3Lbl    = na
+
+bool newEntry = evLongEntry or evShortEntry
+
+// Новый вход: старая запись сделки удаляется, рисуется новая (линии живут до следующего входа).
+if newEntry and showSlTpInput
+    line.delete(entryLine)
+    line.delete(slLine)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    line.delete(tp3Line)
+    label.delete(entryLbl)
+    label.delete(slLbl)
+    label.delete(tp1Lbl)
+    label.delete(tp2Lbl)
+    label.delete(tp3Lbl)
+    int x2 = bar_index + LINE_FORWARD_BARS
+    entryLine := line.new(bar_index, activeEntry, x2, activeEntry, color = ENTRY_COLOR, style = lineStyleFromString(entryLineStyleInput), width = 1)
+    slLine    := line.new(bar_index, activeSL, x2, activeSL, color = SL_COLOR, style = lineStyleFromString(slLineStyleInput), width = 2)
+    tp1Line   := line.new(bar_index, activeTP1, x2, activeTP1, color = TP1_COLOR, style = lineStyleFromString(tpLineStyleInput), width = 1)
+    tp2Line   := line.new(bar_index, activeTP2, x2, activeTP2, color = TP2_COLOR, style = lineStyleFromString(tpLineStyleInput), width = 1)
+    tp3Line   := line.new(bar_index, activeTP3, x2, activeTP3, color = TP3_COLOR, style = lineStyleFromString(tpLineStyleInput), width = 1)
+    if showSlTpLabelsInput
+        int xl = x2 + LABEL_OFFSET_BARS
+        entryLbl := label.new(xl, activeEntry, "ENTRY " + fmtPrice(activeEntry), color = ENTRY_COLOR, textcolor = LABEL_TEXT, style = label.style_label_left, size = labelSize)
+        slLbl    := label.new(xl, activeSL, "SL " + fmtPrice(activeSL) + formatPctFromEntry(activeSL, activeEntry), color = SL_COLOR, textcolor = LABEL_TEXT, style = label.style_label_left, size = labelSize)
+        tp1Lbl   := label.new(xl, activeTP1, "TP1 " + fmtPrice(activeTP1) + formatPctFromEntry(activeTP1, activeEntry), color = TP_LABEL_COLOR, textcolor = LABEL_TEXT, style = label.style_label_left, size = labelSize)
+        tp2Lbl   := label.new(xl, activeTP2, "TP2 " + (tp2Tag != "" ? tp2Tag + " " : "") + fmtPrice(activeTP2) + formatPctFromEntry(activeTP2, activeEntry), color = TP_LABEL_COLOR, textcolor = LABEL_TEXT, style = label.style_label_left, size = labelSize)
+        tp3Lbl   := label.new(xl, activeTP3, "TP3 " + (tp3Tag != "" ? tp3Tag + " " : "") + fmtPrice(activeTP3) + formatPctFromEntry(activeTP3, activeEntry), color = TP_LABEL_COLOR, textcolor = LABEL_TEXT, style = label.style_label_left, size = labelSize)
+
+// Продление активных линий (не сокращаем линии, нарисованные вперёд при входе)
+if activeDir != 0 and showSlTpInput and not newEntry and not na(slLine)
+    int xe = math.max(slLine.get_x2(), bar_index + LINE_UPDATE_BARS)
+    entryLine.set_x2(xe)
+    slLine.set_x2(xe)
+    tp1Line.set_x2(xe)
+    tp2Line.set_x2(xe)
+    tp3Line.set_x2(xe)
+    if showSlTpLabelsInput and not na(slLbl)
+        int xl = xe + LABEL_OFFSET_BARS
+        entryLbl.set_x(xl)
+        slLbl.set_x(xl)
+        tp1Lbl.set_x(xl)
+        tp2Lbl.set_x(xl)
+        tp3Lbl.set_x(xl)
+
+// TP-hit: solid teal + «✓» — из snapshot-переменных, не на баре нового входа
+if showSlTpInput and not newEntry
+    if displayTp1Reached and not na(tp1Line)
+        tp1Line.set_color(TP_HIT_COLOR)
+        tp1Line.set_style(line.style_solid)
+        if not na(tp1Lbl)
+            tp1Lbl.set_text("TP1 ✓ " + fmtPrice(exitTP1) + formatPctFromEntry(exitTP1, exitEntry))
+            tp1Lbl.set_color(TP_HIT_COLOR)
+    if displayTp2Reached and not na(tp2Line)
+        tp2Line.set_color(TP_HIT_COLOR)
+        tp2Line.set_style(line.style_solid)
+        if not na(tp2Lbl)
+            tp2Lbl.set_text("TP2 ✓ " + (tp2Tag != "" ? tp2Tag + " " : "") + fmtPrice(exitTP2) + formatPctFromEntry(exitTP2, exitEntry))
+            tp2Lbl.set_color(TP_HIT_COLOR)
+    if displayTp3Reached and not na(tp3Line)
+        tp3Line.set_color(TP_HIT_COLOR)
+        tp3Line.set_style(line.style_solid)
+        if not na(tp3Lbl)
+            tp3Lbl.set_text("TP3 ✓ " + (tp3Tag != "" ? tp3Tag + " " : "") + fmtPrice(exitTP3) + formatPctFromEntry(exitTP3, exitEntry))
+            tp3Lbl.set_color(TP_HIT_COLOR)
+
+// Break-even: затемнение SL, аннотация входа
+// Линия и подпись SL переезжают на фактическую цену BE: график показывает тот же стоп, что движок и панель.
+if showSlTpInput and beActive and activeDir != 0
+    if not na(slLine)
+        slLine.set_y1(activeSL)
+        slLine.set_y2(activeSL)
+        slLine.set_color(BE_COLOR)
+    if not na(slLbl)
+        slLbl.set_y(activeSL)
+        slLbl.set_text("SL BE " + fmtPrice(activeSL) + formatPctFromEntry(activeSL, activeEntry))
+        slLbl.set_color(color.new(BE_COLOR, 0))
+    if not na(entryLbl)
+        entryLbl.set_text("ENTRY " + fmtPrice(activeEntry) + "  → SL (BE)")
+        entryLbl.set_color(BE_COLOR)
+
+// ══════════════════════════════════════════════════════════
+// 12. DASHBOARD
+// ══════════════════════════════════════════════════════════
+dashPos = switch dashPosInput
+    "Top Left"     => position.top_left
+    "Top Right"    => position.top_right
+    "Bottom Left"  => position.bottom_left
+    "Bottom Right" => position.bottom_right
+    "Middle Right" => position.middle_right
+    =>                position.top_right
+
+var table dashTable = na
+
+if barstate.islast
+    if not na(dashTable)
+        table.delete(dashTable)
+        dashTable := na
+    if showDashInput
+        int marketRows = showMarketSecInput ? 9 : 0
+        int ictRows    = showIctSecInput ? 11 : 0
+        int tradeRows  = showTradeSecInput ? (activeDir != 0 ? 8 : 2) : 0
+        int statsRows  = showStatsSecInput ? 6 : 0
+        int totalRows  = 2 + marketRows + ictRows + tradeRows + statsRows
+        dashTable := table.new(dashPos, 2, totalRows, bgcolor = TABLE_BG, border_color = TABLE_BORDER, border_width = 1, frame_color = TABLE_BORDER, frame_width = 1)
+        int r = 0
+
+        // Заголовок (окрашен по внешнему тренду)
+        color headerBg = sExt.trend > 0 ? HEADER_BG_BULL : sExt.trend < 0 ? HEADER_BG_BEAR : HEADER_BG
+        table.cell(dashTable, 0, r, "◆ " + SHORT_NAME + " · " + trendWord(sExt.trend), text_color = HEADER_TEXT, bgcolor = headerBg, text_size = dashFont, text_halign = text.align_center)
+        table.merge_cells(dashTable, 0, r, 1, r)
+        r += 1
+
+        if showMarketSecInput
+            float  pos      = not na(rHi) and not na(rLo) and rHi > rLo ? safeDiv(close - rLo, rHi - rLo) * 100 : na
+            string posTxt   = na(pos) ? "—" : (pos >= 50 ? "Premium " : "Discount ") + str.tostring(pos, "#") + "%"
+            string ageTxt   = na(trendStartBar) or sExt.trend == 0 ? "—" : str.tostring(bar_index - trendStartBar) + " bars"
+            string htfTxt   = htfActive ? trendWord(hTrend) + " (" + htfInput + ")" : "Off"
+            string posState = activeDir == 1 ? "Long" : activeDir == -1 ? "Short" : "Flat"
+            string lastTxt  = na(lastSigBar) ? "—" : (lastSigDir > 0 ? "▲ BUY" : "▼ SELL") + " · " + str.tostring(lastSigScore * 25) + " (" + str.tostring(bar_index - lastSigBar) + ")"
+            dashDivider(dashTable, r, "— Market —")
+            r += 1
+            dashRow(dashTable, r, "Trend", trendWord(sExt.trend), trendTextColor(sExt.trend), "External structure direction (last BOS / CHoCH)")
+            r += 1
+            dashRow(dashTable, r, "Internal", trendWord(sInt.trend), trendTextColor(sInt.trend), "Internal (minor) structure direction")
+            r += 1
+            dashRow(dashTable, r, "Age", ageTxt, TEXT_COLOR, "Bars since the external trend last changed")
+            r += 1
+            dashRow(dashTable, r, "HTF Bias", htfTxt, htfActive ? trendTextColor(hTrend) : TEXT_MUTED, "Trend of the higher timeframe from its last closed bar")
+            r += 1
+            dashRow(dashTable, r, "Range", posTxt, na(pos) ? TEXT_MUTED : pos >= 50 ? BEAR_TEXT : BULL_TEXT, "Price position in the current dealing range: 0% = range low, 100% = range high")
+            r += 1
+            dashRow(dashTable, r, "Signal", posState, activeDir == 1 ? BULL_TEXT : activeDir == -1 ? BEAR_TEXT : TEXT_MUTED, "Current position of the trade engine")
+            r += 1
+            dashRow(dashTable, r, "Last signal", lastTxt, lastSigDir > 0 ? BULL_TEXT : lastSigDir < 0 ? BEAR_TEXT : TEXT_MUTED, "Last confirmed signal · score /100 (bars ago)")
+            r += 1
+            dashRow(dashTable, r, "Timeframe", timeframe.period, TEXT_COLOR, "Chart timeframe")
+            r += 1
+
+        if showIctSecInput
+            int  nBull = 0
+            int  nBear = 0
+            Zone zDn   = na
+            Zone zUp   = na
+            for z in obs
+                if z.dir > 0
+                    nBull += 1
+                    if z.btm <= close and (na(zDn) or z.top > zDn.top)
+                        zDn := z
+                else
+                    nBear += 1
+                    if z.top >= close and (na(zUp) or z.btm < zUp.btm)
+                        zUp := z
+            string setTxt = na(setZone) ? "—" : arrow(setZone.dir) + " armed · " + str.tostring(setExpire - bar_index) + " bars left"
+            dashDivider(dashTable, r, "— ICT —")
+            r += 1
+            dashRow(dashTable, r, "Zones ▲ / ▼", str.tostring(nBull) + " / " + str.tostring(nBear), TEXT_COLOR, "Active order / breaker blocks: demand / supply")
+            r += 1
+            dashRow(dashTable, r, "FVG", str.tostring(fvgs.size()), TEXT_COLOR, "Active fair value gaps (both sides)")
+            r += 1
+            dashRow(dashTable, r, "Demand", zoneRange(zDn), na(zDn) ? TEXT_MUTED : BULL_TEXT, "Nearest demand zone at or below price")
+            r += 1
+            dashRow(dashTable, r, "Supply", zoneRange(zUp), na(zUp) ? TEXT_MUTED : BEAR_TEXT, "Nearest supply zone at or above price")
+            r += 1
+            dashRow(dashTable, r, "Setup", setTxt, na(setZone) ? TEXT_MUTED : trendTextColor(setZone.dir), "Armed Sweep → CHoCH setup waiting for its first retest" + (na(setZone) ? "" : ". Swept: " + setSweepName))
+            r += 1
+            string kzTxt  = not kzActive ? "n/a (TF > 1H)" : kzName == "" ? (inSb ? "Silver Bullet" : "—") : kzName + (inSb ? " · SB" : "")
+            string pdhTxt = dayLvlOk and not na(pdh) ? fmtPrice(pdh) + " / " + fmtPrice(pdl) : "—"
+            dashRow(dashTable, r, "Killzone", kzTxt, kzName != "" or inSb ? AMBER_TEXT : TEXT_MUTED, "Current killzone (" + kzTzInput + "). Setup time filter: " + timeFilterInput)
+            r += 1
+            dashRow(dashTable, r, "PDH / PDL", pdhTxt, TEXT_COLOR, "Previous day high / low — key liquidity")
+            r += 1
+            string rbpbTxt  = (rbOnInput ? str.tostring(rbs.size()) : "off") + " / " + (pbOnInput ? str.tostring(pbs.size()) : "off")
+            string biasTxt  = not biasActive ? "off" : dailyBias > 0 ? "▲ Bullish → PDH" : dailyBias < 0 ? "▼ Bearish → PDL" : "— Neutral"
+            string judasTxt = not judasOnInput or not biasActive ? "off" : not kzActive ? "n/a (TF > 1H)" : na(moPrice) ? "n/a (no 00:00 bar)" : judasState == 2 ? arrow(judasDir) + " confirmed" : judasState == 1 ? "forming" : "—"
+            dashRow(dashTable, r, "RB / PB", rbpbTxt, TEXT_COLOR, "Active rejection / propulsion blocks (both sides)")
+            r += 1
+            dashRow(dashTable, r, "Daily Bias", biasTxt, trendTextColor(dailyBias), "Draw on liquidity from the previous day's close vs. the prior day range. Setup filter: " + biasFilterInput)
+            r += 1
+            dashRow(dashTable, r, "Judas", judasTxt, judasState == 2 ? AMBER_TEXT : TEXT_MUTED, "Judas Swing today: false move beyond the Midnight Open against the bias, then a close back across it")
+            r += 1
+
+        if showTradeSecInput
+            dashDivider(dashTable, r, "— Trade —")
+            r += 1
+            if activeDir != 0
+                float  slDistPct = safeDiv(math.abs(activeEntry - activeSL), activeEntry) * 100
+                // R:R по фактическим целям (Liquidity / SD тоже) и исходному риску, а не по пресету.
+                float  rr1       = safeDiv(math.abs(activeTP1 - activeEntry), entryRisk)
+                float  rr2       = safeDiv(math.abs(activeTP2 - activeEntry), entryRisk)
+                float  rr3       = safeDiv(math.abs(activeTP3 - activeEntry), entryRisk)
+                string rrTxt     = "1:" + str.tostring(rr1, "#.#") + " / 1:" + str.tostring(rr3, "#.#")
+                color  rrCol     = rr1 >= 1.5 ? BULL_TEXT : rr1 >= 1.0 ? NEUTRAL_TEXT : BEAR_TEXT
+                color  riskCol   = slDistPct > 3.0 ? BEAR_TEXT : slDistPct > 1.0 ? NEUTRAL_TEXT : BULL_TEXT
+                dashRow(dashTable, r, "Entry", (activeDir > 0 ? "▲ " : "▼ ") + fmtPrice(activeEntry), ENTRY_COLOR, "Entry price (close of the retest bar) · " + entryKind + " setup, score " + str.tostring(entryScore * 25) + "/100")
+                r += 1
+                dashRow(dashTable, r, "SL", (beActive ? "BE @ " : "") + fmtPrice(activeSL), beActive ? BE_COLOR : SL_COLOR, "Stop-loss (" + slModeInput + "). Moves to break-even after TP1 if enabled")
+                r += 1
+                dashRow(dashTable, r, "TP1", (tp1Reached ? "✓ " : "") + fmtPrice(activeTP1), tp1Reached ? TP_HIT_COLOR : TP_LABEL_COLOR, "Take-profit 1 = " + str.tostring(rr1, "#.#") + "R of the initial risk. Reaching TP1 makes the trade a win")
+                r += 1
+                dashRow(dashTable, r, "TP2", (tp2Reached ? "✓ " : "") + (tp2Tag != "" ? tp2Tag + " " : "") + fmtPrice(activeTP2), tp2Reached ? TP_HIT_COLOR : TP_LABEL_COLOR, "Take-profit 2 = " + str.tostring(rr2, "#.#") + "R of the initial risk" + (tp2Tag != "" ? " · target: " + tp2Tag : ""))
+                r += 1
+                dashRow(dashTable, r, "TP3", (tp3Reached ? "✓ " : "") + (tp3Tag != "" ? tp3Tag + " " : "") + fmtPrice(activeTP3), tp3Reached ? TP_HIT_COLOR : TP_LABEL_COLOR, "Take-profit 3 = " + str.tostring(rr3, "#.#") + "R of the initial risk" + (tp3Tag != "" ? " · target: " + tp3Tag : "") + ". Closes the trade")
+                r += 1
+                dashRow(dashTable, r, "R:R", rrTxt, rrCol, "Risk:Reward to TP1 / TP3 from the actual targets and the initial SL distance (break-even does not change it)")
+                r += 1
+                dashRow(dashTable, r, "SL Dist", str.tostring(slDistPct, "#.##") + "%", riskCol, "Distance from entry to the current stop, % of entry")
+                r += 1
+            else
+                table.cell(dashTable, 0, r, "Flat · waiting for setup", text_color = TEXT_MUTED, bgcolor = TABLE_BG, text_size = dashFont, text_halign = text.align_center)
+                table.merge_cells(dashTable, 0, r, 1, r)
+                r += 1
+
+        if showStatsSecInput
+            int pW = 0
+            int pL = 0
+            if statsPeriodInput == "All-Time"
+                pW := winCount
+                pL := lossCount
+            else
+                int cutoff = statsPeriodInput == "24 Hours" ? barCloseT - MS_DAY : barCloseT - MS_DAY * 30
+                [w, l] = periodStats(tradeTimes, tradeWins, cutoff)
+                pW := w
+                pL := l
+            int    pTotal    = pW + pL
+            string periodTag = statsPeriodInput == "24 Hours" ? "24H" : statsPeriodInput == "30 Days" ? "30D" : "All-Time"
+            float  pWinRate  = pTotal > 0 ? pW / float(pTotal) * 100.0 : 0.0
+            string wrTxt     = pTotal > 0 ? str.tostring(pWinRate, "#.#") + "%  " + buildGauge(pWinRate, 100, 8) : "—"
+            color  wrCol     = pTotal == 0 ? TEXT_MUTED : pWinRate >= 55.0 ? BULL_TEXT : pWinRate >= 45.0 ? NEUTRAL_TEXT : BEAR_TEXT
+            dashDivider(dashTable, r, "— Stats · " + periodTag + " —")
+            r += 1
+            dashRow(dashTable, r, "Trades", pTotal > 0 ? str.tostring(pTotal) : "—", pTotal > 0 ? TEXT_COLOR : TEXT_MUTED, "Closed trades in the period. Recalculated from the loaded chart history on every reload or settings change")
+            r += 1
+            dashRow(dashTable, r, "Wins", pTotal > 0 ? str.tostring(pW) : "—", pTotal > 0 ? BULL_TEXT : TEXT_MUTED, "A trade is a WIN once TP1 is touched (TP3, BE stop, BE exit at close, reversal after TP1)")
+            r += 1
+            dashRow(dashTable, r, "Losses", pTotal > 0 ? str.tostring(pL) : "—", pTotal > 0 ? BEAR_TEXT : TEXT_MUTED, "Closed before TP1: SL hit or reversal before TP1")
+            r += 1
+            dashRow(dashTable, r, "Win rate", wrTxt, wrCol, "Wins / closed trades. Optimistic intrabar fill model (TP priority). Not a backtest")
+            r += 1
+            dashRow(dashTable, r, "Form", formStr == "" ? "—" : formStr, formStr == "" ? TEXT_MUTED : TEXT_COLOR, "▰ = win · ▱ = loss (newest right). Not filtered by period")
+            r += 1
+
+        table.cell(dashTable, 0, r, SHORT_NAME + " · " + INDICATOR_VERSION, text_color = TEXT_MUTED, bgcolor = TABLE_BG, text_size = dashFontSub, text_halign = text.align_center)
+        table.merge_cells(dashTable, 0, r, 1, r)
+
+// ══════════════════════════════════════════════════════════
+// 13. WATERMARK
+// ══════════════════════════════════════════════════════════
+var table wmTable = na
+if barstate.islast and showWatermarkInput
+    if na(wmTable)
+        wmTable := table.new(position.bottom_center, 1, 1, bgcolor = TRANSPARENT, border_color = TRANSPARENT, border_width = 0, frame_color = TRANSPARENT, frame_width = 0)
+    table.cell(wmTable, 0, 0, BRAND, text_color = WM_COLOR, text_size = size.normal, text_halign = text.align_center, bgcolor = TRANSPARENT)
+
+// ══════════════════════════════════════════════════════════
+// 14. ALERTS (внутрибарная хронология: management → closures → reversal → entries → info)
+// ══════════════════════════════════════════════════════════
+string aTick  = syminfo.tickerid
+string aTf    = timeframe.period
+string aPrice = fmtPrice(close)
+string aTime  = str.format_time(barCloseT, "yyyy-MM-dd HH:mm", syminfo.timezone) + " (bar close)"
+
+// 1. Trade management
+if beJustActivated and alTpBeInput
+    string beText = "🛡️ BREAK-EVEN | " + aTick + " | " + (beDir == 1 ? "Long" : "Short") + " | SL → " + fmtPrice(beLevel)
+    alert(webhookInput ? jsonEvent("breakeven", beDir, beLevel) : beText, alert.freq_once_per_bar_close)
+if tp1FirstTouch and alTpBeInput
+    string tp1Text = "🎯 TP1 HIT | " + aTick + " | " + (exitDir == 1 ? "Long" : "Short") + " | TP1: " + fmtPrice(exitTP1)
+    alert(webhookInput ? jsonEvent("tp1", exitDir, exitTP1) : tp1Text, alert.freq_once_per_bar_close)
+if tp2FirstTouch and alTpBeInput
+    string tp2Text = "🎯🎯 TP2 HIT | " + aTick + " | " + (exitDir == 1 ? "Long" : "Short") + " | TP2: " + fmtPrice(exitTP2)
+    alert(webhookInput ? jsonEvent("tp2", exitDir, exitTP2) : tp2Text, alert.freq_once_per_bar_close)
+
+// 2. Closures
+if evTp3Close and alTpBeInput
+    string tp3Text = "🏆 TP3 HIT | " + aTick + " | " + (exitDir == 1 ? "Long" : "Short") + " | Entry: " + fmtPrice(exitEntry) + " | TP3: " + fmtPrice(exitTP3)
+    alert(webhookInput ? jsonEvent("tp3", exitDir, exitTP3) : tp3Text, alert.freq_once_per_bar_close)
+if evSlHit and alSlRevInput
+    string slDirStr  = exitDir == 1 ? "Long" : "Short"
+    string textSlHit = (exitBeActive ? "🛡️ BE STOP-OUT | " : "🛑 SL HIT | ") + aTick + " | " + slDirStr + " | Entry: " + fmtPrice(hitEntry) + " | SL: " + fmtPrice(hitSL)
+    alert(webhookInput ? jsonEvent(exitBeActive ? "be_stop" : "sl", exitDir, hitSL) : textSlHit, alert.freq_once_per_bar_close)
+if evBeExit and alTpBeInput
+    string beExitText = "🛡️ BE EXIT @ CLOSE | " + aTick + " | " + (exitDir == 1 ? "Long" : "Short") + " | Entry: " + fmtPrice(exitEntry) + " | Close: " + aPrice + " | price already beyond BE " + fmtPrice(beLevel)
+    alert(webhookInput ? jsonEvent("be_close", exitDir, close) : beExitText, alert.freq_once_per_bar_close)
+
+// 3. Reversal
+if evReversal and alSlRevInput
+    string revText = "🔄 REVERSAL | " + aTick + " | → " + (reverseToLong ? "LONG" : "SHORT") + " | Price: " + aPrice + " | " + (revWasWin ? "Closed after TP1 (win)" : "Closed before TP1 (loss)")
+    alert(webhookInput ? jsonEvent("reversal", reverseToLong ? 1 : -1, close) : revText, alert.freq_once_per_bar_close)
+
+// 4. New entries (всегда)
+if evLongEntry or evShortEntry
+    string eSl    = str.tostring(nz(activeSL), format.mintick)
+    string eTp1   = str.tostring(nz(activeTP1), format.mintick)
+    string eTp2   = str.tostring(nz(activeTP2), format.mintick)
+    string eTp3   = str.tostring(nz(activeTP3), format.mintick)
+    string eRr    = str.tostring(safeDiv(math.abs(activeTP1 - activeEntry), entryRisk), "#.##")
+    string eScore = str.tostring(entryScore * 25)
+    string jsonEntry = '{"action":"' + (evLongEntry ? "buy" : "sell") + '","ticker":"' + aTick + '","tf":"' + aTf + '","price":' + str.tostring(close, format.mintick) + ',"score":' + eScore + ',"setup":"' + entryKind + '","swept":"' + entrySweep + '","killzone":"' + kzName + '","sl":' + eSl + ',"tp1":' + eTp1 + ',"tp2":' + eTp2 + ',"tp3":' + eTp3 + ',"rr":' + eRr + '}'
+    string textEntry = (evLongEntry ? "🟢 LONG | " : "🔴 SHORT | ") + aTick + " | TF: " + aTf + " | Price: " + aPrice + " | Setup: Sweep " + entrySweep + " → CHoCH → " + entryKind + " | Score: " + eScore + "/100 | SL: " + eSl + " | TP1: " + eTp1 + " | TP2: " + (tp2Tag != "" ? tp2Tag + " " : "") + eTp2 + " | TP3: " + (tp3Tag != "" ? tp3Tag + " " : "") + eTp3 + " | R:R: " + eRr + " | Time: " + aTime
+    alert(webhookInput ? jsonEntry : textEntry, alert.freq_once_per_bar_close)
+
+// 5. Info (структура, свипы, касания зон, FVG, сетапы)
+if infoMsg != ""
+    string infoJson = '{"event":"info","ticker":"' + aTick + '","tf":"' + aTf + '","msg":"' + infoMsg + '"}'
+    string infoText = "ℹ️ ICT | " + aTick + " | TF: " + aTf + " | " + infoMsg
+    alert(webhookInput ? infoJson : infoText, alert.freq_once_per_bar_close)
