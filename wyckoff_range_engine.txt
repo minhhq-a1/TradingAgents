@@ -1,0 +1,1846 @@
+//@version=6
+// ══════════════════════════════════════════════════════════
+// WYCKOFF RANGE ENGINE [WillyAlgoTrader]
+// ══════════════════════════════════════════════════════════
+// Author:  Willy | WillyAlgoTrader
+// Version: 3.3.2
+// ══════════════════════════════════════
+
+indicator(
+     title               = "Wyckoff Range Engine [WillyAlgoTrader]",
+     shorttitle          = "Wyckoff RE",
+     overlay             = true,
+     max_lines_count     = 500,
+     max_labels_count    = 500,
+     max_boxes_count     = 200,
+     max_bars_back       = 5000)
+
+// ══════════════════════════════════════
+// CONSTANTS
+// ══════════════════════════════════════
+GRP_MAIN   = "⚙️ Main Settings"
+GRP_SWING  = "〰️ Swing Engine"
+GRP_RANGE  = "📐 Range Rules"
+GRP_EVENT  = "🧩 Event Rules"
+GRP_VISUAL = "🎨 Visual Settings"
+GRP_RISK   = "🛡️ Risk Management"
+GRP_DASH   = "📊 Dashboard"
+GRP_ALERT  = "🔔 Alerts"
+GRP_COLORS = "🎨 Colors"
+
+INDICATOR_VERSION = "v3.3.2"
+INDICATOR_SHORT   = "WRE"
+
+// ── Trade engine ──
+WICK_BUFFER_ATR   = 0.25 // Wick-Anchored / Structure SL buffer beyond the anchor, × ATR
+WICK_MIN_ATR      = 0.5  // minimum SL distance for anchored stops, × ATR
+LINE_FORWARD_BARS = 20   // length of trade lines when an entry is drawn
+LINE_UPDATE_BARS  = 8    // extension beyond the current bar while a trade is open
+LABEL_OFFSET_BARS = 1    // label offset from the end of trade lines
+FORM_LEN          = 10   // length of the Form strip
+GAUGE_WIDTH       = 8    // win-rate gauge cells
+MS_DAY            = 86400000
+STATS_PRUNE_DAYS  = 31   // rolling stats buffer horizon
+RSI_LEN           = 14   // context oscillator shown in entry tooltips
+MAX_SWINGS        = 60
+EFF_BUF_MAX       = 3000
+
+// ── Schematic drawing ──
+EVENT_OFFSET_ATR  = 0.5  // event text sits this far beyond the swing, × ATR
+PHASE_TAG_FRAC    = 0.14 // phase captions this fraction of range height below the support lines
+DIVIDER_PAD_FRAC  = 0.06 // phase dividers overshoot the range edges by this fraction of height
+MIN_PHASE_BARS    = 6    // phases shorter than this get a divider but no caption (avoids overlapping text)
+PHASE_E_OFFSET_BARS = 8  // 'Phase E' caption this many bars past the LPS / LPSY divider
+TAG_OFFSET_BARS   = 3    // 'Support / Resistance Lines' tags this many bars right of the line end
+
+// ══════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════
+// ── Main ──
+effModeInput = input.string("Auto", "Effort Source", options = ["Auto", "Volume", "Bar Range"], group = GRP_MAIN,
+     tooltip = "Chosen once per symbol.\n• Auto: volume if the symbol provides it, otherwise bar range\n" +
+               "• Effort of a bar = source / its baseline average (1.0 = normal)")
+effBaseLenInput = input.int(50, "Effort Baseline (bars)", minval = 10, maxval = 500, group = GRP_MAIN,
+     tooltip = "Lookback of the effort baseline (simple average). Bar effort ratio = effort / baseline.")
+atrLenInput = input.int(14, "ATR Period", minval = 1, maxval = 100, group = GRP_MAIN,
+     tooltip = "ATR used for swing reversals, range height, break distances and quality scores.")
+climaxScoreInput = input.int(60, "Climax Score Threshold (0–100)", minval = 20, maxval = 95, group = GRP_MAIN,
+     tooltip = "A swing low (high) becomes a Selling (Buying) Climax candidate when the climactic RUN that ends there\n" +
+               "(all consecutive lower-highs / higher-lows legs) scores at least this much: 30% mean effort of the run,\n" +
+               "30% peak bar effort, 20% run length in ATR, 20% velocity (ATR per bar). Higher = fewer, stronger climaxes.")
+climaxPeakInput = input.float(2.0, "Climax Peak Bar Effort (×baseline)", minval = 1.0, maxval = 6.0, step = 0.1, group = GRP_MAIN,
+     tooltip = "Hard gate: the climactic run must contain at least one bar with effort this many times the baseline.")
+trendSwingsInput = input.int(2, "Trend Context (lower lows in the run)", minval = 1, maxval = 6, group = GRP_MAIN,
+     tooltip = "The climactic run must contain at least this many earlier swing lows above the SC (for a BC: swing highs\n" +
+               "below it) while the swing highs keep falling (lows keep rising). Swing-structure replacement for an EMA filter.")
+entrySignalInput = input.string("LPS / LPSY", "Trade Entry Signal", options = ["LPS / LPSY", "Spring / UTAD", "SOS / SOW", "Spring + LPS"], group = GRP_MAIN,
+     tooltip = "Which Wyckoff event opens a position in the trade engine:\n" +
+               "• LPS / LPSY: last point of support/supply after the breakout (classic, recommended)\n" +
+               "• Spring / UTAD: early entry on the Phase C shakeout\n" +
+               "• SOS / SOW: breakout bar\n• Spring + LPS: both (opposite signal reverses, same-direction ignored)")
+
+// ── Swing engine ──
+swingRevInput = input.float(1.0, "Swing Reversal (×ATR)", minval = 0.5, maxval = 6.0, step = 0.1, group = GRP_SWING,
+     tooltip = "A swing high is confirmed when a bar closes this many ATR below the running high (swing low: above\n" +
+               "the running low). Smaller = more swings, earlier confirmation of ST / TEST / LPS, more noise. Recommended 0.8–1.5.")
+
+// ── Range rules ──
+arRetraceInput = input.float(0.5, "AR Min Retrace (fraction of climactic run)", minval = 0.1, maxval = 1.0, step = 0.02, group = GRP_RANGE,
+     tooltip = "The Automatic Rally / Reaction must retrace at least this fraction of the climactic run (from the start\n" +
+               "of the final decline/advance to the climax extreme). Shallower bounces are ignored and the candidate keeps\n" +
+               "waiting; a deeper extreme extends the candidate.")
+minHeightAtrInput = input.float(3.0, "Min Range Height (×ATR)", minval = 0.5, maxval = 20.0, step = 0.25, group = GRP_RANGE,
+     tooltip = "Minimum distance between the climax extreme and the AR swing.")
+maxHeightAtrInput = input.float(8.0, "Max Range Height (×ATR)", minval = 2.0, maxval = 40.0, step = 0.5, group = GRP_RANGE,
+     tooltip = "If the automatic reaction keeps extending (AR+) beyond this height before the first ST, the structure is a\n" +
+               "trend, not a range: the candidate is dropped (gray 'NO RANGE - trend').")
+arMaxBarsInput = input.int(60, "Max Bars To Confirm AR", minval = 5, maxval = 500, group = GRP_RANGE,
+     tooltip = "Counted from the (latest) climax swing bar. If no qualifying AR swing is confirmed in time, the candidate is discarded.")
+maxRangeBarsInput = input.int(400, "Range Lifetime (bars)", minval = 20, maxval = 5000, group = GRP_RANGE,
+     tooltip = "Counted from the climax bar. A range without a breakout by then is closed as TIMED OUT (gray).")
+
+// ── Event rules (all zones are fractions of range height measured from the climax side) ──
+stZoneInput = input.float(0.30, "ST Zone (u ≤)", minval = 0.05, maxval = 0.9, step = 0.05, group = GRP_EVENT,
+     tooltip = "Secondary Test: a climax-side swing inside the range with u ≤ this value\n(u = 0 climax edge, u = 1 reaction edge).")
+maxSTInput = input.int(3, "Max ST Per Range", minval = 0, maxval = 6, group = GRP_EVENT,
+     tooltip = "0 together with 'Spring Needs A Prior ST' makes Spring/UTAD impossible (validation stops the script).")
+requireSTInput = input.bool(true, "Spring Needs A Prior ST", group = GRP_EVENT,
+     tooltip = "Springs happen in Phase C after the range was tested. With this on, a swing beyond the climax side\n" +
+               "before the first ST only extends the range edge (marked 'ext').")
+reclaimBarsInput = input.int(8, "Reclaim Deadline (bars)", minval = 1, maxval = 40, group = GRP_EVENT,
+     tooltip = "After a swing beyond the climax side is confirmed, price must close back inside the range within\n" +
+               "this many bars. Otherwise the range is BROKEN.")
+failDistAtrInput = input.float(0.5, "Decisive Break Distance (×ATR)", minval = 0.1, maxval = 5.0, step = 0.1, group = GRP_EVENT,
+     tooltip = "A close this far beyond the climax edge ends the range immediately as BROKEN.")
+testZoneInput = input.float(0.4, "Test Zone (u ≤)", minval = 0.05, maxval = 0.9, step = 0.05, group = GRP_EVENT,
+     tooltip = "TEST: climax-side swing after the Spring, above the spring extreme, with u ≤ this value and a leg\n" +
+               "with less effort than the spring leg.")
+sosEffInput = input.float(1.2, "SOS / SOW Leg Effort (×baseline)", minval = 0.5, maxval = 5.0, step = 0.1, group = GRP_EVENT,
+     tooltip = "Mean effort of the breakout LEG (from the last climax-side swing to the breakout bar).\n" +
+               "A breakout is only recognised from Phase B on (after at least one ST or a Spring).")
+sosLegAtrInput = input.float(1.5, "SOS / SOW Leg Length (×ATR)", minval = 0.25, maxval = 10.0, step = 0.25, group = GRP_EVENT,
+     tooltip = "Length of the breakout leg in ATR units at the breakout bar.")
+sosLogicInput = input.string("Effort OR leg length", "SOS / SOW Confirmation", options = ["Effort OR leg length", "Effort AND leg length"], group = GRP_EVENT,
+     tooltip = "OR = either a strong leg or a long leg qualifies. AND = both required (stricter).")
+sosBufAtrInput = input.float(0.1, "SOS / SOW Close Beyond Range (×ATR)", minval = 0.0, maxval = 3.0, step = 0.05, group = GRP_EVENT,
+     tooltip = "Breakout close must exceed the reaction edge by this ATR multiple.")
+lpsFloorInput = input.float(0.75, "LPS / LPSY Floor (u ≥)", minval = 0.5, maxval = 1.5, step = 0.05, group = GRP_EVENT,
+     tooltip = "After SOS/SOW the first climax-side swing with u ≥ this value is the LPS / LPSY.\n" +
+               "0.75 = upper quarter or above the range. 1.0 = must hold above the range edge.\n" +
+               "A close below the midline (u < 0.5) after SOS fails the breakout.")
+lpsMaxBarsInput = input.int(60, "LPS Search Window (bars)", minval = 5, maxval = 500, group = GRP_EVENT,
+     tooltip = "After SOS/SOW. If no LPS appears, the range closes as MARKUP / MARKDOWN without LPS.")
+markUTInput = input.bool(true, "Mark UT / SHAKEOUT (reaction-side false break)", group = GRP_EVENT,
+     tooltip = "A reaction-side swing beyond the range edge after the first ST that did not qualify as SOS/SOW.\n" +
+               "Before the first ST such a swing extends the AR instead (marked 'AR+'). Does not change state.")
+projMultInput = input.float(1.0, "Target Projection (×range height)", minval = 0.25, maxval = 5.0, step = 0.25, group = GRP_EVENT,
+     tooltip = "Measured-move target after SOS/SOW: reaction edge + height × multiplier.")
+projBarsInput = input.int(40, "Target Line Extension (bars)", minval = 5, maxval = 300, group = GRP_EVENT,
+     tooltip = "Visual length of the target line.")
+tgtMarginAtrInput = input.float(0.5, "Target Must Be Ahead Of SOS Close (×ATR)", minval = 0.0, maxval = 5.0, step = 0.1, group = GRP_EVENT,
+     tooltip = "Outcome tracking starts only if the target is at least this far ahead of the SOS close;\n" +
+               "otherwise the case is counted as 'target already passed' and excluded from the hit rate.")
+outcomeBarsInput = input.int(120, "SOS Outcome Horizon (bars)", minval = 10, maxval = 1000, group = GRP_EVENT,
+     tooltip = "Bars after SOS to reach the target before a close back below the midline. Expiry is checked first.")
+
+// ── Visual ──
+themeInput = input.string("Auto", "Theme", options = ["Auto", "Dark", "Light"], group = GRP_VISUAL,
+     tooltip = "Chart color theme.\n• Auto: detects from chart background\n• Dark: optimized for dark backgrounds\n• Light: optimized for light/white backgrounds")
+showRangesInput = input.bool(true, "Show Range Lines", group = GRP_VISUAL,
+     tooltip = "Draw the Resistance / Support lines of the range (outer edge + inner level) and the range title.")
+showPhasesInput = input.bool(true, "Show Phase Dividers", group = GRP_VISUAL,
+     tooltip = "Vertical dashed dividers at the A→B→C→D→E transitions with 'Phase X' captions under the range.")
+showEventsInput = input.bool(true, "Show Event Labels", group = GRP_VISUAL,
+     tooltip = "SC/BC, AR, ST, Test, Spring/UTAD, UT/Shakeout, SOS/SOW, LPS/LPSY as plain text beyond the swing.\nHover a label for scores and details.")
+showSwingsInput = input.bool(false, "Show Swing Points", group = GRP_VISUAL,
+     tooltip = "Small dots on every confirmed swing high / low (debug view of the swing engine).")
+showSignalsInput = input.bool(true, "Show Buy/Sell Labels", group = GRP_VISUAL,
+     tooltip = "'▲ BUY' / '▼ SELL' entry markers of the trade engine with a score tooltip.")
+showTargetInput = input.bool(true, "Show Measured-Move Target", group = GRP_VISUAL,
+     tooltip = "Measured-move target line after SOS/SOW.")
+showDetectInput = input.bool(true, "Show Detection Markers (·)", group = GRP_VISUAL,
+     tooltip = "A dot on the bar where an event became known (the swing confirmation bar).")
+showFailedInput = input.bool(true, "Keep Failed / Expired Ranges (gray)", group = GRP_VISUAL,
+     tooltip = "Off = failed and expired ranges are removed from the chart (still counted in the dashboard).")
+detailLblInput = input.bool(false, "Detailed Event Labels", group = GRP_VISUAL,
+     tooltip = "Adds quality scores and effort notes under the event text. Off = clean schematic; details stay in the tooltips.")
+maxRangesInput = input.int(4, "Range History Depth", minval = 1, maxval = 20, group = GRP_VISUAL,
+     tooltip = "Each range's drawings are removed together with the range.")
+showWatermarkInput = input.bool(true, "Show Watermark", group = GRP_VISUAL,
+     tooltip = "Display 'WillyAlgoTrader' watermark on chart")
+signalFontSizeInput = input.string("Small", "Signal Label Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = GRP_VISUAL,
+     tooltip = "Font size for signal labels and trade entry markers")
+labelFontSizeInput = input.string("Small", "SL/TP Label Font Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = GRP_VISUAL,
+     tooltip = "Font size for SL/TP price labels")
+eventFontSizeInput = input.string("Normal", "Event Label Font", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = GRP_VISUAL,
+     tooltip = "Font size for Wyckoff event labels and phase captions. Secondary marks (AR+, ext, UT) render one step smaller.")
+eventBackdropInput = input.bool(true, "Event Label Backdrop", group = GRP_VISUAL,
+     tooltip = "Draw event text and phase captions on a plate in the chart background color so they stay readable over candles.\nOff = bare text, closest to the classic schematic.")
+
+// ── Risk management ──
+riskPresetInput = input.string("Balanced", "Risk Preset", options = ["Conservative", "Balanced", "Aggressive", "Scalping", "Custom"], group = GRP_RISK,
+     tooltip = "Quick risk presets (SL part applies to ATR mode; Wick-Anchored / Structure anchor the stop to price):\n" +
+               "• Conservative: SL 2.5×ATR, TP 1R/2R/4R\n• Balanced: SL 1.5×ATR, TP 1R/2R/3R\n" +
+               "• Aggressive: SL 1.0×ATR, TP 1.5R/2.5R/4R\n• Scalping: SL 0.8×ATR, TP 0.8R/1.5R/2R\n" +
+               "• Custom: use manual SL/TP multipliers below")
+slModeInput = input.string("Wick-Anchored", "SL Mode", options = ["Wick-Anchored", "ATR", "Structure"], group = GRP_RISK,
+     tooltip = "How the stop-loss is placed at entry:\n" +
+               "• Wick-Anchored: below/above the signal bar's wick + 0.25×ATR buffer (min 0.5×ATR). Recommended\n" +
+               "• ATR: fixed SL Multiplier × ATR distance from entry\n" +
+               "• Structure: beyond the Wyckoff swing (LPS swing / spring extreme / range edge) + 0.25×ATR, min 0.5×ATR")
+atrLenRiskInput = input.int(14, "ATR Length (SL)", minval = 5, maxval = 50, group = GRP_RISK,
+     tooltip = "ATR period for stop-loss calculation.\n• 14 = standard\n• Lower = tighter stops\n• Higher = wider stops")
+slMultInput = input.float(1.5, "SL Multiplier (×ATR)", minval = 0.5, maxval = 5.0, step = 0.1, group = GRP_RISK,
+     tooltip = "Stop-loss distance as multiple of ATR (ATR mode, Custom preset).\n• 1.0 = tight\n• 1.5 = balanced\n• 2.0–3.0 = wide")
+tp1MultInput = input.float(1.0, "TP1 Multiplier (×Risk)", minval = 0.5, maxval = 5.0, step = 0.1, group = GRP_RISK,
+     tooltip = "Take-profit 1 as multiple of the actual SL distance (Custom preset). 1.0 = 1:1")
+tp2MultInput = input.float(2.0, "TP2 Multiplier (×Risk)", minval = 1.0, maxval = 10.0, step = 0.1, group = GRP_RISK,
+     tooltip = "Take-profit 2 as multiple of risk (Custom preset). 2.0 = 1:2")
+tp3MultInput = input.float(3.0, "TP3 Multiplier (×Risk)", minval = 1.5, maxval = 15.0, step = 0.1, group = GRP_RISK,
+     tooltip = "Take-profit 3 as multiple of risk (Custom preset). 3.0 = 1:3")
+beInput = input.bool(true, "Break-Even After TP1", group = GRP_RISK,
+     tooltip = "Move stop-loss to entry price once TP1 is reached.\nPositions stopped at break-even after TP1 count as wins")
+beOffsetInput = input.float(0.0, "BE Offset (×ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = GRP_RISK,
+     tooltip = "Optional offset of the break-even stop from entry, in ATR of the entry bar. 0 = exactly at entry.")
+showSlTpInput = input.bool(true, "Show SL/TP Lines", group = GRP_RISK,
+     tooltip = "Draw entry, stop-loss and take-profit lines. Lines persist after the trade closes and are\n" +
+               "replaced by the next entry.")
+showSlTpLabelsInput = input.bool(true, "Show SL/TP Labels", group = GRP_RISK,
+     tooltip = "Price labels on entry/SL/TP lines")
+showPctOnLabelsInput = input.bool(true, "Show % Distance on Labels", group = GRP_RISK,
+     tooltip = "Append % distance from entry to SL/TP labels,\ne.g. 'SL 1.2300 (-0.36%)'")
+entryLineStyleInput = input.string("Dotted", "Entry Line Style", options = ["Solid", "Dashed", "Dotted"], group = GRP_RISK,
+     tooltip = "Entry is a reference, not an action level — keep it subtle")
+slLineStyleInput = input.string("Solid", "SL Line Style", options = ["Solid", "Dashed", "Dotted"], group = GRP_RISK,
+     tooltip = "Stop-loss is the action level — solid, width 2")
+tpLineStyleInput = input.string("Dashed", "TP Line Style", options = ["Solid", "Dashed", "Dotted"], group = GRP_RISK,
+     tooltip = "Style for TP1/TP2/TP3. On hit, a TP line turns solid teal")
+
+// ── Dashboard ──
+showDashInput = input.bool(true, "Show Dashboard", group = GRP_DASH,
+     tooltip = "Sectional dashboard with Market, Wyckoff, Trade and Stats sections")
+dashPosStrInput = input.string("Top Right", "Dashboard Position", options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right", "Middle Right"], group = GRP_DASH,
+     tooltip = "Where the dashboard table is anchored")
+dashFontSizeInput = input.string("Small", "Dashboard Font Size", options = ["Small", "Normal", "Large", "Huge"], group = GRP_DASH,
+     tooltip = "Font size for the dashboard table. Section dividers and the\nversion footer render one step smaller to preserve hierarchy")
+showMarketSecInput = input.bool(true, "  ├ Market section", group = GRP_DASH, tooltip = "Trend / Phase / Leg / Position / Last signal")
+showWyckoffSecInput = input.bool(true, "  ├ Wyckoff section", group = GRP_DASH, tooltip = "Status / Range / Events / Quality / Outcomes")
+showTradeSecInput = input.bool(true, "  ├ Trade section", group = GRP_DASH, tooltip = "Entry / SL / TP1-3 / R:R / SL distance")
+showStatsSecInput = input.bool(true, "  └ Stats section", group = GRP_DASH, tooltip = "Trades / W / L / Win rate / Form (resets on chart reload)")
+statsPeriodInput = input.string("All-Time", "Win Rate Period", options = ["24 Hours", "30 Days", "All-Time"], group = GRP_DASH,
+     tooltip = "Time window for the Stats section (Trades / Wins / Losses / Win rate):\n" +
+               "• 24 Hours: trades closed in the last 24h (relative to the latest bar)\n" +
+               "• 30 Days: trades closed in the last 30 days\n• All-Time: all trades on the loaded chart history\n" +
+               "Form strip always shows the last trades regardless of period.\nAll stats reset on chart reload")
+
+// ── Alerts ──
+webhookInput = input.bool(false, "Webhook JSON Format", group = GRP_ALERT,
+     tooltip = "Send entry alerts in JSON format for webhook integrations")
+alertEventsInput = input.bool(true, "Alert on Wyckoff Events", group = GRP_ALERT,
+     tooltip = "Climax, AR, ST, Spring/UTAD, TEST, SOS/SOW, LPS/LPSY, range failed. Suppressed on bars that open or reverse a trade.")
+alertSlRevInput = input.bool(true, "Alert on SL Hit & Reversal", group = GRP_ALERT,
+     tooltip = "🛑 SL HIT / 🛡️ BE STOP-OUT and 🔄 REVERSAL alerts")
+alertTpBeInput = input.bool(true, "Alert on TP & Break-Even", group = GRP_ALERT,
+     tooltip = "🎯 TP1 / TP2 / 🏆 TP3 hits and 🛡️ break-even move")
+
+// ── Colors ──
+bullColorInput = input.color(#00E676, "Bull", inline = "clr", group = GRP_COLORS)
+bearColorInput = input.color(#FF5252, "Bear", inline = "clr", group = GRP_COLORS)
+sigColorInput  = input.color(#FFEB3B, "Spring/UTAD", inline = "clr2", group = GRP_COLORS)
+climColorInput = input.color(#00E5FF, "Climax", inline = "clr2", group = GRP_COLORS)
+failColorInput = input.color(#FF9100, "Failure", inline = "clr3", group = GRP_COLORS)
+
+// ══════════════════════════════════════
+// INPUT VALIDATION
+// ══════════════════════════════════════
+if tp1MultInput >= tp2MultInput or tp2MultInput >= tp3MultInput
+    runtime.error("Invalid TP multipliers: required TP1 < TP2 < TP3")
+if slMultInput <= 0
+    runtime.error("SL Multiplier must be greater than 0")
+if maxSTInput == 0 and requireSTInput
+    runtime.error("Max ST = 0 with 'Spring Needs A Prior ST' makes springs impossible: set Max ST ≥ 1 or disable Require ST")
+if beInput and beOffsetInput > 0 and beOffsetInput >= tp1MultInput
+    runtime.error("BE Offset too large: breakeven level would be at or beyond TP1")
+if testZoneInput < stZoneInput
+    runtime.error("Test Zone must be ≥ ST Zone")
+if maxHeightAtrInput <= minHeightAtrInput
+    runtime.error("Max Range Height must be greater than Min Range Height")
+
+// ══════════════════════════════════════
+// THEME DETECTION & COLORS
+// ══════════════════════════════════════
+isDark = switch themeInput
+    "Dark"  => true
+    "Light" => false
+    =>         color.r(chart.bg_color) < 128
+
+// ── Texts ──
+TEXT_COLOR  = isDark ? #E0E0E0 : #1A1A1A
+TEXT_MUTED  = isDark ? color.new(#9E9E9E, 0) : color.new(#757575, 0)
+TEXT_BRIGHT = isDark ? #FFFFFF : #000000
+
+// ── Signal colors for text (on chart/table background) ──
+BULL_TEXT    = isDark ? #00E676 : #00A152
+BEAR_TEXT    = isDark ? #FF5252 : #D32F2F
+NEUTRAL_TEXT = isDark ? #FFEB3B : #F57F17
+
+// ── Labels ──
+BULL_LABEL_TEXT = #004D25
+BEAR_LABEL_TEXT = #FFFFFF
+LABEL_TEXT      = isDark ? #1A1A1A : #FFFFFF
+EVENT_LABEL_TEXT = #0B0B0B
+
+// ── Dashboard ──
+TABLE_BG      = isDark ? color.new(#131722, 5) : color.new(#FFFFFF, 5)
+TABLE_BORDER  = isDark ? color.new(#2A2E39, 0) : color.new(#D0D0D0, 0)
+TABLE_ROW_ALT = isDark ? color.new(#1C2030, 0) : color.new(#F0F4F8, 0)
+HEADER_TEXT   = #FFFFFF
+HEADER_BG_BULL = color.new(#0F6E56, 0)
+HEADER_BG_BEAR = color.new(#A32D2D, 0)
+HEADER_BG_NEUTRAL = isDark ? color.new(#0D47A1, 0) : color.new(#1565C0, 0)
+
+// ── Lines ──
+LINE_SUBTLE = isDark ? color.new(#666666, 0) : color.new(#999999, 0)
+GRAY_RANGE  = isDark ? color.new(#7F8C8D, 0) : color.new(#9AA3A8, 0)
+WM_COLOR    = isDark ? color.new(#FFFFFF, 80) : color.new(#000000, 80)
+TRANSP_COLOR = color.new(#000000, 100)
+SWING_DOT   = isDark ? color.new(#B0BEC5, 40) : color.new(#546E7A, 40)
+LABEL_PLATE = isDark ? color.new(#131722, 15) : color.new(#FFFFFF, 10)   // backdrop plate under schematic text
+int FILL_TRANSP = isDark ? 88 : 82
+
+// ── Risk palette (muted, theme-aware) ──
+SL_COLOR       = isDark ? color.new(#E57373, 0)  : color.new(#B71C1C, 0)
+TP1_COLOR      = isDark ? color.new(#66BB6A, 30) : color.new(#388E3C, 30)
+TP2_COLOR      = isDark ? color.new(#66BB6A, 40) : color.new(#388E3C, 40)
+TP3_COLOR      = isDark ? color.new(#66BB6A, 0)  : color.new(#388E3C, 0)
+ENTRY_COLOR    = isDark ? color.new(#5C8AAE, 0)  : color.new(#34495E, 0)
+TP_LABEL_COLOR = isDark ? color.new(#66BB6A, 0)  : color.new(#388E3C, 0)
+TP_HIT_COLOR   = isDark ? color.new(#4DB6AC, 0)  : color.new(#00695C, 0)
+BE_COLOR       = isDark ? color.new(#FFA726, 0)  : color.new(#E65100, 0)
+// LABEL_TEXT (above) = text on filled Entry / SL / TP labels
+
+// ══════════════════════════════════════
+// TYPES
+// ══════════════════════════════════════
+// A confirmed swing point together with the statistics of the leg that ENDS at it.
+type Swing
+    int   kind      // +1 swing high, -1 swing low
+    float price
+    int   bar
+    float legEff    // mean bar effort ratio over the leg
+    float legPeak   // max bar effort ratio in the leg
+    float legAtr    // leg length in ATR units
+    int   legBars
+    int   confBar   // bar on which the swing was confirmed
+
+// An accumulation (side = +1) or distribution (side = -1) range.
+// Normalized coordinate u: 0 = climax edge, 1 = reaction edge.
+type Rng
+    int   id
+    int   side
+    float top
+    float bot
+    int   climaxBar
+    int   reactBar
+    int   stage          // 1..5 = A..E
+    float climEff
+    float climPeak
+    int   climScore
+    int   nTests
+    int   utCount
+    bool  sprung
+    bool  springCounted
+    bool  tested
+    bool  brokeOut
+    bool  lpsSeen
+    bool  pendBreak      // climax-side swing beyond the edge, waiting for reclaim
+    int   pendBar
+    float pendPrice
+    float pendEff
+    int   pendConfBar
+    float springPrice
+    int   springBar
+    float springEff
+    int   springScore
+    int   breakBar
+    int   sosScore
+    float sosEff
+    float target
+    line  edgeClim       // outer line on the climax side (SC low / BC high)
+    line  innerClim      // inner line on the climax side (first ST)
+    line  edgeReact      // outer line on the reaction side (AR, extended by AR+)
+    line  innerReact     // inner line on the reaction side (previous AR level after an extension)
+    label tagClim        // 'Support Lines' / 'Resistance Lines' tag at the climax edge
+    label tagReact       // tag at the reaction edge
+    label stageLbl       // range title
+    label curPhaseTag    // caption of the running phase
+    int   lastDivBar     // x of the last phase divider (climax bar before the first one)
+    array<line>  dividers
+    array<label> phaseTags
+    line  tgtLn
+    label tgtTag
+    array<label> marks
+
+// ══════════════════════════════════════
+// FUNCTIONS
+// ══════════════════════════════════════
+safeDiv(float num, float den, float fallback = 0.0) =>
+    den != 0 and not na(num) and not na(den) ? num / den : fallback
+
+fmtPrice(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+fmtScore(float v) =>
+    na(v) ? "—" : str.tostring(math.round(v))
+
+formatPctFromEntry(float level, float entry) =>
+    string res = ""
+    if showPctOnLabelsInput and not na(level) and not na(entry) and entry != 0
+        float pct   = (level - entry) / entry * 100.0
+        string sign = pct >= 0 ? "+" : ""
+        res := " (" + sign + str.tostring(pct, "#.##") + "%)"
+    res
+
+sizeFromString(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Normal" ? size.normal : s == "Large" ? size.large : s == "Huge" ? size.huge : size.small
+
+sizeDownFromString(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.tiny : s == "Normal" ? size.small : s == "Large" ? size.normal : s == "Huge" ? size.large : size.tiny
+
+lineStyleFromString(string s) =>
+    s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+
+clamp01(float x) =>
+    math.max(0.0, math.min(1.0, x))
+
+buildGauge(float value, float maxVal, int width) =>
+    string result = ""
+    int filled = maxVal <= 0 ? 0 : math.round(math.min(width, math.max(0.0, value / maxVal * width)))
+    for i = 0 to width - 1
+        result += i < filled ? "▰" : "▱"
+    result
+
+periodStats(array<int> tms, array<bool> wns, int cutoff) =>
+    int w = 0
+    int l = 0
+    int n = array.size(tms)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(tms, i) >= cutoff
+                if array.get(wns, i)
+                    w += 1
+                else
+                    l += 1
+    [w, l]
+
+phaseTxt(int p) =>
+    p == 1 ? "A" : p == 2 ? "B" : p == 3 ? "C" : p == 4 ? "D" : p == 5 ? "E" : "—"
+
+chk(bool b) =>
+    b ? "✓" : "–"
+
+// text color readable on the chart background: as is on dark charts, darkened on light ones
+inkOf(color c) =>
+    isDark ? c : color.rgb(color.r(c) * 0.55, color.g(c) * 0.55, color.b(c) * 0.55, color.t(c))
+
+// schematic text (events, phase captions): plain text, or text on a plate in the chart background color
+schemLabel(int x, float y, string txt, color c, string sz, string tip = "") =>
+    label.new(x, y, txt, xloc = xloc.bar_index, style = eventBackdropInput ? label.style_label_center : label.style_none, color = eventBackdropInput ? LABEL_PLATE : TRANSP_COLOR, textcolor = inkOf(c), size = sz, text_font_family = font.family_monospace, tooltip = tip)
+
+// u-space helpers
+uOf(Rng r, float p) =>
+    float h = r.top - r.bot
+    h > 0 ? (r.side == 1 ? (p - r.bot) / h : (r.top - p) / h) : 0.5
+
+pOf(Rng r, float u) =>
+    float h = r.top - r.bot
+    r.side == 1 ? r.bot + u * h : r.top - u * h
+
+nmOf(Rng r, string a, string d) =>
+    r.side == 1 ? a : d
+
+dashPos = switch dashPosStrInput
+    "Top Left"     => position.top_left
+    "Top Right"    => position.top_right
+    "Bottom Left"  => position.bottom_left
+    "Bottom Right" => position.bottom_right
+    "Middle Right" => position.middle_right
+    => position.top_right
+
+signalSize   = sizeFromString(signalFontSizeInput)
+labelSize    = sizeFromString(labelFontSizeInput)
+eventSize    = sizeFromString(eventFontSizeInput)
+eventSizeSub = sizeDownFromString(eventFontSizeInput)
+dashFontSize = sizeFromString(dashFontSizeInput)
+dashFontSizeSub = sizeDownFromString(dashFontSizeInput)
+
+// ══════════════════════════════════════
+// CALCULATIONS (na-protected)
+// ══════════════════════════════════════
+int WARMUP_BARS = math.max(math.max(effBaseLenInput, atrLenInput), 50)
+bool isWarmedUp = bar_index >= WARMUP_BARS
+bool confirmed  = barstate.isconfirmed
+
+float atr     = nz(ta.atr(atrLenInput), 0.0)
+float riskAtr = nz(ta.atr(atrLenRiskInput), 0.0)
+float rsiValue = nz(ta.rsi(close, RSI_LEN), 50.0)
+
+// effort source chosen once per symbol; bar effort ratio = effort / baseline
+var bool useVol = false
+if barstate.isfirst
+    useVol := effModeInput == "Volume" ? true : effModeInput == "Bar Range" ? false : not na(volume)
+float effRaw   = useVol ? nz(volume, 0.0) : high - low
+float effBase  = nz(ta.sma(effRaw, effBaseLenInput), effRaw)
+float effRatio = effBase > 0 ? effRaw / effBase : 1.0
+
+// per-bar effort buffer (for leg statistics)
+var array<float> effBuf = array.new<float>()
+if confirmed
+    array.push(effBuf, effRatio)
+    if array.size(effBuf) > EFF_BUF_MAX
+        array.shift(effBuf)
+
+// statistics of the leg covering bars (startBar, endBar]
+legStats(int startBar, int endBar) =>
+    float s  = 0.0
+    float pk = 0.0
+    int   n  = 0
+    int   sz = array.size(effBuf)
+    if endBar > startBar
+        for k = startBar + 1 to endBar
+            int idx = sz - 1 - (bar_index - k)
+            if idx >= 0 and idx < sz
+                float v = array.get(effBuf, idx)
+                s  += v
+                pk := math.max(pk, v)
+                n  += 1
+    [n > 0 ? s / n : 1.0, pk, n]
+
+float barRng = high - low
+float cpos   = barRng > 0 ? (close - low) / barRng : 0.5
+
+// ══════════════════════════════════════
+// SWING ENGINE — ATR-reversal swing stream
+// ══════════════════════════════════════
+var array<Swing> swings = array.new<Swing>()
+var int   legDir        = 0      // +1 up-leg in progress (candidate swing high), -1 down-leg
+var float extPrice      = na
+var int   extBar        = na
+var int   legStartBar   = na
+var float legStartPrice = na
+
+int   nSince       = math.max(1, bar_index - nz(extBar, bar_index))
+float lowSinceExt  = ta.lowest(low, nSince)
+int   lowSinceOff  = ta.lowestbars(low, nSince)
+float highSinceExt = ta.highest(high, nSince)
+int   highSinceOff = ta.highestbars(high, nSince)
+
+bool  newSwing = false
+Swing sw = na
+
+if confirmed and isWarmedUp
+    if legDir == 0
+        legDir        := 1
+        legStartBar   := bar_index
+        legStartPrice := low
+        extPrice      := high
+        extBar        := bar_index
+    else if legDir == 1
+        if high > extPrice
+            extPrice := high
+            extBar   := bar_index
+        if close < extPrice - swingRevInput * atr
+            [le, lp, ln] = legStats(legStartBar, extBar)
+            sw := Swing.new(1, extPrice, extBar, le, lp, safeDiv(extPrice - legStartPrice, atr, 0.0), ln, bar_index)
+            newSwing := true
+            legDir        := -1
+            legStartBar   := extBar
+            legStartPrice := extPrice
+            if extBar == bar_index
+                extPrice := low
+                extBar   := bar_index
+            else
+                extPrice := lowSinceExt
+                extBar   := bar_index + lowSinceOff
+    else
+        if low < extPrice
+            extPrice := low
+            extBar   := bar_index
+        if close > extPrice + swingRevInput * atr
+            [le, lp, ln] = legStats(legStartBar, extBar)
+            sw := Swing.new(-1, extPrice, extBar, le, lp, safeDiv(legStartPrice - extPrice, atr, 0.0), ln, bar_index)
+            newSwing := true
+            legDir        := 1
+            legStartBar   := extBar
+            legStartPrice := extPrice
+            if extBar == bar_index
+                extPrice := high
+                extBar   := bar_index
+            else
+                extPrice := highSinceExt
+                extBar   := bar_index + highSinceOff
+    if newSwing
+        array.push(swings, sw)
+        if array.size(swings) > MAX_SWINGS
+            array.shift(swings)
+        if showSwingsInput
+            label.new(sw.bar, sw.price, "", xloc = xloc.bar_index, style = label.style_circle, color = SWING_DOT, size = size.tiny)
+
+// Climactic run ending at the newest swing (kind = -1 for a selling climax, +1 for a buying climax):
+// walk back while the opposite-kind swings keep falling (rising) and the same-kind swings stay above (below)
+// the candidate. Returns [runStartBar, runStartPrice, sameKindSwingsInsideRun].
+runOf(int kind, float candPx) =>
+    int   n        = array.size(swings)
+    int   startBar = na
+    float startPx  = na
+    int   cnt      = 0
+    if n >= 2
+        int   i = n - 2
+        Swing s = array.get(swings, i)
+        startBar := s.bar
+        startPx  := s.price
+        bool go = true
+        while go and i - 2 >= 0
+            Swing prevOpp  = array.get(swings, i - 2)
+            Swing between  = array.get(swings, i - 1)
+            bool oppOk     = kind == -1 ? prevOpp.price > s.price : prevOpp.price < s.price
+            bool betweenOk = kind == -1 ? between.price > candPx : between.price < candPx
+            if oppOk and betweenOk
+                i -= 2
+                s := prevOpp
+                startBar := s.bar
+                startPx  := s.price
+                cnt += 1
+            else
+                go := false
+    [startBar, startPx, cnt]
+
+// ══════════════════════════════════════
+// RANGE ENGINE — climax candidate → range → events (u-space)
+// ══════════════════════════════════════
+var Rng cur = na
+var array<Rng> hist = array.new<Rng>()
+var int rangeSeq = 0
+
+// climax candidate (awaiting AR)
+var int   candDir   = 0
+var float candPrice = na
+var int   candBar   = na
+var float candEff   = na
+var float candPeak  = na
+var float candLegPx = na      // climactic leg in price
+var int   candScore = 0
+var label candLbl   = na
+
+// counters
+var int accTotal = 0
+var int distTotal = 0
+var int accOk = 0
+var int accBad = 0
+var int distOk = 0
+var int distBad = 0
+var int springRanges = 0
+var int sprungBroke = 0
+var int utadRanges = 0
+var int utadBroke = 0
+var int tgtHit = 0
+var int tgtMiss = 0
+var int tgtExp = 0
+var int tgtPre = 0
+var array<int>   oId  = array.new<int>()
+var array<int>   oDir = array.new<int>()
+var array<float> oTgt = array.new<float>()
+var array<float> oInv = array.new<float>()
+var array<int>   oBar = array.new<int>()
+
+// per-bar events
+bool evClimax = false
+bool evAR     = false
+bool evST     = false
+bool evTEST   = false
+bool evSpring = false
+bool evUtad   = false
+bool evSos    = false
+bool evSow    = false
+bool evLps    = false
+bool evLpsy   = false
+bool evFailed = false
+bool sigDetect = false
+string eventMsg = ""
+float  eventLevel = na
+int    entryScoreEv = 0
+string entryInfoEv = ""      // event behind the entry, for the entry tooltip
+
+// current leg (towards the reaction side) statistics — for SOS/SOW quality
+float legEffNow  = 1.0
+float legPeakNow = 0.0
+float legAtrNow  = 0.0
+
+// Event text beyond the swing (below lows for accumulation's climax side, above highs for its reaction side;
+// mirrored for distribution). Details go to the tooltip.
+evLabel(Rng r, int x, float y, string txt, bool atClimaxSide, color c, string sz, string tip = "") =>
+    bool  below = (r.side == 1) == atClimaxSide
+    float yy    = below ? y - EVENT_OFFSET_ATR * atr : y + EVENT_OFFSET_ATR * atr
+    if showEventsInput
+        label mk = schemLabel(x, yy, txt, c, sz, tip)
+        array.push(r.marks, mk)
+    showEventsInput
+
+climEdge(Rng r) =>
+    r.side == 1 ? r.bot : r.top
+
+reactEdge(Rng r) =>
+    r.side == 1 ? r.top : r.bot
+
+// outer lines and tags follow the current edges
+redrawRange(Rng r) =>
+    line.set_y1(r.edgeClim, climEdge(r))
+    line.set_y2(r.edgeClim, climEdge(r))
+    line.set_y1(r.edgeReact, reactEdge(r))
+    line.set_y2(r.edgeReact, reactEdge(r))
+    label.set_y(r.tagClim, climEdge(r))
+    label.set_y(r.tagReact, reactEdge(r))
+    label.set_y(r.stageLbl, reactEdge(r))
+    true
+
+// vertical dashed divider at x closing the phase `ended`, with its caption centered on the closed phase
+addDivider(Rng r, int x, int ended, color c) =>
+    float h   = math.max(r.top - r.bot, syminfo.mintick)
+    float yTop = r.top + DIVIDER_PAD_FRAC * h
+    float yBot = r.bot - (PHASE_TAG_FRAC + DIVIDER_PAD_FRAC) * h
+    if showPhasesInput and x > r.lastDivBar
+        array.push(r.dividers, line.new(x, yTop, x, yBot, xloc = xloc.bar_index, color = color.new(inkOf(c), 15), style = line.style_dashed, width = 1))
+        if x - r.lastDivBar >= MIN_PHASE_BARS
+            int mid = math.round((r.lastDivBar + x) / 2.0)
+            array.push(r.phaseTags, schemLabel(mid, r.bot - PHASE_TAG_FRAC * h, "Phase " + phaseTxt(ended), c, eventSize))
+        r.lastDivBar := x
+    true
+
+removeOutcome(int id) =>
+    n = 0
+    if array.size(oId) > 0
+        for i = array.size(oId) - 1 to 0
+            if array.get(oId, i) == id
+                n += 1
+                array.remove(oId, i)
+                array.remove(oDir, i)
+                array.remove(oTgt, i)
+                array.remove(oInv, i)
+                array.remove(oBar, i)
+    n
+
+// finalization flags for this bar
+bool   closeRange = false
+bool   failedRange = false
+string closeTag    = ""
+
+// ── A) bar-level checks on the active range ──
+if confirmed and not na(cur)
+    float h    = math.max(cur.top - cur.bot, syminfo.mintick)
+    float uC   = uOf(cur, close)
+    color rngCol = cur.side == 1 ? bullColorInput : bearColorInput
+
+    // 1) expiry (before events)
+    if not cur.brokeOut and bar_index - cur.climaxBar > maxRangeBarsInput
+        closeRange := true
+        failedRange := true
+        closeTag := "TIMED OUT"
+
+    // 2) decisive break beyond the climax edge
+    if not closeRange and not cur.brokeOut and uC < -failDistAtrInput * atr / h
+        evLabel(cur, bar_index, cur.side == 1 ? low : high, nmOf(cur, "BREAKDOWN", "BREAKOUT"), true, failColorInput, eventSize, "Decisive close beyond the climax edge: range failed")
+        if cur.side == 1
+            accBad += 1
+        else
+            distBad += 1
+        evFailed := true
+        eventMsg += nmOf(cur, "Accumulation", "Distribution") + " range FAILED (decisive break) | "
+        closeRange := true
+        failedRange := true
+        closeTag := "BROKEN"
+
+    // 3) pending spring: reclaim or timeout
+    if not closeRange and cur.pendBreak
+        if uC >= 0
+            cur.pendBreak := false
+            if requireSTInput and cur.nTests == 0
+                if na(cur.innerClim)
+                    cur.innerClim := line.new(cur.climaxBar, climEdge(cur), bar_index, climEdge(cur), xloc = xloc.bar_index, color = color.new(inkOf(rngCol), 35), width = 1)
+                if cur.side == 1
+                    cur.bot := cur.pendPrice
+                else
+                    cur.top := cur.pendPrice
+                redrawRange(cur)
+                evLabel(cur, cur.pendBar, cur.pendPrice, "ext", true, climColorInput, eventSizeSub, "Climax extreme extended before the first ST")
+            else
+                cur.sprung  := true
+                cur.tested    := false
+                cur.springPrice := cur.pendPrice
+                cur.springBar   := cur.pendBar
+                cur.springEff   := cur.pendEff
+                cur.stage       := 3
+                float depthAtr = safeDiv(cur.side == 1 ? cur.bot - cur.pendPrice : cur.pendPrice - cur.top, atr, 0.0)
+                float depthC = clamp01(1.0 - depthAtr / 1.5)
+                float effC   = clamp01(1.0 - safeDiv(cur.pendEff, cur.climEff, 1.0))
+                float speedC = clamp01(1.0 - (bar_index - cur.pendConfBar) / 10.0)
+                cur.springScore := math.round(40.0 * depthC + 40.0 * effC + 20.0 * speedC)
+                string effNote = cur.pendEff < 1.0 ? nmOf(cur, "no supply", "no demand") : "shake-out"
+                string sprDet = str.tostring(cur.springScore) + "/100 · " + effNote + " · " + str.tostring(depthAtr, "#.##") + " ATR"
+                evLabel(cur, cur.pendBar, cur.pendPrice, nmOf(cur, "Spring", "UTAD") + (detailLblInput ? "\n" + sprDet : ""), true, sigColorInput, eventSize, nmOf(cur, "Spring", "Upthrust After Distribution") + "\n" + sprDet)
+                addDivider(cur, cur.pendBar, 2, rngCol)
+                sigDetect := true
+                eventLevel := cur.pendPrice
+                entryScoreEv := cur.springScore
+                entryInfoEv := nmOf(cur, "Spring", "UTAD") + " @ " + fmtPrice(cur.pendPrice) + " (" + effNote + ")"
+                if cur.side == 1
+                    evSpring := true
+                    if not cur.springCounted
+                        springRanges += 1
+                        cur.springCounted := true
+                else
+                    evUtad := true
+                    if not cur.springCounted
+                        utadRanges += 1
+                        cur.springCounted := true
+                eventMsg += nmOf(cur, "SPRING", "UTAD") + " " + str.tostring(cur.springScore) + "/100 (" + effNote + ") at " + fmtPrice(cur.pendPrice) + " | "
+        else if bar_index - cur.pendConfBar > reclaimBarsInput
+            evLabel(cur, bar_index, cur.side == 1 ? low : high, nmOf(cur, "BREAKDOWN", "BREAKOUT"), true, failColorInput, eventSize, "No reclaim within the deadline: range failed")
+            if cur.side == 1
+                accBad += 1
+            else
+                distBad += 1
+            evFailed := true
+            eventMsg += nmOf(cur, "Accumulation", "Distribution") + " range FAILED (no reclaim) | "
+            cur.pendBreak := false
+            closeRange := true
+            failedRange := true
+            closeTag := "BROKEN"
+
+    // 4) SOS failure: back below the midline before LPS
+    if not closeRange and cur.brokeOut and not cur.lpsSeen and bar_index > cur.breakBar and uC < 0.5
+        evLabel(cur, bar_index, cur.side == 1 ? low : high, nmOf(cur, "SOS lost", "SOW lost"), true, failColorInput, eventSize, "Close back below the midline before LPS: breakout failed")
+        if cur.side == 1
+            accBad += 1
+        else
+            distBad += 1
+        tgtMiss += removeOutcome(cur.id)
+        evFailed := true
+        eventMsg += nmOf(cur, "SOS", "SOW") + " FAILED — back below midline | "
+        closeRange := true
+        failedRange := true
+        closeTag := "BREAKOUT LOST"
+
+    // 5) SOS / SOW: breakout close with a quality leg (leg runs from the last climax-side swing)
+    if not closeRange and not cur.brokeOut and not cur.pendBreak and legDir == cur.side and (cur.nTests > 0 or cur.sprung)
+        [le, lp, ln] = legStats(legStartBar, bar_index)
+        legEffNow  := le
+        legPeakNow := lp
+        legAtrNow  := safeDiv(math.abs(close - legStartPrice), atr, 0.0)
+        bool effOk  = legEffNow >= sosEffInput
+        bool lenOk  = legAtrNow >= sosLegAtrInput
+        bool qualOk = sosLogicInput == "Effort AND leg length" ? (effOk and lenOk) : (effOk or lenOk)
+        if uC > 1.0 + sosBufAtrInput * atr / h and qualOk
+            float tCpos = cur.side == 1 ? cpos : 1.0 - cpos
+            cur.sosScore := math.round(clamp01((legEffNow - 1.0) / 1.5) * 40.0 + clamp01(legAtrNow / 3.0) * 30.0 + tCpos * 30.0)
+            cur.brokeOut := true
+            cur.breakBar  := bar_index
+            cur.sosEff  := legEffNow
+            cur.stage   := 4
+            string sosDet = str.tostring(cur.sosScore) + "/100 · leg eff ×" + str.tostring(legEffNow, "#.#") + " · " + str.tostring(legAtrNow, "#.#") + " ATR"
+            evLabel(cur, bar_index, cur.side == 1 ? high : low, nmOf(cur, "SOS", "SOW") + (detailLblInput ? "\n" + sosDet : ""), false, rngCol, eventSize, nmOf(cur, "Sign of Strength", "Sign of Weakness") + "\n" + sosDet)
+            addDivider(cur, bar_index, cur.sprung ? 3 : 2, rngCol)
+            sigDetect := true
+            eventLevel := cur.side == 1 ? cur.top : cur.bot
+            entryScoreEv := cur.sosScore
+            entryInfoEv := nmOf(cur, "SOS", "SOW") + " @ " + fmtPrice(close) + " · leg eff ×" + str.tostring(legEffNow, "#.#")
+            if cur.side == 1
+                evSos := true
+            else
+                evSow := true
+            if cur.sprung
+                if cur.side == 1
+                    sprungBroke += 1
+                else
+                    utadBroke += 1
+            cur.target := pOf(cur, 1.0 + projMultInput)
+            if showTargetInput
+                cur.tgtLn    := line.new(bar_index, cur.target, bar_index + projBarsInput, cur.target, xloc = xloc.bar_index, color = inkOf(rngCol), style = line.style_dashed, width = 2)
+                cur.tgtTag := label.new(bar_index + projBarsInput, cur.target, "Target " + fmtPrice(cur.target), xloc = xloc.bar_index, style = label.style_label_left, color = eventBackdropInput ? LABEL_PLATE : TRANSP_COLOR, textcolor = inkOf(rngCol), size = eventSize, text_font_family = font.family_monospace)
+            if math.abs(cur.target - close) >= tgtMarginAtrInput * atr
+                array.push(oId, cur.id)
+                array.push(oDir, cur.side)
+                array.push(oTgt, cur.target)
+                array.push(oInv, pOf(cur, 0.5))
+                array.push(oBar, bar_index)
+            else
+                tgtPre += 1
+            eventMsg += nmOf(cur, "SOS", "SOW") + " " + str.tostring(cur.sosScore) + "/100 at " + fmtPrice(close) + " → target " + fmtPrice(cur.target) + " | "
+
+    // 6) LPS timeout
+    if not closeRange and cur.brokeOut and not cur.lpsSeen and bar_index - cur.breakBar > lpsMaxBarsInput
+        if cur.side == 1
+            accOk += 1
+        else
+            distOk += 1
+        closeRange := true
+        closeTag := nmOf(cur, "MARKUP · no LPS", "MARKDOWN · no LPSY")
+
+// ── B) swing-level classification ──
+if confirmed and newSwing
+    if na(cur)
+        // B1) climax candidate: reaction-side swing = AR test, climax-side swing = possible extension
+        if candDir != 0
+            bool reactionKind = (candDir == 1 and sw.kind == 1) or (candDir == -1 and sw.kind == -1)
+            if reactionKind
+                float heightPx = candDir == 1 ? sw.price - candPrice : candPrice - sw.price
+                float retrace  = safeDiv(heightPx, candLegPx, 0.0)
+                if heightPx >= minHeightAtrInput * atr and retrace >= arRetraceInput
+                    rangeSeq += 1
+                    color rngCol = candDir == 1 ? bullColorInput : bearColorInput
+                    float top  = candDir == 1 ? sw.price : candPrice
+                    float bot  = candDir == 1 ? candPrice : sw.price
+                    color lineCol = showRangesInput ? inkOf(rngCol) : color.new(rngCol, 100)
+                    color tagCol  = showRangesInput ? TEXT_MUTED : color.new(TEXT_MUTED, 100)
+                    float climPx  = candDir == 1 ? bot : top
+                    float reactPx = candDir == 1 ? top : bot
+                    line  lC  = line.new(candBar, climPx, bar_index, climPx, xloc = xloc.bar_index, color = lineCol, width = 2)
+                    line  lR  = line.new(candBar, reactPx, bar_index, reactPx, xloc = xloc.bar_index, color = lineCol, width = 2)
+                    color plate   = eventBackdropInput and showRangesInput ? LABEL_PLATE : TRANSP_COLOR
+                    label tC  = label.new(bar_index + TAG_OFFSET_BARS, climPx, candDir == 1 ? "Support Lines" : "Resistance Lines", xloc = xloc.bar_index, style = label.style_label_left, color = plate, textcolor = tagCol, size = eventSizeSub, text_font_family = font.family_monospace)
+                    label tR  = label.new(bar_index + TAG_OFFSET_BARS, reactPx, candDir == 1 ? "Resistance Lines" : "Support Lines", xloc = xloc.bar_index, style = label.style_label_left, color = plate, textcolor = tagCol, size = eventSizeSub, text_font_family = font.family_monospace)
+                    label phl = label.new(candBar, reactPx, "", xloc = xloc.bar_index, color = plate, style = candDir == 1 ? label.style_label_upper_left : label.style_label_lower_left, textcolor = showRangesInput ? inkOf(rngCol) : color.new(rngCol, 100), size = eventSize, text_font_family = font.family_monospace)
+                    label cpt = label.new(bar_index, bot, "", xloc = xloc.bar_index, style = eventBackdropInput ? label.style_label_center : label.style_none, color = TRANSP_COLOR, textcolor = showPhasesInput ? inkOf(rngCol) : color.new(rngCol, 100), size = eventSize, text_font_family = font.family_monospace)
+                    cur := Rng.new(id = rangeSeq, side = candDir, top = top, bot = bot, climaxBar = candBar, reactBar = sw.bar, stage = 1, climEff = candEff, climPeak = candPeak, climScore = candScore, nTests = 0, utCount = 0, sprung = false, springCounted = false, tested = false, brokeOut = false, lpsSeen = false, pendBreak = false, pendBar = 0, pendConfBar = 0, springBar = 0, springScore = 0, breakBar = 0, sosScore = 0, edgeClim = lC, edgeReact = lR, tagClim = tC, tagReact = tR, stageLbl = phl, curPhaseTag = cpt, lastDivBar = candBar, dividers = array.new<line>(), phaseTags = array.new<label>(), marks = array.new<label>())
+                    if not na(candLbl)
+                        array.push(cur.marks, candLbl)
+                    candLbl := na
+                    string arDet = str.tostring(retrace * 100, "#") + "% retrace of the climactic run"
+                    evLabel(cur, sw.bar, sw.price, "AR" + (detailLblInput ? "\n" + arDet : ""), false, rngCol, eventSize, (candDir == 1 ? "Automatic Rally" : "Automatic Reaction") + "\n" + arDet)
+                    sigDetect := true
+                    evAR := true
+                    if candDir == 1
+                        accTotal += 1
+                    else
+                        distTotal += 1
+                    eventMsg += (candDir == 1 ? "ACCUMULATION" : "DISTRIBUTION") + " range confirmed (AR) " + fmtPrice(bot) + " – " + fmtPrice(top) + " | "
+                    candDir := 0
+            else
+                bool deeper = candDir == 1 ? sw.price < candPrice : sw.price > candPrice
+                if deeper
+                    candLegPx += math.abs(sw.price - candPrice)
+                    candPrice := sw.price
+                    candBar   := sw.bar
+                    if not na(candLbl)
+                        label.set_xy(candLbl, sw.bar, candDir == 1 ? sw.price - EVENT_OFFSET_ATR * atr : sw.price + EVENT_OFFSET_ATR * atr)
+        // B2) climax test on this swing: score the whole climactic run that ends here
+        if candDir == 0 and na(cur)
+            [runStartBar, runStartPx, runLows] = runOf(sw.kind, sw.price)
+            bool  trendOk = runLows >= trendSwingsInput
+            float runPx   = na(runStartPx) ? 0.0 : math.abs(runStartPx - sw.price)
+            float runAtr  = safeDiv(runPx, atr, 0.0)
+            int   runBars = na(runStartBar) ? 0 : sw.bar - runStartBar
+            [runEff, runPeak, runN] = legStats(nz(runStartBar, sw.bar), sw.bar)
+            float effC  = clamp01(runEff - 1.0)
+            float peakC = clamp01((runPeak - 1.0) / 3.0)
+            float extC  = clamp01((runAtr - 2.0) / 6.0)
+            float velC  = clamp01(safeDiv(runAtr, math.max(runBars, 1), 0.0) / 0.5)
+            int   score = math.round(30.0 * effC + 30.0 * peakC + 20.0 * extC + 20.0 * velC)
+            if trendOk and runPeak >= climaxPeakInput and score >= climaxScoreInput
+                candDir   := sw.kind == -1 ? 1 : -1
+                candPrice := sw.price
+                candBar   := sw.bar
+                candEff   := runEff
+                candPeak  := runPeak
+                candLegPx := runPx
+                candScore := score
+                if showEventsInput
+                    string scDet = str.tostring(score) + "/100 · peak ×" + str.tostring(runPeak, "#.#") + " · run " + str.tostring(runAtr, "#.#") + " ATR"
+                    float  scY   = candDir == 1 ? sw.price - EVENT_OFFSET_ATR * atr : sw.price + EVENT_OFFSET_ATR * atr
+                    candLbl := schemLabel(sw.bar, scY, (candDir == 1 ? "SC" : "BC") + (detailLblInput ? "\n" + scDet : ""), climColorInput, eventSize, (candDir == 1 ? "Selling Climax" : "Buying Climax") + "\n" + scDet)
+                sigDetect := true
+                evClimax := true
+                eventMsg += (candDir == 1 ? "Selling Climax (SC)" : "Buying Climax (BC)") + " " + str.tostring(score) + "/100 | "
+    else if not closeRange
+        float u    = uOf(cur, sw.price)
+        float uC   = uOf(cur, close)
+        color rngCol = cur.side == 1 ? bullColorInput : bearColorInput
+        bool climaxSide = (cur.side == 1 and sw.kind == -1) or (cur.side == -1 and sw.kind == 1)
+        if climaxSide
+            if u < 0 and not cur.brokeOut
+                // beyond the climax edge: extension, spring, or pending reclaim
+                if uC >= 0
+                    if requireSTInput and cur.nTests == 0
+                        if na(cur.innerClim)
+                            cur.innerClim := line.new(cur.climaxBar, climEdge(cur), bar_index, climEdge(cur), xloc = xloc.bar_index, color = color.new(inkOf(rngCol), 35), width = 1)
+                        if cur.side == 1
+                            cur.bot := sw.price
+                        else
+                            cur.top := sw.price
+                        redrawRange(cur)
+                        evLabel(cur, sw.bar, sw.price, "ext", true, climColorInput, eventSizeSub, "Climax extreme extended before the first ST")
+                    else
+                        cur.sprung  := true
+                        cur.tested    := false
+                        cur.springPrice := sw.price
+                        cur.springBar   := sw.bar
+                        cur.springEff   := sw.legEff
+                        cur.stage       := 3
+                        float depthAtr = safeDiv(cur.side == 1 ? cur.bot - sw.price : sw.price - cur.top, atr, 0.0)
+                        float depthC = clamp01(1.0 - depthAtr / 1.5)
+                        float effC   = clamp01(1.0 - safeDiv(sw.legEff, cur.climEff, 1.0))
+                        float speedC = clamp01(1.0 - (bar_index - sw.bar) / 10.0)
+                        cur.springScore := math.round(40.0 * depthC + 40.0 * effC + 20.0 * speedC)
+                        string effNote = sw.legEff < 1.0 ? nmOf(cur, "no supply", "no demand") : "shake-out"
+                        string sprDet = str.tostring(cur.springScore) + "/100 · " + effNote + " · " + str.tostring(depthAtr, "#.##") + " ATR"
+                        evLabel(cur, sw.bar, sw.price, nmOf(cur, "Spring", "UTAD") + (detailLblInput ? "\n" + sprDet : ""), true, sigColorInput, eventSize, nmOf(cur, "Spring", "Upthrust After Distribution") + "\n" + sprDet)
+                        addDivider(cur, sw.bar, 2, rngCol)
+                        sigDetect := true
+                        eventLevel := sw.price
+                        entryScoreEv := cur.springScore
+                        entryInfoEv := nmOf(cur, "Spring", "UTAD") + " @ " + fmtPrice(sw.price) + " (" + effNote + ")"
+                        if cur.side == 1
+                            evSpring := true
+                            if not cur.springCounted
+                                springRanges += 1
+                                cur.springCounted := true
+                        else
+                            evUtad := true
+                            if not cur.springCounted
+                                utadRanges += 1
+                                cur.springCounted := true
+                        eventMsg += nmOf(cur, "SPRING", "UTAD") + " " + str.tostring(cur.springScore) + "/100 (" + effNote + ") at " + fmtPrice(sw.price) + " | "
+                else
+                    cur.pendBreak   := true
+                    cur.pendBar     := sw.bar
+                    cur.pendPrice   := sw.price
+                    cur.pendEff     := sw.legEff
+                    cur.pendConfBar := bar_index
+            else if cur.brokeOut
+                if not cur.lpsSeen and sw.bar > cur.breakBar and u >= lpsFloorInput
+                    cur.lpsSeen := true
+                    cur.stage   := 5
+                    string lpsDet = "u " + str.tostring(u, "#.##") + " · eff ×" + str.tostring(sw.legEff, "#.#")
+                    evLabel(cur, sw.bar, sw.price, nmOf(cur, "LPS", "LPSY") + (detailLblInput ? "\n" + lpsDet : ""), true, rngCol, eventSize, nmOf(cur, "Last Point of Support", "Last Point of Supply") + "\n" + lpsDet)
+                    addDivider(cur, sw.bar, 4, rngCol)
+                    sigDetect := true
+                    eventLevel := sw.price
+                    entryScoreEv := math.max(cur.sosScore, cur.springScore)
+                    entryInfoEv := nmOf(cur, "LPS", "LPSY") + " @ " + fmtPrice(sw.price) + " · u " + str.tostring(u, "#.##")
+                    if cur.side == 1
+                        evLps := true
+                        accOk += 1
+                    else
+                        evLpsy := true
+                        distOk += 1
+                    eventMsg += nmOf(cur, "LPS", "LPSY") + " locked in at " + fmtPrice(sw.price) + " | "
+                    closeRange := true
+                    closeTag := nmOf(cur, "MARKUP", "MARKDOWN")
+            else if cur.sprung
+                float uSpring = uOf(cur, cur.springPrice)
+                if not cur.tested and u > uSpring and u <= testZoneInput and sw.legEff < cur.springEff
+                    cur.tested := true
+                    evLabel(cur, sw.bar, sw.price, "Test" + (detailLblInput ? "\neff ×" + str.tostring(sw.legEff, "#.#") : ""), true, rngCol, eventSize, "Test of the " + nmOf(cur, "spring", "UTAD") + "\nleg effort ×" + str.tostring(sw.legEff, "#.#") + " (spring leg ×" + str.tostring(cur.springEff, "#.#") + ")")
+                    sigDetect := true
+                    evTEST := true
+                    eventMsg += "TEST confirmed | "
+            else if u >= 0 and u <= stZoneInput and cur.nTests < maxSTInput
+                cur.nTests += 1
+                if cur.stage < 2
+                    cur.stage := 2
+                    addDivider(cur, sw.bar, 1, rngCol)
+                if na(cur.innerClim)
+                    cur.innerClim := line.new(sw.bar, sw.price, bar_index, sw.price, xloc = xloc.bar_index, color = color.new(inkOf(rngCol), 35), width = 1)
+                evLabel(cur, sw.bar, sw.price, "ST" + (detailLblInput ? (sw.legEff < cur.climEff ? "\neff↓" : "\neff↑") : ""), true, rngCol, eventSize, "Secondary Test\nleg effort ×" + str.tostring(sw.legEff, "#.#") + (sw.legEff < cur.climEff ? " (below climax)" : " (above climax)"))
+                sigDetect := true
+                evST := true
+                eventMsg += "ST confirmed | "
+        else
+            // reaction-side swing
+            if cur.pendBreak and u < 0
+                // structure continued beyond the climax edge: breakdown
+                evLabel(cur, sw.bar, sw.price, nmOf(cur, "BREAKDOWN", "BREAKOUT"), false, failColorInput, eventSize, "Reaction-side swing formed beyond the climax edge: structure broke")
+                if cur.side == 1
+                    accBad += 1
+                else
+                    distBad += 1
+                evFailed := true
+                eventMsg += nmOf(cur, "Accumulation", "Distribution") + " range FAILED (structure) | "
+                cur.pendBreak := false
+                closeRange := true
+                failedRange := true
+                closeTag := "BROKEN"
+            else if u > 1 and not cur.brokeOut
+                if cur.nTests == 0 and not cur.sprung
+                    float newH = safeDiv(cur.side == 1 ? sw.price - cur.bot : cur.top - sw.price, atr, 0.0)
+                    if newH > maxHeightAtrInput
+                        // the "reaction" never stopped: this is a trend, not a range
+                        evLabel(cur, sw.bar, sw.price, "no range · trend", false, failColorInput, eventSizeSub, "The reaction never stopped: trend, not a range")
+                        if cur.side == 1
+                            accBad += 1
+                        else
+                            distBad += 1
+                        eventMsg += nmOf(cur, "Accumulation", "Distribution") + " candidate dropped: reaction exceeded Max Range Height | "
+                        closeRange := true
+                        failedRange := true
+                        closeTag := "NO RANGE · trend"
+                    else
+                        // Phase A: the automatic reaction is still running — extend the reaction edge
+                        if na(cur.innerReact)
+                            cur.innerReact := line.new(cur.reactBar, reactEdge(cur), bar_index, reactEdge(cur), xloc = xloc.bar_index, color = color.new(inkOf(rngCol), 35), width = 1)
+                        if cur.side == 1
+                            cur.top := sw.price
+                        else
+                            cur.bot := sw.price
+                        cur.reactBar := sw.bar
+                        redrawRange(cur)
+                        evLabel(cur, sw.bar, sw.price, "AR+", false, rngCol, eventSizeSub, "Automatic reaction extended (Phase A)")
+                else if markUTInput and uC <= 1
+                    cur.utCount += 1
+                    evLabel(cur, sw.bar, sw.price, nmOf(cur, "UT", "Shakeout"), false, sigColorInput, eventSizeSub, nmOf(cur, "Upthrust: false break of the resistance", "Shakeout: false break of the support"))
+
+// ── C) extend / finalize the active range ──
+if confirmed and not na(cur)
+    line.set_x2(cur.edgeClim, bar_index)
+    line.set_x2(cur.edgeReact, bar_index)
+    if not na(cur.innerClim)
+        line.set_x2(cur.innerClim, bar_index)
+    if not na(cur.innerReact)
+        line.set_x2(cur.innerReact, bar_index)
+    label.set_x(cur.tagClim, bar_index + TAG_OFFSET_BARS)
+    label.set_x(cur.tagReact, bar_index + TAG_OFFSET_BARS)
+    label.set_text(cur.stageLbl, nmOf(cur, "ACCUMULATION", "DISTRIBUTION") + " · Phase " + phaseTxt(cur.stage))
+    float hC = math.max(cur.top - cur.bot, syminfo.mintick)
+    bool showTag = bar_index - cur.lastDivBar >= MIN_PHASE_BARS
+    label.set_xy(cur.curPhaseTag, math.round((cur.lastDivBar + bar_index) / 2.0), cur.bot - PHASE_TAG_FRAC * hC)
+    label.set_text(cur.curPhaseTag, showTag ? "Phase " + phaseTxt(cur.stage) : "")
+    label.set_color(cur.curPhaseTag, showTag and showPhasesInput and eventBackdropInput ? LABEL_PLATE : TRANSP_COLOR)
+    if closeRange
+        bool hide = failedRange and not showFailedInput
+        if hide
+            line.delete(cur.edgeClim)
+            line.delete(cur.edgeReact)
+            line.delete(cur.innerClim)
+            line.delete(cur.innerReact)
+            label.delete(cur.tagClim)
+            label.delete(cur.tagReact)
+            label.delete(cur.stageLbl)
+            label.delete(cur.curPhaseTag)
+            line.delete(cur.tgtLn)
+            label.delete(cur.tgtTag)
+            for dv in cur.dividers
+                line.delete(dv)
+            for pt in cur.phaseTags
+                label.delete(pt)
+            for mk in cur.marks
+                label.delete(mk)
+        else
+            label.set_text(cur.stageLbl, nmOf(cur, "ACCUMULATION", "DISTRIBUTION") + " · " + closeTag)
+            if cur.lpsSeen
+                // the range ends at the LPS / LPSY: Phase E is the tail, captioned just past the last divider
+                label.set_xy(cur.curPhaseTag, cur.lastDivBar + PHASE_E_OFFSET_BARS, cur.bot - PHASE_TAG_FRAC * hC)
+                label.set_text(cur.curPhaseTag, "Phase E")
+                label.set_color(cur.curPhaseTag, showPhasesInput and eventBackdropInput ? LABEL_PLATE : TRANSP_COLOR)
+            if failedRange
+                color gLine = showRangesInput ? color.new(GRAY_RANGE, 10) : color.new(GRAY_RANGE, 100)
+                line.set_color(cur.edgeClim, gLine)
+                line.set_color(cur.edgeReact, gLine)
+                if not na(cur.innerClim)
+                    line.set_color(cur.innerClim, color.new(GRAY_RANGE, 40))
+                if not na(cur.innerReact)
+                    line.set_color(cur.innerReact, color.new(GRAY_RANGE, 40))
+                label.set_textcolor(cur.tagClim, showRangesInput ? color.new(GRAY_RANGE, 20) : color.new(GRAY_RANGE, 100))
+                label.set_textcolor(cur.tagReact, showRangesInput ? color.new(GRAY_RANGE, 20) : color.new(GRAY_RANGE, 100))
+                label.set_textcolor(cur.stageLbl, showRangesInput ? GRAY_RANGE : color.new(GRAY_RANGE, 100))
+                label.set_textcolor(cur.curPhaseTag, showPhasesInput ? color.new(GRAY_RANGE, 20) : color.new(GRAY_RANGE, 100))
+                for dv in cur.dividers
+                    line.set_color(dv, color.new(GRAY_RANGE, 35))
+                for pt in cur.phaseTags
+                    label.set_textcolor(pt, color.new(GRAY_RANGE, 20))
+                for mk in cur.marks
+                    label.set_textcolor(mk, color.new(GRAY_RANGE, 20))
+            array.push(hist, cur)
+            if array.size(hist) > maxRangesInput
+                Rng old = array.shift(hist)
+                line.delete(old.edgeClim)
+                line.delete(old.edgeReact)
+                line.delete(old.innerClim)
+                line.delete(old.innerReact)
+                label.delete(old.tagClim)
+                label.delete(old.tagReact)
+                label.delete(old.stageLbl)
+                label.delete(old.curPhaseTag)
+                line.delete(old.tgtLn)
+                label.delete(old.tgtTag)
+                for dv in old.dividers
+                    line.delete(dv)
+                for pt in old.phaseTags
+                    label.delete(pt)
+                for mk in old.marks
+                    label.delete(mk)
+        cur := na
+
+// candidate timeout (no AR swing in time)
+if confirmed and candDir != 0 and na(cur) and bar_index - candBar > arMaxBarsInput
+    label.delete(candLbl)
+    candLbl := na
+    candDir := 0
+
+// ── D) outcome tracker (from the bar after SOS; expiry before hit) ──
+if confirmed and array.size(oId) > 0
+    for i = array.size(oId) - 1 to 0
+        if bar_index <= array.get(oBar, i)
+            continue
+        int d = array.get(oDir, i)
+        int ageO = bar_index - array.get(oBar, i)
+        bool hitT = d > 0 ? high >= array.get(oTgt, i) : low <= array.get(oTgt, i)
+        bool inv  = d > 0 ? close < array.get(oInv, i) : close > array.get(oInv, i)
+        bool done = false
+        if ageO > outcomeBarsInput
+            tgtExp += 1
+            done := true
+        else if hitT
+            tgtHit += 1
+            done := true
+        else if inv
+            tgtMiss += 1
+            done := true
+        if done
+            array.remove(oId, i)
+            array.remove(oDir, i)
+            array.remove(oTgt, i)
+            array.remove(oInv, i)
+            array.remove(oBar, i)
+
+// ── Entry signals ──
+bool useLps    = entrySignalInput == "LPS / LPSY" or entrySignalInput == "Spring + LPS"
+bool useSpring = entrySignalInput == "Spring / UTAD" or entrySignalInput == "Spring + LPS"
+bool useSos    = entrySignalInput == "SOS / SOW"
+bool confirmedLongSignal  = isWarmedUp and confirmed and ((useLps and evLps) or (useSpring and evSpring) or (useSos and evSos))
+bool confirmedShortSignal = isWarmedUp and confirmed and ((useLps and evLpsy) or (useSpring and evUtad) or (useSos and evSow))
+int  entryScore = entryScoreEv
+
+var string lastSigType   = ""
+var float  lastSigScore  = na
+var int    lastSigBarIdx = na
+if confirmedLongSignal
+    lastSigType   := "Long"
+    lastSigScore  := entryScore
+    lastSigBarIdx := bar_index
+if confirmedShortSignal
+    lastSigType   := "Short"
+    lastSigScore  := entryScore
+    lastSigBarIdx := bar_index
+
+// ══════════════════════════════════════
+// RISK MANAGEMENT (SL/TP) — TRADE ENGINE
+// ══════════════════════════════════════
+[effectiveSLMult, effTP1m, effTP2m, effTP3m] = switch riskPresetInput
+    "Conservative" => [2.5, 1.0, 2.0, 4.0]
+    "Aggressive"   => [1.0, 1.5, 2.5, 4.0]
+    "Scalping"     => [0.8, 0.8, 1.5, 2.0]
+    "Custom"       => [slMultInput, tp1MultInput, tp2MultInput, tp3MultInput]
+    => [1.5, 1.0, 2.0, 3.0]
+float slDistance = riskAtr * effectiveSLMult
+
+// state
+var float activeEntry = na
+var float activeSL    = na
+var float activeTP1   = na
+var float activeTP2   = na
+var float activeTP3   = na
+var int   activeDir   = 0
+var int   entryBarIdx = na
+var float entryAtr    = na
+var bool  tp1Reached  = false
+var bool  tp2Reached  = false
+var bool  tp3Reached  = false
+var bool  beActive    = false
+
+// session stats
+var int    winCount  = 0
+var int    lossCount = 0
+var string formStr   = ""
+var array<int>  tradeTimes = array.new<int>()
+var array<bool> tradeWins  = array.new<bool>()
+
+// bar-start captures
+bool  beActiveAtBarStart = beActive
+float effectiveSL        = activeSL
+
+// hit detection: entry-bar guard + confirmed only
+bool canCheckHit = activeDir != 0 and not na(entryBarIdx) and bar_index > entryBarIdx and barstate.isconfirmed
+bool slHitRaw  = canCheckHit and (activeDir == 1 ? low  <= effectiveSL : high >= effectiveSL)
+bool tp1HitRaw = canCheckHit and (activeDir == 1 ? high >= activeTP1   : low  <= activeTP1)
+bool tp2HitRaw = canCheckHit and (activeDir == 1 ? high >= activeTP2   : low  <= activeTP2)
+bool tp3HitRaw = canCheckHit and (activeDir == 1 ? high >= activeTP3   : low  <= activeTP3)
+
+bool tp1FirstTouch = tp1HitRaw and not tp1Reached
+bool tp2FirstTouch = tp2HitRaw and not tp2Reached
+bool tp3FirstTouch = tp3HitRaw and not tp3Reached
+if tp1FirstTouch
+    tp1Reached := true
+if tp2FirstTouch
+    tp2Reached := true
+if tp3FirstTouch
+    tp3Reached := true
+
+// break-even after TP1
+bool  beJustActivated = false
+float beLevel         = na
+if beInput and tp1FirstTouch and not beActive and activeDir != 0
+    activeSL        := activeEntry + activeDir * beOffsetInput * nz(entryAtr, 0.0)
+    beActive        := true
+    beJustActivated := true
+    beLevel         := activeSL
+
+// snapshots before reset
+var float hitSL    = na
+var float hitEntry = na
+if slHitRaw
+    hitSL    := effectiveSL
+    hitEntry := activeEntry
+float exitEntry         = activeEntry
+int   exitDir           = activeDir
+float exitTP1           = activeTP1
+float exitTP2           = activeTP2
+float exitTP3           = activeTP3
+bool  exitBeActive      = beActiveAtBarStart
+bool  displayTp1Reached = tp1Reached
+bool  displayTp2Reached = tp2Reached
+bool  displayTp3Reached = tp3Reached
+
+// closure: SL blocked by first TP touch of this bar (TP priority)
+bool closeBySl = slHitRaw and not tp1FirstTouch and not tp3FirstTouch
+bool evSlHit   = closeBySl
+bool evTp3Hit  = false
+if (tp3HitRaw or closeBySl) and activeDir != 0
+    evTp3Hit := tp3HitRaw
+    bool tradeWin = tp1Reached
+    if tradeWin
+        winCount += 1
+    else
+        lossCount += 1
+    formStr := formStr + (tradeWin ? "▰" : "▱")
+    if str.length(formStr) > FORM_LEN
+        formStr := str.substring(formStr, str.length(formStr) - FORM_LEN)
+    array.push(tradeTimes, time)
+    array.push(tradeWins, tradeWin)
+    while array.size(tradeTimes) > 0 and array.get(tradeTimes, 0) < time - MS_DAY * STATS_PRUNE_DAYS
+        array.shift(tradeTimes)
+        array.shift(tradeWins)
+    activeDir   := 0
+    activeEntry := na
+    activeSL    := na
+    activeTP1   := na
+    activeTP2   := na
+    activeTP3   := na
+    entryBarIdx := na
+    entryAtr    := na
+    tp1Reached  := false
+    tp2Reached  := false
+    tp3Reached  := false
+    beActive    := false
+
+// signal-trade parity: reversal
+int  sigDir = confirmedLongSignal ? 1 : confirmedShortSignal ? -1 : 0
+bool reverseToShort = sigDir == -1 and activeDir == 1
+bool reverseToLong  = sigDir ==  1 and activeDir == -1
+bool evReversal = false
+bool reversalWin = false
+if reverseToShort or reverseToLong
+    evReversal := true
+    bool tradeWin = tp1Reached
+    reversalWin := tradeWin
+    if tradeWin
+        winCount += 1
+    else
+        lossCount += 1
+    formStr := formStr + (tradeWin ? "▰" : "▱")
+    if str.length(formStr) > FORM_LEN
+        formStr := str.substring(formStr, str.length(formStr) - FORM_LEN)
+    array.push(tradeTimes, time)
+    array.push(tradeWins, tradeWin)
+    while array.size(tradeTimes) > 0 and array.get(tradeTimes, 0) < time - MS_DAY * STATS_PRUNE_DAYS
+        array.shift(tradeTimes)
+        array.shift(tradeWins)
+    activeDir   := 0
+    activeEntry := na
+    activeSL    := na
+    activeTP1   := na
+    activeTP2   := na
+    activeTP3   := na
+    entryBarIdx := na
+    entryAtr    := na
+    tp1Reached  := false
+    tp2Reached  := false
+    tp3Reached  := false
+    beActive    := false
+
+// entries
+bool evLongEntry  = false
+bool evShortEntry = false
+if confirmedLongSignal and activeDir == 0 and slDistance > 0
+    float slAtrLong   = close - slDistance
+    float slWickLong  = math.min(low - riskAtr * WICK_BUFFER_ATR, close - riskAtr * WICK_MIN_ATR)
+    float slStructLong = na(eventLevel) ? slWickLong : math.min(eventLevel - riskAtr * WICK_BUFFER_ATR, close - riskAtr * WICK_MIN_ATR)
+    float slLong = slModeInput == "ATR" ? slAtrLong : slModeInput == "Structure" ? slStructLong : slWickLong
+    float riskLong = close - slLong
+    if riskLong > 0
+        activeEntry := close
+        activeSL    := slLong
+        activeTP1   := close + riskLong * effTP1m
+        activeTP2   := close + riskLong * effTP2m
+        activeTP3   := close + riskLong * effTP3m
+        activeDir   := 1
+        entryBarIdx := bar_index
+        entryAtr    := riskAtr
+        tp1Reached  := false
+        tp2Reached  := false
+        tp3Reached  := false
+        beActive    := false
+        evLongEntry := true
+if confirmedShortSignal and activeDir == 0 and slDistance > 0
+    float slAtrShort   = close + slDistance
+    float slWickShort  = math.max(high + riskAtr * WICK_BUFFER_ATR, close + riskAtr * WICK_MIN_ATR)
+    float slStructShort = na(eventLevel) ? slWickShort : math.max(eventLevel + riskAtr * WICK_BUFFER_ATR, close + riskAtr * WICK_MIN_ATR)
+    float slShort = slModeInput == "ATR" ? slAtrShort : slModeInput == "Structure" ? slStructShort : slWickShort
+    float riskShort = slShort - close
+    if riskShort > 0
+        activeEntry  := close
+        activeSL     := slShort
+        activeTP1    := close - riskShort * effTP1m
+        activeTP2    := close - riskShort * effTP2m
+        activeTP3    := close - riskShort * effTP3m
+        activeDir    := -1
+        entryBarIdx  := bar_index
+        entryAtr     := riskAtr
+        tp1Reached   := false
+        tp2Reached   := false
+        tp3Reached   := false
+        beActive     := false
+        evShortEntry := true
+
+bool newEntry = evLongEntry or evShortEntry
+
+// ── Statistics ──
+int   closedTrades = winCount + lossCount
+float winRate      = closedTrades > 0 ? winCount * 100.0 / closedTrades : 0.0
+
+// ══════════════════════════════════════
+// PLOTS & VISUALS
+// ══════════════════════════════════════
+plotchar(showDetectInput and sigDetect, "Event detected", "·", location.top, color.new(TEXT_COLOR, 20), size = size.small)
+
+// ══════════════════════════════════════
+// LABELS & SHAPES — ENTRY LABELS
+// ══════════════════════════════════════
+// Every entry is marked. Same-direction signals while a trade is open are
+// ignored by the engine (no pyramiding) and are not marked.
+if showSignalsInput and evLongEntry
+    string buyKind = evReversal ? "Long entry (reversal from short)" : "Long entry · " + entrySignalInput
+    string buyTip  = buyKind + "\nScore: " + fmtScore(entryScore) + "/100" + "\nEvent: " + entryInfoEv + "\nRSI: " + str.tostring(rsiValue, "#.0") + "\nSL: " + fmtPrice(activeSL) + " | TP1: " + fmtPrice(activeTP1)
+    label.new(bar_index, low, "Long ▲", color = bullColorInput, textcolor = BULL_LABEL_TEXT, style = label.style_label_up, size = signalSize, tooltip = buyTip)
+
+if showSignalsInput and evShortEntry
+    string sellKind = evReversal ? "Short entry (reversal from long)" : "Short entry · " + entrySignalInput
+    string sellTip  = sellKind + "\nScore: " + fmtScore(entryScore) + "/100" + "\nEvent: " + entryInfoEv + "\nRSI: " + str.tostring(rsiValue, "#.0") + "\nSL: " + fmtPrice(activeSL) + " | TP1: " + fmtPrice(activeTP1)
+    label.new(bar_index, high, "Short ▼", color = bearColorInput, textcolor = BEAR_LABEL_TEXT, style = label.style_label_down, size = signalSize, tooltip = sellTip)
+
+// ══════════════════════════════════════
+// SL/TP LINES & LABELS
+// ══════════════════════════════════════
+var line  entryLine  = na
+var line  slLine     = na
+var line  tp1Line    = na
+var line  tp2Line    = na
+var line  tp3Line    = na
+var label entryLabel = na
+var label slLabel    = na
+var label tp1Label   = na
+var label tp2Label   = na
+var label tp3Label   = na
+
+string entryStyle = lineStyleFromString(entryLineStyleInput)
+string slStyle    = lineStyleFromString(slLineStyleInput)
+string tpStyle    = lineStyleFromString(tpLineStyleInput)
+
+// New entry: replace the previous trade's lines (they persist until now as a record)
+if newEntry and showSlTpInput
+    line.delete(entryLine)
+    line.delete(slLine)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    line.delete(tp3Line)
+    label.delete(entryLabel)
+    label.delete(slLabel)
+    label.delete(tp1Label)
+    label.delete(tp2Label)
+    label.delete(tp3Label)
+    int x1 = bar_index
+    int x2 = bar_index + LINE_FORWARD_BARS
+    entryLine := line.new(x1, activeEntry, x2, activeEntry, color = ENTRY_COLOR, style = entryStyle, width = 1)
+    slLine    := line.new(x1, activeSL, x2, activeSL, color = SL_COLOR, style = slStyle, width = 2)
+    tp1Line   := line.new(x1, activeTP1, x2, activeTP1, color = TP1_COLOR, style = tpStyle, width = 1)
+    tp2Line   := line.new(x1, activeTP2, x2, activeTP2, color = TP2_COLOR, style = tpStyle, width = 1)
+    tp3Line   := line.new(x1, activeTP3, x2, activeTP3, color = TP3_COLOR, style = tpStyle, width = 1)
+    if showSlTpLabelsInput
+        int lx = x2 + LABEL_OFFSET_BARS
+        entryLabel := label.new(lx, activeEntry, "ENTRY " + fmtPrice(activeEntry), color = ENTRY_COLOR, textcolor = LABEL_TEXT, style = label.style_label_left, size = labelSize)
+        slLabel    := label.new(lx, activeSL, "SL " + fmtPrice(activeSL) + formatPctFromEntry(activeSL, activeEntry), color = SL_COLOR, textcolor = LABEL_TEXT, style = label.style_label_left, size = labelSize)
+        tp1Label   := label.new(lx, activeTP1, "TP1 " + fmtPrice(activeTP1) + formatPctFromEntry(activeTP1, activeEntry), color = TP_LABEL_COLOR, textcolor = LABEL_TEXT, style = label.style_label_left, size = labelSize)
+        tp2Label   := label.new(lx, activeTP2, "TP2 " + fmtPrice(activeTP2) + formatPctFromEntry(activeTP2, activeEntry), color = TP_LABEL_COLOR, textcolor = LABEL_TEXT, style = label.style_label_left, size = labelSize)
+        tp3Label   := label.new(lx, activeTP3, "TP3 " + fmtPrice(activeTP3) + formatPctFromEntry(activeTP3, activeEntry), color = TP_LABEL_COLOR, textcolor = LABEL_TEXT, style = label.style_label_left, size = labelSize)
+
+// Open trade: lines end LINE_UPDATE_BARS after the current bar, labels right behind them
+if activeDir != 0 and showSlTpInput and not na(slLine)
+    int xe = bar_index + LINE_UPDATE_BARS
+    line.set_x2(entryLine, xe)
+    line.set_x2(slLine, xe)
+    line.set_x2(tp1Line, xe)
+    line.set_x2(tp2Line, xe)
+    line.set_x2(tp3Line, xe)
+    if showSlTpLabelsInput and not na(slLabel)
+        label.set_x(entryLabel, xe + LABEL_OFFSET_BARS)
+        label.set_x(slLabel, xe + LABEL_OFFSET_BARS)
+        label.set_x(tp1Label, xe + LABEL_OFFSET_BARS)
+        label.set_x(tp2Label, xe + LABEL_OFFSET_BARS)
+        label.set_x(tp3Label, xe + LABEL_OFFSET_BARS)
+
+// Break-even: the stop is still the action level, so it stays solid, now in the BE color
+// (not on a bar where new lines were just drawn)
+if showSlTpInput and beJustActivated and not newEntry
+    if not na(slLine)
+        line.set_color(slLine, BE_COLOR)
+        line.set_y1(slLine, beLevel)
+        line.set_y2(slLine, beLevel)
+    if showSlTpLabelsInput
+        if not na(slLabel)
+            label.set_y(slLabel, beLevel)
+            label.set_text(slLabel, "SL → BE " + fmtPrice(beLevel))
+            label.set_color(slLabel, BE_COLOR)
+            label.set_textcolor(slLabel, LABEL_TEXT)
+        if not na(entryLabel)
+            if math.abs(beLevel - exitEntry) < syminfo.mintick / 2
+                // the stop now sits exactly on the entry: one label is enough, hide the entry label
+                label.set_text(entryLabel, "")
+                label.set_color(entryLabel, TRANSP_COLOR)
+                label.set_textcolor(entryLabel, TRANSP_COLOR)
+            else
+                label.set_text(entryLabel, "ENTRY " + fmtPrice(exitEntry) + "  → SL (BE)")
+                label.set_color(entryLabel, BE_COLOR)
+
+// TP hit: the reached target turns solid teal with a check mark (from snapshots)
+if showSlTpInput and not newEntry
+    if displayTp1Reached and not na(tp1Line)
+        line.set_color(tp1Line, TP_HIT_COLOR)
+        line.set_style(tp1Line, line.style_solid)
+        if showSlTpLabelsInput and not na(tp1Label)
+            label.set_text(tp1Label, "TP1 ✓ " + fmtPrice(exitTP1) + formatPctFromEntry(exitTP1, exitEntry))
+            label.set_color(tp1Label, TP_HIT_COLOR)
+    if displayTp2Reached and not na(tp2Line)
+        line.set_color(tp2Line, TP_HIT_COLOR)
+        line.set_style(tp2Line, line.style_solid)
+        if showSlTpLabelsInput and not na(tp2Label)
+            label.set_text(tp2Label, "TP2 ✓ " + fmtPrice(exitTP2) + formatPctFromEntry(exitTP2, exitEntry))
+            label.set_color(tp2Label, TP_HIT_COLOR)
+    if displayTp3Reached and not na(tp3Line)
+        line.set_color(tp3Line, TP_HIT_COLOR)
+        line.set_style(tp3Line, line.style_solid)
+        if showSlTpLabelsInput and not na(tp3Label)
+            label.set_text(tp3Label, "TP3 ✓ " + fmtPrice(exitTP3) + formatPctFromEntry(exitTP3, exitEntry))
+            label.set_color(tp3Label, TP_HIT_COLOR)
+
+// ══════════════════════════════════════
+// DASHBOARD 2.0 — sectional
+// ══════════════════════════════════════
+var table dashTable = na
+if showDashInput and barstate.islast
+    int marketRows  = showMarketSecInput  ? 6 : 0
+    int wyckoffRows = showWyckoffSecInput ? 9 : 0
+    int tradeRows   = showTradeSecInput   ? (activeDir != 0 ? 8 : 2) : 0
+    int statsRows   = showStatsSecInput   ? 6 : 0
+    int totalRows   = 2 + marketRows + wyckoffRows + tradeRows + statsRows
+    if not na(dashTable)
+        table.delete(dashTable)
+    dashTable := table.new(dashPos, 2, totalRows, bgcolor = TABLE_BG, border_color = TABLE_BORDER, border_width = 1, frame_color = TABLE_BORDER, frame_width = 1)
+
+    int  r   = 0
+    bool zeb = false
+    color rb = TABLE_BG
+
+    // snapshot of the active range (no field access on an na object)
+    bool   hasRng    = not na(cur)
+    int    rDir      = candDir
+    int    rPhase    = 0
+    string rangeRow    = "—"
+    string eventsRow     = "—"
+    string qTxt      = "—"
+    if hasRng
+        rDir   := cur.side
+        rPhase := cur.stage
+        rangeRow := fmtPrice(cur.bot) + " – " + fmtPrice(cur.top) + " (" + str.tostring(safeDiv(cur.top - cur.bot, atr, 0.0), "#.#") + " ATR) · u " + str.tostring(uOf(cur, close), "#.##")
+        eventsRow  := nmOf(cur, "SC", "BC") + "✓ AR✓ ST" + str.tostring(cur.nTests) + " " + nmOf(cur, "UT", "SHK") + str.tostring(cur.utCount) + " " + nmOf(cur, "SPR", "UTAD") + chk(cur.sprung) + " TEST" + chk(cur.tested) + " " + nmOf(cur, "SOS", "SOW") + chk(cur.brokeOut) + (cur.pendBreak ? " ⏳" : "")
+        qTxt   := "Climax " + str.tostring(cur.climScore) + (cur.sprung ? " · " + nmOf(cur, "Spring ", "UTAD ") + str.tostring(cur.springScore) : "") + (cur.brokeOut ? " · " + nmOf(cur, "SOS ", "SOW ") + str.tostring(cur.sosScore) : "")
+    string accWord = rDir == 1 ? "Accumulation" : "Distribution"
+    color  rngColD   = rDir == 1 ? bullColorInput : rDir == -1 ? bearColorInput : TEXT_COLOR
+
+    // header: trend = range direction, else last swing structure
+    int trendDir = rDir
+    if trendDir == 0 and array.size(swings) >= 3
+        Swing s1 = array.get(swings, array.size(swings) - 1)
+        Swing s3 = array.get(swings, array.size(swings) - 3)
+        trendDir := s1.price > s3.price ? 1 : s1.price < s3.price ? -1 : 0
+    string trendWord = hasRng ? accWord : trendDir == 1 ? "Bullish" : trendDir == -1 ? "Bearish" : "Neutral"
+    color headerBg = trendDir == 1 ? HEADER_BG_BULL : trendDir == -1 ? HEADER_BG_BEAR : HEADER_BG_NEUTRAL
+    color trendCol = trendDir == 1 ? BULL_TEXT : trendDir == -1 ? BEAR_TEXT : TEXT_MUTED
+    table.cell(dashTable, 0, r, "◆ " + INDICATOR_SHORT + " · " + trendWord, text_color = HEADER_TEXT, bgcolor = headerBg, text_size = dashFontSize, text_halign = text.align_center)
+    table.merge_cells(dashTable, 0, r, 1, r)
+    r += 1
+
+    // — Market —
+    if showMarketSecInput
+        table.cell(dashTable, 0, r, "— Market —", text_color = TEXT_MUTED, bgcolor = TABLE_ROW_ALT, text_size = dashFontSizeSub, text_halign = text.align_center)
+        table.merge_cells(dashTable, 0, r, 1, r)
+        r += 1
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        table.cell(dashTable, 0, r, "Trend", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Range direction while a range is active, otherwise swing structure (last swing vs the one two back)")
+        table.cell(dashTable, 1, r, trendWord, text_color = trendCol, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        table.cell(dashTable, 0, r, "Phase", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Wyckoff phase A–E of the active range")
+        table.cell(dashTable, 1, r, hasRng ? "Phase " + phaseTxt(rPhase) : candDir != 0 ? "Awaiting AR" : "—", text_color = TEXT_COLOR, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        [leD, lpD, lnD] = legStats(nz(legStartBar, bar_index), bar_index)
+        string legStr = legDir == 0 ? "—" : (legDir == 1 ? "↑ " : "↓ ") + str.tostring(safeDiv(math.abs(close - nz(legStartPrice, close)), atr, 0.0), "#.#") + " ATR · eff ×" + str.tostring(leD, "#.#") + " · " + str.tostring(lnD) + "b"
+        table.cell(dashTable, 0, r, "Leg", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Current leg: direction, length in ATR, mean bar effort vs baseline, bars. Source: " + (useVol ? "volume" : "bar range"))
+        table.cell(dashTable, 1, r, legStr, text_color = leD >= sosEffInput ? NEUTRAL_TEXT : TEXT_COLOR, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        string posStr = activeDir == 1 ? "Long" : activeDir == -1 ? "Short" : "Flat"
+        table.cell(dashTable, 0, r, "Position", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Trade engine state. Entry signal: " + entrySignalInput)
+        table.cell(dashTable, 1, r, posStr, text_color = activeDir == 1 ? BULL_TEXT : activeDir == -1 ? BEAR_TEXT : TEXT_MUTED, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        string lastStr = na(lastSigBarIdx) ? "—" : lastSigType + " · " + fmtScore(lastSigScore) + " (" + str.tostring(bar_index - lastSigBarIdx) + ")"
+        color  lastCol = lastSigType == "Long" ? BULL_TEXT : lastSigType == "Short" ? BEAR_TEXT : TEXT_MUTED
+        table.cell(dashTable, 0, r, "Last Signal", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Last confirmed signal · quality score (bars ago). Score is heuristic, 0–100.")
+        table.cell(dashTable, 1, r, lastStr, text_color = lastCol, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+
+    // — Wyckoff —
+    if showWyckoffSecInput
+        table.cell(dashTable, 0, r, "— Wyckoff —", text_color = TEXT_MUTED, bgcolor = TABLE_ROW_ALT, text_size = dashFontSizeSub, text_halign = text.align_center)
+        table.merge_cells(dashTable, 0, r, 1, r)
+        r += 1
+        string statusRow = hasRng ? str.upper(accWord) + " · Phase " + phaseTxt(rPhase) : candDir != 0 ? (candDir == 1 ? "SC" : "BC") + " " + str.tostring(candScore) + "/100 · awaiting AR" : "Scanning swings for a climax"
+        color statusCol = hasRng ? rngColD : candDir != 0 ? climColorInput : TEXT_COLOR
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        table.cell(dashTable, 0, r, "Status", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Swing stream → climax candidate → range (phases A–E)")
+        table.cell(dashTable, 1, r, statusRow, text_color = statusCol, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        table.cell(dashTable, 0, r, "Range", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Active range edges, height in ATR and the close in u-space (0 = climax edge, 1 = reaction edge)")
+        table.cell(dashTable, 1, r, rangeRow, text_color = statusCol, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        table.cell(dashTable, 0, r, "Events", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Checklist of Wyckoff events in the active range. ⏳ = swing beyond the climax edge awaiting reclaim")
+        table.cell(dashTable, 1, r, eventsRow, text_color = statusCol, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        table.cell(dashTable, 0, r, "Quality", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Heuristic 0–100 scores (climax run, spring depth/effort/speed, breakout leg). Not a probability.")
+        table.cell(dashTable, 1, r, qTxt, text_color = NEUTRAL_TEXT, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        string springRow = springRanges > 0 ? str.tostring(100.0 * sprungBroke / springRanges, "#") + "% (" + str.tostring(sprungBroke) + "/" + str.tostring(springRanges) + ")" : "—"
+        string utadRow  = utadRanges > 0 ? str.tostring(100.0 * utadBroke / utadRanges, "#") + "% (" + str.tostring(utadBroke) + "/" + str.tostring(utadRanges) + ")" : "—"
+        table.cell(dashTable, 0, r, "Spring→SOS / UTAD→SOW", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Ranges whose Spring/UTAD was followed by a breakout. Unit = range. Resets on chart reload")
+        table.cell(dashTable, 1, r, springRow + " / " + utadRow, text_color = TEXT_COLOR, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        int tgtDone = tgtHit + tgtMiss
+        int tgtAll  = tgtHit + tgtMiss + tgtExp
+        string tgtTxt = tgtDone > 0 ? str.tostring(100.0 * tgtHit / tgtDone, "#") + "% · in horizon " + str.tostring(100.0 * tgtHit / math.max(tgtAll, 1), "#") + "%" : "—"
+        table.cell(dashTable, 0, r, "SOS→Target", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Target reached before a close back below the midline (first %), and within the outcome horizon incl. expired (second %). Resets on chart reload")
+        table.cell(dashTable, 1, r, tgtTxt, text_color = tgtDone > 0 and tgtHit * 2 >= tgtDone ? BULL_TEXT : tgtDone > 0 ? BEAR_TEXT : TEXT_MUTED, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        string outTxt = "hit " + str.tostring(tgtHit) + " · miss " + str.tostring(tgtMiss) + " · exp " + str.tostring(tgtExp) + " · pend " + str.tostring(array.size(oId)) + " · passed " + str.tostring(tgtPre)
+        table.cell(dashTable, 0, r, "Outcomes", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "hit = target reached · miss = closed below midline · exp = horizon expired · pend = still open · passed = target already beyond SOS close (excluded)")
+        table.cell(dashTable, 1, r, outTxt, text_color = TEXT_COLOR, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        string rangesRow = "Acc " + str.tostring(accTotal) + " ✓" + str.tostring(accOk) + " ✗" + str.tostring(accBad) + "   Dist " + str.tostring(distTotal) + " ✓" + str.tostring(distOk) + " ✗" + str.tostring(distBad)
+        table.cell(dashTable, 0, r, "Ranges", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Confirmed ranges: total, ✓ completed, ✗ broken. Resets on chart reload")
+        table.cell(dashTable, 1, r, rangesRow, text_color = TEXT_COLOR, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+
+    // — Trade —
+    if showTradeSecInput
+        table.cell(dashTable, 0, r, "— Trade —", text_color = TEXT_MUTED, bgcolor = TABLE_ROW_ALT, text_size = dashFontSizeSub, text_halign = text.align_center)
+        table.merge_cells(dashTable, 0, r, 1, r)
+        r += 1
+        if activeDir == 0
+            table.cell(dashTable, 0, r, "Flat · waiting for signal", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = TABLE_BG, text_halign = text.align_center)
+            table.merge_cells(dashTable, 0, r, 1, r)
+            r += 1
+        else
+            string entryStr = (activeDir == 1 ? "Long @ " : "Short @ ") + fmtPrice(activeEntry)
+            string slStr    = beActive ? "BE @ " + fmtPrice(activeSL) : fmtPrice(activeSL) + formatPctFromEntry(activeSL, activeEntry)
+            color  slCol    = beActive ? BE_COLOR : SL_COLOR
+            string tp1Str   = (tp1Reached ? "✓ " : "") + fmtPrice(activeTP1)
+            string tp2Str   = (tp2Reached ? "✓ " : "") + fmtPrice(activeTP2)
+            string tp3Str   = (tp3Reached ? "✓ " : "") + fmtPrice(activeTP3)
+            color  tp1Col   = tp1Reached ? TP_HIT_COLOR : TP_LABEL_COLOR
+            color  tp2Col   = tp2Reached ? TP_HIT_COLOR : TP_LABEL_COLOR
+            color  tp3Col   = tp3Reached ? TP_HIT_COLOR : TP_LABEL_COLOR
+            string rrStr    = str.tostring(effTP1m, "#.#") + "R · " + str.tostring(effTP2m, "#.#") + "R · " + str.tostring(effTP3m, "#.#") + "R"
+            color  rrCol    = effTP1m >= 1.5 ? BULL_TEXT : effTP1m >= 1.0 ? NEUTRAL_TEXT : BEAR_TEXT
+            float  riskPct  = safeDiv(math.abs(activeEntry - activeSL), activeEntry) * 100.0
+            string riskStr  = str.tostring(riskPct, "#.##") + "%"
+            color  riskCol  = riskPct > 3.0 ? BEAR_TEXT : riskPct > 1.0 ? NEUTRAL_TEXT : BULL_TEXT
+            rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+            table.cell(dashTable, 0, r, "Entry", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Entry at the close of the signal bar.")
+            table.cell(dashTable, 1, r, entryStr, text_color = ENTRY_COLOR, text_size = dashFontSize, bgcolor = rb)
+            r += 1
+            zeb := not zeb
+            rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+            table.cell(dashTable, 0, r, "SL", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Stop-loss (" + slModeInput + " mode). 'BE @' = stop moved to break-even after TP1.")
+            table.cell(dashTable, 1, r, slStr, text_color = slCol, text_size = dashFontSize, bgcolor = rb)
+            r += 1
+            zeb := not zeb
+            rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+            table.cell(dashTable, 0, r, "TP1", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "✓ = reached. Reaching TP1 makes the trade a win.")
+            table.cell(dashTable, 1, r, tp1Str, text_color = tp1Col, text_size = dashFontSize, bgcolor = rb)
+            r += 1
+            zeb := not zeb
+            rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+            table.cell(dashTable, 0, r, "TP2", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "✓ = reached.")
+            table.cell(dashTable, 1, r, tp2Str, text_color = tp2Col, text_size = dashFontSize, bgcolor = rb)
+            r += 1
+            zeb := not zeb
+            rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+            table.cell(dashTable, 0, r, "TP3", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Final target: closes the trade.")
+            table.cell(dashTable, 1, r, tp3Str, text_color = tp3Col, text_size = dashFontSize, bgcolor = rb)
+            r += 1
+            zeb := not zeb
+            rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+            table.cell(dashTable, 0, r, "R:R", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Reward-to-risk of TP1 · TP2 · TP3, in multiples of the actual SL distance.")
+            table.cell(dashTable, 1, r, rrStr, text_color = rrCol, text_size = dashFontSize, bgcolor = rb)
+            r += 1
+            zeb := not zeb
+            rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+            table.cell(dashTable, 0, r, "SL Dist", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Current distance from entry to stop, % of entry price.")
+            table.cell(dashTable, 1, r, riskStr, text_color = riskCol, text_size = dashFontSize, bgcolor = rb)
+            r += 1
+            zeb := not zeb
+
+    // — Stats —
+    if showStatsSecInput
+        int cutoff = statsPeriodInput == "24 Hours" ? time - MS_DAY : statsPeriodInput == "30 Days" ? time - MS_DAY * 30 : 0
+        int pW = winCount
+        int pL = lossCount
+        if statsPeriodInput != "All-Time"
+            [w, l] = periodStats(tradeTimes, tradeWins, cutoff)
+            pW := w
+            pL := l
+        int pTotal = pW + pL
+        float pWR = pTotal > 0 ? pW / float(pTotal) * 100.0 : 0.0
+        string periodTag = statsPeriodInput == "24 Hours" ? "24H" : statsPeriodInput == "30 Days" ? "30D" : "All-Time"
+        table.cell(dashTable, 0, r, "— Stats · " + periodTag + " —", text_color = TEXT_MUTED, bgcolor = TABLE_ROW_ALT, text_size = dashFontSizeSub, text_halign = text.align_center)
+        table.merge_cells(dashTable, 0, r, 1, r)
+        r += 1
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        table.cell(dashTable, 0, r, "Trades", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Closed trades in the selected period (resets on chart reload)")
+        table.cell(dashTable, 1, r, pTotal > 0 ? str.tostring(pTotal) : "—", text_color = pTotal > 0 ? TEXT_COLOR : TEXT_MUTED, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        table.cell(dashTable, 0, r, "W / L", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "A trade is a WIN once TP1 is touched (TP3, BE-stop, reversal after TP1). Loss = closed before TP1")
+        table.cell(dashTable, 1, r, pTotal > 0 ? str.tostring(pW) + " / " + str.tostring(pL) : "—", text_color = pTotal > 0 ? TEXT_COLOR : TEXT_MUTED, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        string dashWR = pTotal > 0 ? str.tostring(pWR, "#.#") + "%  " + buildGauge(pWR, 100.0, GAUGE_WIDTH) : "—"
+        color wrCol = pTotal == 0 ? TEXT_MUTED : pWR >= 55.0 ? BULL_TEXT : pWR >= 45.0 ? NEUTRAL_TEXT : BEAR_TEXT
+        table.cell(dashTable, 0, r, "Win rate", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "Optimistic intrabar fill model (TP priority). Not a backtest")
+        table.cell(dashTable, 1, r, dashWR, text_color = wrCol, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        table.cell(dashTable, 0, r, "Form", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb, tooltip = "▰ = win · ▱ = loss (newest right). Always the last trades, not filtered by period")
+        table.cell(dashTable, 1, r, formStr == "" ? "—" : formStr, text_color = TEXT_COLOR, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+        rb := zeb ? TABLE_ROW_ALT : TABLE_BG
+        table.cell(dashTable, 0, r, "TF", text_color = TEXT_MUTED, text_size = dashFontSize, bgcolor = rb)
+        table.cell(dashTable, 1, r, timeframe.period, text_color = TEXT_COLOR, text_size = dashFontSize, bgcolor = rb)
+        r += 1
+        zeb := not zeb
+
+    // footer
+    table.cell(dashTable, 0, r, INDICATOR_SHORT + " · " + INDICATOR_VERSION, text_color = TEXT_MUTED, bgcolor = TABLE_ROW_ALT, text_size = dashFontSizeSub, text_halign = text.align_center)
+    table.merge_cells(dashTable, 0, r, 1, r)
+
+// ══════════════════════════════════════
+// WATERMARK — WillyAlgoTrader
+// ══════════════════════════════════════
+if barstate.islast and showWatermarkInput
+    var table wmTable = table.new(position = position.bottom_center, columns = 1, rows = 1, bgcolor = TRANSP_COLOR, border_color = TRANSP_COLOR, border_width = 0, frame_color = TRANSP_COLOR, frame_width = 0)
+    table.cell(wmTable, 0, 0, "WillyAlgoTrader", text_color = WM_COLOR, text_size = size.normal, text_halign = text.align_center, bgcolor = TRANSP_COLOR)
+
+// ══════════════════════════════════════
+// ALERTS — management → closures → reversal → entries → info
+// ══════════════════════════════════════
+string tick       = syminfo.tickerid
+string tfStr      = timeframe.period
+string aPrice     = str.tostring(close, format.mintick)
+string exitDirStr = exitDir == 1 ? "Long" : exitDir == -1 ? "Short" : "—"
+
+// 1) trade management
+if beJustActivated and alertTpBeInput
+    alert("🛡️ BREAK-EVEN | " + tick + " | TF: " + tfStr + " | " + exitDirStr + " | SL moved to " + fmtPrice(beLevel), alert.freq_once_per_bar_close)
+if tp1FirstTouch and alertTpBeInput
+    alert("🎯 TP1 HIT | " + tick + " | TF: " + tfStr + " | " + exitDirStr + " | TP1: " + fmtPrice(exitTP1), alert.freq_once_per_bar_close)
+if tp2FirstTouch and alertTpBeInput
+    alert("🎯🎯 TP2 HIT | " + tick + " | TF: " + tfStr + " | " + exitDirStr + " | TP2: " + fmtPrice(exitTP2), alert.freq_once_per_bar_close)
+// 2) closures
+if evTp3Hit and alertTpBeInput
+    alert("🏆 TP3 HIT | " + tick + " | TF: " + tfStr + " | " + exitDirStr + " | Entry: " + fmtPrice(exitEntry) + " | TP3: " + fmtPrice(exitTP3), alert.freq_once_per_bar_close)
+if evSlHit and alertSlRevInput
+    string textSlHit = (exitBeActive ? "🛡️ BE STOP-OUT | " : "🛑 SL HIT | ") + tick + " | TF: " + tfStr + " | " + exitDirStr + " | Entry: " + fmtPrice(hitEntry) + " | SL: " + fmtPrice(hitSL)
+    alert(textSlHit, alert.freq_once_per_bar_close)
+// 3) reversal
+if evReversal and alertSlRevInput
+    string newDirStr = exitDir == 1 ? "Short" : "Long"
+    string revResult = reversalWin ? "Closed after TP1 (win)" : "Closed before TP1 (loss)"
+    alert("🔄 REVERSAL | " + tick + " | TF: " + tfStr + " | " + exitDirStr + " → " + newDirStr + " | " + revResult + " | Exit: " + aPrice, alert.freq_once_per_bar_close)
+// 4) new entries
+if newEntry
+    string slS   = str.tostring(nz(activeSL), format.mintick)
+    string tp1S  = str.tostring(nz(activeTP1), format.mintick)
+    string tp2S  = str.tostring(nz(activeTP2), format.mintick)
+    string tp3S  = str.tostring(nz(activeTP3), format.mintick)
+    string rrS   = str.tostring(effTP1m, "#.#")
+    string scS   = fmtScore(entryScore)
+    string act   = evLongEntry ? "buy" : "sell"
+    string head  = evLongEntry ? "🟢 LONG | " : "🔴 SHORT | "
+    string jsonEntry = '{"action":"' + act + '","ticker":"' + tick + '","tf":"' + tfStr + '","price":' + aPrice + ',"score":' + scS + ',"sl":' + slS + ',"tp1":' + tp1S + ',"tp2":' + tp2S + ',"tp3":' + tp3S + ',"rr":' + rrS + '}'
+    string textEntry = head + tick + " | TF: " + tfStr + " | Price: " + aPrice + " | Score: " + scS + "/100 | Event: " + entryInfoEv + " | SL: " + slS + " | TP1: " + tp1S + " | TP2: " + tp2S + " | TP3: " + tp3S + " | R:R: " + rrS
+    alert(webhookInput ? jsonEntry : textEntry, alert.freq_once_per_bar_close)
+// 5) info — Wyckoff events (suppressed on bars that opened or reversed a trade)
+if alertEventsInput and eventMsg != "" and not evLongEntry and not evShortEntry and not evReversal
+    alert("ℹ️ WYCKOFF | " + tick + " | TF: " + tfStr + " | " + eventMsg + "Price: " + aPrice, alert.freq_once_per_bar_close)
