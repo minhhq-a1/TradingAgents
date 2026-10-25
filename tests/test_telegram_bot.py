@@ -47,7 +47,7 @@ def test_status_and_health_report_whether_the_job_is_alive(bot, monkeypatch):
     mod.handle({"chat": {"id": 1}, "text": "/status"})
     mod.handle({"chat": {"id": 1}, "text": "/health@MyBot ETHUSDT"})
     mod.handle({"chat": {"id": 2}, "text": "/status"})  # unlisted chat: ignored
-    assert sent == ["health of BTCUSDT", "health of ETHUSDT"] and "/status" in mod.COMMANDS
+    assert sent == ["health of BTCUSDT\n\nhealth of BTCUSDT-ICHIMOKU", "health of ETHUSDT"] and "/status" in mod.COMMANDS
 
 
 DECISION = """**Rating**: Hold
@@ -296,7 +296,7 @@ def test_trend_command_replies_with_the_trend_state(bot, monkeypatch):
     mod.handle({"chat": {"id": 1}, "text": "/trend"})
     mod.handle({"chat": {"id": 1}, "text": "/trend@MyBot ETHUSDT"})
     mod.handle({"chat": {"id": 2}, "text": "/trend"})  # unlisted chat: ignored
-    assert sent == ["state of BTCUSDT", "state of ETHUSDT"]
+    assert sent == ["state of BTCUSDT", "state of ETHUSDT"] and "/trend ichimoku" in mod.COMMANDS
 
 
 def test_paper_command_and_analysis_label(bot, monkeypatch):

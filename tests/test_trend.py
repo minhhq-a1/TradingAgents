@@ -6,6 +6,7 @@ Prices are synthetic and the vendors are mocked, so these run without a network 
 import _socket
 import importlib
 import json
+import os
 import re
 import socket
 import threading
@@ -66,6 +67,7 @@ def _state_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(trend, "DIR", str(tmp_path))
     monkeypatch.setattr(trend, "quote", lambda symbol: None)  # no network; tests that need a price set their own
     monkeypatch.delenv("TREND_CORE_WEIGHT", raising=False)
+    monkeypatch.setattr(trend, "BOOKS", {"BTCUSDT": trend.SMA200})  # the SMA200 book alone; the shadow book has its own tests
 
 
 def _events():
@@ -337,7 +339,8 @@ def test_a_source_switch_does_not_signal_a_flip_inside_the_sources_own_noise():
 def test_bars_fall_back_to_yahoo_without_gap_filling_and_without_todays_bar():
     today = datetime.now(UTC)
     days = pd.date_range(end=today.date(), periods=5, freq="D")
-    yahoo = pd.DataFrame({"Date": days, "Open": [1.0, 2, 3, 4, 5], "Close": [1.5, 2, 3, 4, 5]})
+    yahoo = pd.DataFrame({"Date": days, "Open": [1.0, 2, 3, 4, 5], "High": [2.0, 3, 4, 5, 6], "Low": [0.5, 1, 2, 3, 4],
+                          "Close": [1.5, 2, 3, 4, 5]})
     with mock.patch.object(trend, "fetch_daily_klines", return_value=None), \
             mock.patch.object(trend, "load_ohlcv", return_value=yahoo) as load:
         out, source = trend.bars("BTCUSDT", today)
@@ -885,3 +888,112 @@ def test_the_drill_command_prints_pass_for_every_step_and_exits_zero(telegram, m
     assert trend_drill.main() == 0
     out = capsys.readouterr().out
     assert out.count("PASS") == 7 and "FAIL" not in out
+
+
+# --- the Ichimoku shadow book ------------------------------------------------------------------------
+
+ICHI = "BTCUSDT-ICHIMOKU"
+
+
+def _ohlc(frame, seed=3):
+    """Adds a High and Low around each bar's open and close."""
+    rng = np.random.default_rng(seed)
+    top, bottom = frame[["Open", "Close"]].max(axis=1), frame[["Open", "Close"]].min(axis=1)
+    return frame.assign(High=top * np.exp(rng.uniform(0, 0.02, len(frame))), Low=bottom * np.exp(-rng.uniform(0, 0.02, len(frame))))
+
+
+@pytest.fixture
+def two_books(monkeypatch):
+    monkeypatch.setattr(trend, "BOOKS", {"BTCUSDT": trend.SMA200, ICHI: trend.ICHIMOKU})
+
+
+@pytest.mark.unit
+def test_cloud_top_matches_a_plain_loop_and_never_repaints():
+    frame = _ohlc(_walk())
+    hi, lo = frame["High"].to_numpy(), frame["Low"].to_numpy()
+
+    def mid(i, n):
+        return (hi[i - n + 1:i + 1].max() + lo[i - n + 1:i + 1].min()) / 2 if i >= n - 1 else np.nan
+
+    expected = [max((mid(i - 25, 9) + mid(i - 25, 26)) / 2, mid(i - 25, 52)) if i >= 25 + 51 else np.nan
+                for i in range(len(frame))]
+    got = trend.cloud_top(frame)
+    assert np.allclose(got.to_numpy(), expected, equal_nan=True) and got.notna().sum() == len(frame) - 76
+    assert got.iloc[:-100].equals(trend.cloud_top(frame.iloc[:-100]))  # a later bar never moves an earlier cloud
+    state = trend.rule_states(frame, trend.ICHIMOKU)
+    assert ((state == trend.HOLD) == (frame["Close"] > got)[got.notna()]).all()
+    assert trend.rule_states(frame).equals(trend.states(frame["Close"]))  # the SMA200 book is unchanged
+
+
+@pytest.mark.unit
+def test_the_shadow_book_alerts_on_its_own_flips_in_its_own_file_and_leaves_the_sma200_book_alone(two_books):
+    frame = _ohlc(_walk())
+    state = trend.rule_states(frame, trend.ICHIMOKU)
+    first = frame.index[260]
+    flips = [d for d in state.index[state.ne(state.shift())][1:] if d > first]
+    sent = []
+    for day in frame.index[frame.index >= first]:
+        with mock.patch.object(trend, "bars", return_value=(frame[:day], "binance")) as bars:
+            trend.check(ICHI, lambda chat, text: sent.append(text), ["a"], _at(day))
+        assert bars.call_args.args[0] == "BTCUSDT"  # the shadow book reads the BTCUSDT bars
+    assert len(flips) >= 6 and len(sent) == len(flips)
+    for text, day in zip(sent, flips, strict=True):
+        assert "BTCUSDT Ichimoku (shadow)" in text and "Cloud top" in text and f"Close {day.date()}" in text
+        assert ("HOLD BTC" in text) == (state[day] == trend.HOLD) and _telegram_html(text)
+    assert not os.path.exists(f"{trend.DIR}/state.json")  # the SMA200 book's file is never written
+    entry = trend._load(ICHI)[ICHI]
+    assert [r["signal_date"] for r in entry["ledger"]] == [d.date().isoformat() for d in flips]
+    for name in (ICHI, "ichimoku"):
+        paper = trend.paper_text(name)
+        assert "Ichimoku (shadow) paper book" in paper and "100% Ichimoku" in paper and _telegram_html(paper)
+    with mock.patch.object(trend, "bars", return_value=(frame, "binance")):
+        status = trend.status_text("ichimoku")
+    assert "Ichimoku (shadow)" in status and "9/26/52" in status and _telegram_html(status)
+    assert "Ichimoku (shadow) job: OK" in trend.health_text("ichimoku", datetime.fromisoformat(entry["last_run"]["at"]))
+
+
+@pytest.mark.unit
+def test_a_failing_shadow_book_neither_delays_nor_fails_the_sma200_book(two_books, monkeypatch):
+    monkeypatch.setattr(trend, "RETRIES", 2)
+    frame = _frame(np.r_[100 + 0.5 * np.arange(260), 150.0])  # Open/Close only: the cloud cannot be built
+    _check(frame, frame.index[-2], [])
+    order, sent = [], []
+    real = trend.check
+
+    def check(symbol, send, chats):
+        order.append(symbol)
+        return real(symbol, send, chats)
+
+    def nap(seconds):
+        if seconds != trend.RETRY_SECONDS:
+            raise SystemExit
+
+    monkeypatch.setattr(trend, "check", check)
+    monkeypatch.setattr(trend, "bars", lambda symbol, today=None: (frame, "binance"))
+    monkeypatch.setattr(trend.time, "sleep", nap)
+    with pytest.raises(SystemExit):
+        trend.watch(lambda chat, text: sent.append(text), ["a"])
+    assert order == ["BTCUSDT", ICHI, ICHI]  # SMA200 first, once; the shadow book is retried on its own
+    assert "BTCUSDT trend DOWN" in sent[0] and "BTCUSDT Ichimoku (shadow) check failed" in sent[1] and len(sent) == 2
+    sma, ichi = trend._ops_rows()
+    assert sma["symbol"] == "BTCUSDT" and sma["ok"] is True and sma["flips"] == [frame.index[-1].date().isoformat()]
+    assert ichi["symbol"] == ICHI and ichi["ok"] is False and len(ichi["errors"]) == 2
+    health = trend.health_text("BTCUSDT", datetime.now(UTC))
+    assert "FAILED" not in health  # the shadow book's failed row is not the SMA200 job's
+    assert list(trend._load()) == ["BTCUSDT"] and trend._load(ICHI) == {}
+
+
+@pytest.mark.unit
+def test_the_dead_man_names_the_book_that_did_not_run(two_books):
+    sent = []
+    now = datetime(2026, 10, 24, 0, 31, tzinfo=UTC)
+    assert trend.alert_overdue(ICHI, lambda chat, text: sent.append(text), ["a"], now) is True
+    assert "BTCUSDT Ichimoku (shadow) job is down" in sent[0] and _telegram_html(sent[0])
+    assert trend.alert_overdue("BTCUSDT", lambda chat, text: sent.append(text), ["a"], now) is True  # its own day mark
+    assert "BTCUSDT trend job is down" in sent[1]
+
+
+@pytest.mark.unit
+def test_book_names_from_chat_commands():
+    assert trend.book("ichimoku") == trend.book("ICHI") == ICHI and trend.book("btcusdt") == "BTCUSDT"
+    assert "only validated on BTCUSDT" in trend.status_text("ETHUSDT")
